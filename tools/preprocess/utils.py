@@ -30,6 +30,36 @@ def skip_replace_frame_outputs(frame):
     return frame.copy(), aug_mask
 
 
+ACTION_BODY_KEYPOINT_INDICES = (0, 1, 2, 5, 8, 11, 10, 13)
+
+
+def is_valid_action_pose_meta(meta, min_keypoints=1, min_score=0.3):
+    body_key_points = meta["keypoints_body"]
+    visible_count = 0
+    for idx in ACTION_BODY_KEYPOINT_INDICES:
+        if idx >= len(body_key_points):
+            continue
+        kp = body_key_points[idx]
+        if kp is None:
+            continue
+        kp = np.asarray(kp)
+        if kp.size == 0:
+            continue
+        if kp.size >= 3:
+            if kp[2] >= min_score and (kp[0] != 0 or kp[1] != 0):
+                visible_count += 1
+        elif np.any(kp[:2] != 0):
+            visible_count += 1
+    return visible_count >= min_keypoints
+
+
+def trim_trailing_blank_end(valid_flags):
+    end = len(valid_flags)
+    while end > 0 and not valid_flags[end - 1]:
+        end -= 1
+    return end
+
+
 def get_aug_mask(body_mask, w_len=10, h_len=20):
     body_bbox = get_mask_boxes(body_mask)
     if body_bbox is None:

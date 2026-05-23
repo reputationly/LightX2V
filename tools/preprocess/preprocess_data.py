@@ -47,6 +47,12 @@ def get_preprocess_parser():
         default=1,
         help="The number of subdivisions for the grid along the 'h' dimension. A higher value results in a more detailed contour. A value of 1 means no subdivision is performed.",
     )
+    parser.add_argument(
+        "--trim_trailing_blank",
+        action="store_true",
+        default=False,
+        help="Trim trailing frames with no detectable human action/pose at the end of the driving video.",
+    )
     return parser
 
 
@@ -79,6 +85,7 @@ def process_input_video(args):
         retarget_flag=args.retarget_flag,
         use_flux=args.use_flux,
         replace_flag=args.replace_flag,
+        trim_trailing_blank=args.trim_trailing_blank,
     )
 
 

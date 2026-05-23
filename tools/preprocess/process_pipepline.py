@@ -32,7 +32,17 @@ from human_visualization import draw_aapose_by_meta_new
 from pose2d import Pose2d
 from pose2d_utils import AAPoseMeta
 from retarget_pose import get_retarget_pose
-from utils import get_aug_mask, get_face_bboxes, get_frame_indices, get_mask_body_img, padding_resize, resize_by_area, skip_replace_frame_outputs
+from utils import (
+    get_aug_mask,
+    get_face_bboxes,
+    get_frame_indices,
+    get_mask_body_img,
+    is_valid_action_pose_meta,
+    padding_resize,
+    resize_by_area,
+    skip_replace_frame_outputs,
+    trim_trailing_blank_end,
+)
 
 
 class ProcessPipeline:
@@ -49,7 +59,32 @@ class ProcessPipeline:
 
             self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
 
-    def __call__(self, video_path, refer_image_path, output_path, resolution_area=[1280, 720], fps=30, iterations=3, k=7, w_len=1, h_len=1, retarget_flag=False, use_flux=False, replace_flag=False):
+    def _trim_trailing_blank_end(self, valid_flags, trim_trailing_blank, mode_name):
+        if not trim_trailing_blank:
+            return len(valid_flags)
+        end = trim_trailing_blank_end(valid_flags)
+        if end == 0:
+            raise ValueError(f"{mode_name} preprocessing failed: no detectable human action in driving video")
+        if end < len(valid_flags):
+            logger.info(f"trim_trailing_blank: trimmed {len(valid_flags) - end} trailing blank frames, keeping {end}/{len(valid_flags)}")
+        return end
+
+    def __call__(
+        self,
+        video_path,
+        refer_image_path,
+        output_path,
+        resolution_area=[1280, 720],
+        fps=30,
+        iterations=3,
+        k=7,
+        w_len=1,
+        h_len=1,
+        retarget_flag=False,
+        use_flux=False,
+        replace_flag=False,
+        trim_trailing_blank=False,
+    ):
         if replace_flag:
             video_reader = VideoReader(video_path)
             frame_num = len(video_reader)
@@ -107,13 +142,14 @@ class ProcessPipeline:
                 cond_images.append(conditioning_image)
             masks = self.get_mask(frames, 400, tpl_pose_metas)
 
+            pose_valid = [is_valid_action_pose_meta(meta) for meta in tpl_pose_metas]
             bg_images = []
             aug_masks = []
-            replace_frame_count = 0
+            replace_frame_valid = []
 
             for frame_idx, (frame, mask) in enumerate(zip(frames, masks)):
                 each_aug_mask = None
-                if mask is not None and mask.sum() > 0:
+                if pose_valid[frame_idx] and mask is not None and mask.sum() > 0:
                     if iterations > 0:
                         _, each_mask = get_mask_body_img(frame, mask, iterations=iterations, k=k)
                         if each_mask.sum() > 0:
@@ -122,19 +158,33 @@ class ProcessPipeline:
                         each_aug_mask = mask
 
                 if each_aug_mask is None or each_aug_mask.sum() == 0:
-                    logger.warning(f"Frame {frame_idx}: no valid person mask, skipping character replacement for this frame")
+                    if not pose_valid[frame_idx]:
+                        logger.warning(f"Frame {frame_idx}: no valid pose, skipping character replacement for this frame")
+                    else:
+                        logger.warning(f"Frame {frame_idx}: no valid person mask, skipping character replacement for this frame")
                     each_bg_image, each_aug_mask = skip_replace_frame_outputs(frame)
+                    replace_frame_valid.append(False)
                 else:
                     each_bg_image = frame * (1 - each_aug_mask[:, :, None])
-                    replace_frame_count += 1
+                    replace_frame_valid.append(True)
 
                 bg_images.append(each_bg_image)
                 aug_masks.append(each_aug_mask)
 
+            end = self._trim_trailing_blank_end(pose_valid, trim_trailing_blank, "Animate replace")
+            face_images = face_images[:end]
+            cond_images = cond_images[:end]
+            bg_images = bg_images[:end]
+            aug_masks = aug_masks[:end]
+            replace_frame_valid = replace_frame_valid[:end]
+            replace_frame_count = sum(replace_frame_valid)
+
             if replace_frame_count == 0:
                 raise ValueError("Animate replace preprocessing failed: no stable human body detected in driving video")
-            if replace_frame_count < len(frames):
-                logger.info(f"Replace preprocessing: {replace_frame_count}/{len(frames)} frames will be replaced, {len(frames) - replace_frame_count} frames kept as original")
+            if replace_frame_count < len(replace_frame_valid):
+                logger.info(
+                    f"Replace preprocessing: {replace_frame_count}/{len(replace_frame_valid)} frames will be replaced, {len(replace_frame_valid) - replace_frame_count} frames kept as original"
+                )
 
             src_face_path = os.path.join(output_path, "src_face.mp4")
             mpy.ImageSequenceClip(face_images, fps=fps).write_videofile(src_face_path)
@@ -198,6 +248,14 @@ class ProcessPipeline:
                 face_image = frames[idx][y1:y2, x1:x2]
                 face_image = cv2.resize(face_image, (512, 512))
                 face_images.append(face_image)
+
+            frame_valid = [is_valid_action_pose_meta(meta) for meta in tpl_pose_metas]
+            end = self._trim_trailing_blank_end(frame_valid, trim_trailing_blank, "Animate")
+            frames = frames[:end]
+            tpl_pose_metas = tpl_pose_metas[:end]
+            face_images = face_images[:end]
+            if len(tpl_pose_metas) == 0:
+                raise ValueError("Animate preprocessing failed: no frames left after trimming trailing blank frames")
 
             if retarget_flag:
                 if use_flux:

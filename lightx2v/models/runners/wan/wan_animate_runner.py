@@ -67,6 +67,44 @@ class WanAnimateRunner(WanRunner):
         msk = msk.transpose(1, 2)[0]
         return msk
 
+    def _align_hw_to_vae(self, height, width):
+        vae_stride = self.config["vae_stride"]
+        patch_size = self.config["patch_size"]
+        latent_h = int(height) // vae_stride[1] // patch_size[1] * patch_size[1]
+        latent_w = int(width) // vae_stride[2] // patch_size[2] * patch_size[2]
+        return latent_h * vae_stride[1], latent_w * vae_stride[2]
+
+    def _resolve_target_hw(self, ref_height, ref_width, pose_height=None, pose_width=None):
+        if self.config.get("auto_target_shape", True):
+            height, width = self._align_hw_to_vae(pose_height, pose_width)
+            if height != pose_height or width != pose_width:
+                logger.info(f"auto_target_shape=true, aligned pose resolution from {pose_height}x{pose_width} to {height}x{width}")
+            return height, width
+        aspect_ratio = ref_height / ref_width
+        max_area = self.config["target_height"] * self.config["target_width"]
+        vae_stride = self.config["vae_stride"]
+        patch_size = self.config["patch_size"]
+        latent_h = round(np.sqrt(max_area * aspect_ratio) // vae_stride[1] // patch_size[1] * patch_size[1])
+        latent_w = round(np.sqrt(max_area / aspect_ratio) // vae_stride[2] // patch_size[2] * patch_size[2])
+        height = latent_h * vae_stride[1]
+        width = latent_w * vae_stride[2]
+        logger.info(f"auto_target_shape=false, using ref-based area target resolution: {height}x{width} (area={height * width}, config_area={max_area}, ref_aspect_ratio={aspect_ratio:.4f})")
+        return height, width
+
+    def _resize_frame(self, img, height, width, interpolation=cv2.INTER_LINEAR):
+        if img.shape[0] == height and img.shape[1] == width:
+            return img
+        return cv2.resize(img, (width, height), interpolation=interpolation)
+
+    def _padding_resize_mask(self, mask, height, width):
+        mask_rgb = self.padding_resize(
+            np.stack([mask * 255, mask * 255, mask * 255], axis=-1).astype(np.uint8),
+            height=height,
+            width=width,
+            interpolation=cv2.INTER_NEAREST,
+        )
+        return mask_rgb[:, :, 0].astype(np.float32) / 255.0
+
     def padding_resize(
         self,
         img_ori,
@@ -116,12 +154,20 @@ class WanAnimateRunner(WanRunner):
         face_len = len(face_video_reader)
         face_idxs = list(range(face_len))
         face_images = face_video_reader.get_batch(face_idxs).asnumpy()
-        height, width = cond_images[0].shape[:2]
+        pose_height, pose_width = cond_images[0].shape[:2]
         refer_images = cv2.imread(src_ref_path)[..., ::-1]
-        refer_images = self.padding_resize(refer_images, height=height, width=width)
-        return cond_images, face_images, refer_images
+        ref_height, ref_width = refer_images.shape[:2]
+        if self.config.get("auto_target_shape", True):
+            height, width = self._resolve_target_hw(ref_height, ref_width, pose_height, pose_width)
+            refer_images = self.padding_resize(refer_images, height=height, width=width)
+        else:
+            height, width = self._resolve_target_hw(ref_height, ref_width)
+            refer_images = self._resize_frame(refer_images, height, width)
+        if height != pose_height or width != pose_width:
+            cond_images = np.stack([self.padding_resize(img, height=height, width=width) for img in cond_images])
+        return cond_images, face_images, refer_images, height, width
 
-    def prepare_source_for_replace(self, src_bg_path, src_mask_path):
+    def prepare_source_for_replace(self, src_bg_path, src_mask_path, height, width):
         bg_video_reader = VideoReader(src_bg_path)
         bg_len = len(bg_video_reader)
         bg_idxs = list(range(bg_len))
@@ -132,6 +178,10 @@ class WanAnimateRunner(WanRunner):
         mask_idxs = list(range(mask_len))
         mask_images = mask_video_reader.get_batch(mask_idxs).asnumpy()
         mask_images = mask_images[:, :, :, 0] / 255
+        bg_height, bg_width = bg_images[0].shape[:2]
+        if height != bg_height or width != bg_width:
+            bg_images = np.stack([self.padding_resize(img, height=height, width=width) for img in bg_images])
+            mask_images = np.stack([self._padding_resize_mask(mask, height, width) for mask in mask_images])
         return bg_images, mask_images
 
     @ProfilingContext4DebugL2("Run Image Encoders")
@@ -241,7 +291,7 @@ class WanAnimateRunner(WanRunner):
         src_pose_path = self.input_info.src_pose_path
         src_face_path = self.input_info.src_face_path
         src_ref_path = self.input_info.src_ref_images
-        self.cond_images, self.face_images, self.refer_images = self.prepare_source(src_pose_path, src_face_path, src_ref_path)
+        self.cond_images, self.face_images, self.refer_images, self.target_height, self.target_width = self.prepare_source(src_pose_path, src_face_path, src_ref_path)
         self.refer_pixel_values = torch.tensor(self.refer_images / 127.5 - 1, dtype=GET_DTYPE(), device=AI_DEVICE).permute(2, 0, 1)  # chw
         self.latent_t = self.config["target_video_length"] // self.config["vae_stride"][0] + 1
         self.latent_h = self.refer_pixel_values.shape[-2] // self.config["vae_stride"][1]
@@ -260,7 +310,7 @@ class WanAnimateRunner(WanRunner):
         if self.config["replace_flag"] if "replace_flag" in self.config else False:
             src_bg_path = self.input_info.src_bg_path
             src_mask_path = self.input_info.src_mask_path
-            self.bg_images, self.mask_images = self.prepare_source_for_replace(src_bg_path, src_mask_path)
+            self.bg_images, self.mask_images = self.prepare_source_for_replace(src_bg_path, src_mask_path, self.target_height, self.target_width)
             self.bg_images = self.inputs_padding(self.bg_images, target_len)
             self.mask_images = self.inputs_padding(self.mask_images, target_len)
 
