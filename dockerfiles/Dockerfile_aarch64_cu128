@@ -1,0 +1,91 @@
+# ============================================================
+# LightX2V ARM64 (aarch64) + CUDA 12.8 镜像 — A100 (sm_80) 专用
+# 对应上游 dockerfiles/Dockerfile，仅保留 A100 sm_80 相关组件
+# ------------------------------------------------------------
+# 关键适配:
+#   1. base: pytorch/pytorch(仅amd64) → nvidia/cuda(有arm64) + pip torch cu128
+#   2. LD_LIBRARY_PATH: x86_64 → aarch64
+#   3. 所有 CUDA 编译只针对 sm_80（A100），去掉 sm_90/sm_120
+# 去掉的上游组件（非 A100 或非推理必需）:
+#   - flash-attention/hopper (sm_90 H100)
+#   - SageAttention3 blackwell (sm_120 RTX5090)
+#   - MagiAttention (sm_90 H100)
+#   - flex-block-attn / FlashVSR / GStreamer (非 Wan 推理必需)
+# 保留:
+#   - PyTorch cu128, flash_attn(sm_80), sageattention(sm_80)
+#   - sgl-kernel (FP8 量化, dit_quant_scheme=fp8-sgl)
+#   - SpargeAttn (sm_80 稀疏注意力), q8_kernels (LTX INT8)
+# ============================================================
+
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04 AS base
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+# 全局只编译 sm_80 (A100)
+ENV TORCH_CUDA_ARCH_LIST="8.0"
+ENV MAX_JOBS=32
+
+# 系统依赖
+RUN apt-get update && apt-get install -y \
+    python3.10 python3.10-dev python3-pip \
+    vim tmux zip unzip bzip2 wget git git-lfs build-essential libibverbs-dev ca-certificates \
+    curl iproute2 libsm6 libxext6 kmod ccache libnuma-dev libssl-dev \
+    libglib2.0-dev libjpeg-dev libpng-dev ffmpeg \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* && git lfs install
+
+# PyTorch ARM64 + CUDA 12.8
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn requests -U && \
+    pip install --no-cache-dir torch==2.11.0 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# sglang sgl-kernel (FP8 GEMM, dit_quant_scheme=fp8-sgl 需要)
+RUN git clone https://github.com/sgl-project/sglang.git && cd sglang/sgl-kernel \
+    && make build && make clean \
+    || echo "sgl-kernel build failed (FP8-sgl 不可用，可用 torchao 替代)"
+
+# LightX2V 运行依赖
+RUN pip install --no-cache-dir diffusers transformers tokenizers accelerate safetensors opencv-python numpy imageio \
+    imageio-ffmpeg einops loguru qtorch ftfy av decord matplotlib soundfile jsonschema modelscope \
+    prometheus_client gguf pydantic pyzmq librosa
+
+# flash-attention (sm_80 A100, 关闭 backward 加速编译)
+ENV FLASH_ATTN_CUDA_ARCHS="80"
+ENV FLASH_ATTENTION_DISABLE_BACKWARD="TRUE"
+RUN pip install --no-cache-dir flash-attn==2.7.4.post1 --no-build-isolation
+
+# SageAttention (sm_80 A100)
+RUN git clone https://github.com/thu-ml/SageAttention.git /opt/SageAttention && \
+    cd /opt/SageAttention && \
+    TORCH_CUDA_ARCH_LIST="8.0" EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
+    pip install --no-cache-dir --no-build-isolation -v -e .
+
+# SpargeAttn (sm_80 稀疏注意力)
+RUN git clone https://github.com/thu-ml/SpargeAttn.git --depth 1 \
+    && cd SpargeAttn && TORCH_CUDA_ARCH_LIST="8.0" pip install --no-cache-dir --no-build-isolation -v -e . \
+    || echo "SpargeAttn skip"
+
+# q8_kernels (LTX-2 INT8, sm_80)
+RUN git clone https://github.com/KONAKONA666/q8_kernels.git --depth 1 \
+    && cd q8_kernels && git submodule init && git submodule update \
+    && TORCH_CUDA_ARCH_LIST="8.0" python setup.py install && rm -rf build \
+    || echo "q8_kernels skip"
+
+# LightX2V 本体
+COPY . /opt/LightX2V
+RUN cd /opt/LightX2V && pip install --no-cache-dir -e . --no-deps
+
+ENV PYTHONPATH=/opt/LightX2V
+
+# 验证核心组件
+RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" && \
+    python -c "import flash_attn; print('flash_attn', flash_attn.__version__)" && \
+    python -c "from sageattention import sageattn; print('sageattention OK')"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
