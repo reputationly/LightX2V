@@ -4,8 +4,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 import torch
-from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from lightx2v.models.input_encoders.hf.ltx2.gemma.embeddings_processor import EmbeddingsProcessor
 from lightx2v.models.input_encoders.hf.ltx2.gemma.tokenizer import LTXVGemmaTokenizer

@@ -20,8 +20,7 @@ from lightx2v.models.video_encoders.hf.ltx2.video_vae.model_configurator import 
     VideoDecoderConfigurator,
     VideoEncoderConfigurator,
 )
-from lightx2v.models.video_encoders.hf.ltx2.video_vae.tiling import TilingConfig
-from lightx2v.models.video_encoders.hf.ltx2.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
+from lightx2v.models.video_encoders.hf.ltx2.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from lightx2v.models.video_encoders.hf.ltx2.video_vae.video_vae import VideoDecoder, VideoEncoder, decode_video
 from lightx2v.utils.ltx2_media_io import *
 from lightx2v.utils.ltx2_utils import *
