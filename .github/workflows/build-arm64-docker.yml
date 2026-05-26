@@ -1,13 +1,14 @@
 name: Build ARM64 Docker Image
 
-# 构建 ARM64 A100 app 镜像并推送 Docker Hub
-# 依赖 CUDA 扩展的 base 镜像应先在 A100 服务器上低频构建并上传。
+# 构建 ARM64 A100 app 镜像并推送阿里云 ACR(上海)。
+# base 镜像(已预编译 CUDA 扩展)在 A100 服务器上低频构建,直连推到 ACR;
+# 这里只在 GitHub 原生 ARM64 runner 上构建 app 层(拷代码 + pip install -e --no-deps)。
 on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: "已预编译 CUDA 扩展的 ARM64 A100 base 镜像"
-        default: "arronlee/lightx2v:arm64-cu128-a100-base"
+        description: "已预编译 CUDA 扩展的 ARM64 A100 base 镜像(ACR 公开仓)"
+        default: "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base"
   push:
     branches: [main]
     paths:
@@ -18,11 +19,16 @@ on:
       - "setup.py"
       - ".github/workflows/build-arm64-docker.yml"
 
+env:
+  # 阿里云 ACR 上海(个人版)。base 公开,拉取不需要登录;推 app 需要登录。
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v
+
 jobs:
   build-arm64:
-    # GitHub 原生 ARM64 runner。这里只构建 app 层，不重新编译 flash_attn/SageAttention/q8 等 CUDA 扩展。
+    # GitHub 原生 ARM64 runner。只构建 app 层,不重新编译 flash_attn/SageAttention/q8 等 CUDA 扩展。
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,11 +36,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      # base 是 ACR 公开仓,FROM 拉取不需要登录;登录只为把 app 推回 ACR。
+      - name: Login to Aliyun ACR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Generate image tags
         id: image_tags
@@ -53,9 +61,9 @@ jobs:
           platforms: linux/arm64
           push: true
           build-args: |
-            BASE_IMAGE=${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu128-a100-base' }}
+            BASE_IMAGE=${{ github.event.inputs.base_image || 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base' }}
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:${{ steps.image_tags.outputs.version_tag }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:${{ steps.image_tags.outputs.latest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.version_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
