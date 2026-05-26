@@ -1,14 +1,15 @@
 name: Build ARM64 Docker Image
 
-# 构建 ARM64 A100 app 镜像并推送阿里云 ACR(上海)。
-# base 镜像(已预编译 CUDA 扩展)在 A100 服务器上低频构建,直连推到 ACR;
-# 这里只在 GitHub 原生 ARM64 runner 上构建 app 层(拷代码 + pip install -e --no-deps)。
+# 构建 ARM64 A100 app 镜像,双推 阿里云 ACR(上海) + Docker Hub。
+# base 镜像(已预编译 CUDA 扩展)在 A100 服务器上低频构建、直连推到 ACR,
+# 再由 sync-base-to-dockerhub.yml 同步到 Docker Hub。
+# 本流水线从 Docker Hub 拉 base(国外 runner 拉得快),只构建 app 层(拷代码 + pip install -e --no-deps)。
 on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: "已预编译 CUDA 扩展的 ARM64 A100 base 镜像(ACR 公开仓)"
-        default: "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base"
+        description: "base 镜像(默认 Docker Hub;需先跑 Sync base 流水线把 base 同步过去)"
+        default: "arronlee/lightx2v:arm64-cu128-a100-base"
   push:
     branches: [main]
     paths:
@@ -20,15 +21,15 @@ on:
       - ".github/workflows/build-arm64-docker.yml"
 
 env:
-  # 阿里云 ACR 上海(个人版)。base 公开,拉取不需要登录;推 app 需要登录。
   ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
   ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v
+  DOCKERHUB_REPO: arronlee/lightx2v
 
 jobs:
   build-arm64:
     # GitHub 原生 ARM64 runner。只构建 app 层,不重新编译 flash_attn/SageAttention/q8 等 CUDA 扩展。
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,7 +37,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # base 是 ACR 公开仓,FROM 拉取不需要登录;登录只为把 app 推回 ACR。
+      # base 默认从 Docker Hub 公开仓拉,FROM 不需要登录;以下登录都是为了推 app。
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Login to Aliyun ACR
         uses: docker/login-action@v3
         with:
@@ -53,7 +60,7 @@ jobs:
           echo "version_tag=arm64-a100-${build_time}-${short_sha}" >> "$GITHUB_OUTPUT"
           echo "latest_tag=arm64-a100-latest" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push ARM64 A100 app image
+      - name: Build and push ARM64 A100 app image (ACR + Docker Hub)
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -61,9 +68,11 @@ jobs:
           platforms: linux/arm64
           push: true
           build-args: |
-            BASE_IMAGE=${{ github.event.inputs.base_image || 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base' }}
+            BASE_IMAGE=${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu128-a100-base' }}
           tags: |
             ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.version_tag }}
             ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.image_tags.outputs.version_tag }}
+            ${{ env.DOCKERHUB_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

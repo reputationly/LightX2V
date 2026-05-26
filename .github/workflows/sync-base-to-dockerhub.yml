@@ -1,0 +1,36 @@
+name: Sync base image (ACR -> Docker Hub)
+
+# 一次性 / 低频:把已在阿里云 ACR 的 base 镜像搬一份到 Docker Hub。
+# 之后常规 app 流水线(build-arm64-docker.yml)就从 Docker Hub 拉 base,
+# GHA 国外 runner 拉 Docker Hub 快,避免每次拉上海 ACR 的 ~38 分钟。
+# 只在 base 重建后才需要手动跑一次。
+on:
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: "要同步的 base 镜像 tag"
+        default: "arm64-cu128-a100-base"
+
+env:
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v
+  DOCKERHUB_REPO: arronlee/lightx2v
+
+jobs:
+  sync:
+    # registry 间直传,与架构无关,用标准 x86 runner 即可。
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Set up crane
+        uses: imjasonh/setup-crane@v0.4
+
+      # 源 ACR 仓是公开的,拉取不需要登录;只登录目标 Docker Hub 用于推送。
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | crane auth login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Copy base ACR -> Docker Hub
+        run: |
+          set -x
+          crane copy \
+            "${ACR_REPO}:${{ github.event.inputs.base_tag }}" \
+            "${DOCKERHUB_REPO}:${{ github.event.inputs.base_tag }}"
