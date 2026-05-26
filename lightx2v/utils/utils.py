@@ -306,6 +306,10 @@ def save_to_video(
                 "-",  # Input from pipe
                 "-vcodec",
                 "libx264",
+                "-crf",
+                "12",
+                "-preset",
+                "slow",
                 "-pix_fmt",
                 out_pix,
                 "-an",  # No audio

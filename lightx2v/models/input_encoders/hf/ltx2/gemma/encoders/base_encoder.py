@@ -1,13 +1,16 @@
 import functools
+import os
 from pathlib import Path
 from typing import NamedTuple
 
 import torch
+from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
 from lightx2v.models.input_encoders.hf.ltx2.gemma.embeddings_processor import EmbeddingsProcessor
 from lightx2v.models.input_encoders.hf.ltx2.gemma.tokenizer import LTXVGemmaTokenizer
 from lightx2v.models.input_encoders.hf.ltx2.utils import ModuleOps, find_matching_file
+from lightx2v_platform.base.global_var import AI_DEVICE
 
 
 class GemmaEncoderOutput(NamedTuple):
@@ -42,6 +45,89 @@ class GemmaTextEncoder(torch.nn.Module):
     def _convert_to_additive_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return (attention_mask.to(torch.int64) - 1).to(dtype).reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1])) * torch.finfo(dtype).max
 
+    @torch.no_grad()
+    def _run_text_model_layerwise_on_gpu(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        output_hidden_states: bool = True,
+    ) -> BaseModelOutputWithPast:
+        """Run Gemma text layers on GPU one at a time while keeping weights on CPU."""
+        text_model = self.model.model.language_model
+        device = torch.device(AI_DEVICE)
+        input_ids = input_ids.to(device)
+        attention_mask = attention_mask.to(device)
+
+        embed_tokens = text_model.embed_tokens.to(device)
+        hidden_states = embed_tokens(input_ids)
+        embed_tokens.to("cpu")
+
+        cache_position = torch.arange(0, hidden_states.shape[1], device=device)
+        position_ids = cache_position.unsqueeze(0)
+        mask_kwargs = {
+            "config": text_model.config,
+            "input_embeds": hidden_states,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": None,
+            "position_ids": position_ids,
+        }
+
+        import transformers.models.gemma3.modeling_gemma3 as modeling_gemma3
+
+        if text_model.config.use_bidirectional_attention:
+            mask_kwargs["or_mask_function"] = lambda *args: torch.tensor(True, dtype=torch.bool, device=device)
+            sliding_mask_kwargs = dict(mask_kwargs)
+            sliding_mask_kwargs["or_mask_function"] = modeling_gemma3._bidirectional_window_overlay(text_model.config.sliding_window)
+        else:
+            sliding_mask_kwargs = dict(mask_kwargs)
+
+        causal_mask_mapping = {
+            "full_attention": modeling_gemma3.create_causal_mask(**mask_kwargs),
+            "sliding_attention": modeling_gemma3.create_sliding_window_causal_mask(**sliding_mask_kwargs),
+        }
+
+        text_model.rotary_emb.to(device)
+        text_model.rotary_emb_local.to(device)
+        position_embeddings_global = text_model.rotary_emb(hidden_states, position_ids)
+        position_embeddings_local = text_model.rotary_emb_local(hidden_states, position_ids)
+        text_model.rotary_emb.to("cpu")
+        text_model.rotary_emb_local.to("cpu")
+
+        all_hidden_states = () if output_hidden_states else None
+        for decoder_layer in text_model.layers[: text_model.config.num_hidden_layers]:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+            decoder_layer.to(device)
+            layer_outputs = decoder_layer(
+                hidden_states,
+                position_embeddings_global=position_embeddings_global,
+                position_embeddings_local=position_embeddings_local,
+                attention_mask=causal_mask_mapping[decoder_layer.attention_type],
+                position_ids=position_ids,
+                past_key_values=None,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=cache_position,
+            )
+            hidden_states = layer_outputs[0]
+            decoder_layer.to("cpu")
+            torch.cuda.empty_cache()
+
+        text_model.norm.to(device)
+        hidden_states = text_model.norm(hidden_states)
+        text_model.norm.to("cpu")
+
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=None,
+            hidden_states=all_hidden_states,
+            attentions=None,
+        )
+
     def precompute(self, text: str, padding_side: str = "left") -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         """Blocks 1+2: Gemma model -> feature extraction.
         Used by process_captions.py for offline precomputation.
@@ -51,9 +137,15 @@ class GemmaTextEncoder(torch.nn.Module):
         token_pairs = self.tokenizer.tokenize_with_weights(text)["gemma"]
         input_ids = torch.tensor([[t[0] for t in token_pairs]], device=self.model.device)
         attention_mask = torch.tensor([[w[1] for w in token_pairs]], device=self.model.device)
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        if os.environ.get("LTX_GEMMA_LAYERWISE_GPU", "") == "1":
+            outputs = self._run_text_model_layerwise_on_gpu(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            attention_mask = attention_mask.to(outputs.last_hidden_state.device)
+        else:
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
 
         # Block 2: Feature extraction
+        if os.environ.get("LTX_GEMMA_LAYERWISE_GPU", "") == "1":
+            self.feature_extractor = self.feature_extractor.to(AI_DEVICE)
         video_feats, audio_feats = self.feature_extractor(outputs.hidden_states, attention_mask, padding_side)
         return video_feats, audio_feats, attention_mask
 
@@ -61,6 +153,8 @@ class GemmaTextEncoder(torch.nn.Module):
         """Full pipeline: precompute -> embeddings processor."""
         video_feats, audio_feats, attention_mask = self.precompute(text, padding_side)
         additive_mask = self._convert_to_additive_mask(attention_mask, video_feats.dtype)
+        if os.environ.get("LTX_GEMMA_LAYERWISE_GPU", "") == "1":
+            self.embeddings_processor = self.embeddings_processor.to(AI_DEVICE)
         video_enc, audio_enc, binary_mask = self.embeddings_processor.create_embeddings(video_feats, audio_feats, additive_mask)
         return GemmaEncoderOutput(video_enc, audio_enc, binary_mask)
 

@@ -69,6 +69,31 @@ def _ltx2_resize_video_denoise_mask_for_stage2(mask: torch.Tensor, target_h: int
     return m.permute(1, 0, 2, 3).contiguous()
 
 
+def _ltx2_debug_tensor_stats(name: str, tensor) -> None:
+    if os.environ.get("LTX_DEBUG_STATS", "") != "1" or tensor is None:
+        return
+    try:
+        if isinstance(tensor, torch.Tensor):
+            sample = tensor.detach()
+        else:
+            return
+        finite = torch.isfinite(sample)
+        finite_count = int(finite.sum().item())
+        total = sample.numel()
+        if finite_count:
+            stats = sample[finite].to(torch.float32)
+            logger.info(
+                f"[LTX_DEBUG_STATS] {name}: shape={tuple(sample.shape)} dtype={sample.dtype} "
+                f"device={sample.device} finite={finite_count}/{total} "
+                f"min={stats.min().item():.6g} max={stats.max().item():.6g} "
+                f"mean={stats.mean().item():.6g} std={stats.std(unbiased=False).item():.6g}"
+            )
+        else:
+            logger.info(f"[LTX_DEBUG_STATS] {name}: shape={tuple(sample.shape)} dtype={sample.dtype} device={sample.device} finite=0/{total}")
+    except Exception as exc:
+        logger.warning(f"[LTX_DEBUG_STATS] failed for {name}: {exc}")
+
+
 @RUNNER_REGISTER("ltx2")
 class LTX2Runner(DefaultRunner):
     def __init__(self, config):
@@ -710,6 +735,9 @@ class LTX2Runner(DefaultRunner):
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             self.video_vae, self.audio_vae = self.load_vae()
 
+        _ltx2_debug_tensor_stats("before_vae_video_latent", v_latent)
+        _ltx2_debug_tensor_stats("before_vae_audio_latent", a_latent)
+
         # Decode video latents (returns iterator)
         video = self.video_vae.decode(v_latent.unsqueeze(0).to(GET_DTYPE()))
         # Decode audio latents
@@ -736,7 +764,9 @@ class LTX2Runner(DefaultRunner):
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             self.upsampler = self.load_upsampler()
 
+        _ltx2_debug_tensor_stats("before_upsampler_video_latent", v_latent)
         upsampled_v_latent = self.upsampler.upsample(v_latent, self.video_vae.encoder).squeeze(0)
+        _ltx2_debug_tensor_stats("after_upsampler_video_latent", upsampled_v_latent)
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             del self.upsampler
             torch_device_module.empty_cache()
@@ -870,10 +900,14 @@ class LTX2Runner(DefaultRunner):
                 self.init_run_segment(segment_idx)
                 # 2. main inference loop
                 v_latent, a_latent = self.run_segment(segment_idx)
+                _ltx2_debug_tensor_stats("after_stage1_video_latent", v_latent)
+                _ltx2_debug_tensor_stats("after_stage1_audio_latent", a_latent)
 
                 ## upsample latent
                 if self.config.get("use_upsampler", False):
                     v_latent, a_latent = self.run_upsampler(v_latent, a_latent)
+                    _ltx2_debug_tensor_stats("after_stage2_video_latent", v_latent)
+                    _ltx2_debug_tensor_stats("after_stage2_audio_latent", a_latent)
                 # 3. vae decoder
                 self.gen_video, self.gen_audio = self.run_vae_decoder(v_latent, a_latent)
 

@@ -1,3 +1,4 @@
+import os
 from typing import Iterator
 
 import torch
@@ -20,6 +21,7 @@ from lightx2v.models.video_encoders.hf.ltx2.video_vae.model_configurator import 
     VideoEncoderConfigurator,
 )
 from lightx2v.models.video_encoders.hf.ltx2.video_vae.tiling import TilingConfig
+from lightx2v.models.video_encoders.hf.ltx2.video_vae.tiling import SpatialTilingConfig, TemporalTilingConfig
 from lightx2v.models.video_encoders.hf.ltx2.video_vae.video_vae import VideoDecoder, VideoEncoder, decode_video
 from lightx2v.utils.ltx2_media_io import *
 from lightx2v.utils.ltx2_utils import *
@@ -49,6 +51,16 @@ class LTX2VideoVAE:
         self.cpu_offload = cpu_offload
         self.grid_table = {}  # Cache for 2D grid calculations
         self.load()
+
+    def _build_tiling_config(self) -> TilingConfig:
+        spatial_tile = int(os.environ.get("LTX_VAE_SPATIAL_TILE", "512"))
+        spatial_overlap = int(os.environ.get("LTX_VAE_SPATIAL_OVERLAP", "64"))
+        temporal_tile = int(os.environ.get("LTX_VAE_TEMPORAL_TILE", "64"))
+        temporal_overlap = int(os.environ.get("LTX_VAE_TEMPORAL_OVERLAP", "24"))
+        return TilingConfig(
+            spatial_config=SpatialTilingConfig(tile_size_in_pixels=spatial_tile, tile_overlap_in_pixels=spatial_overlap),
+            temporal_config=TemporalTilingConfig(tile_size_in_frames=temporal_tile, tile_overlap_in_frames=temporal_overlap),
+        )
 
     def load(self) -> tuple[VideoEncoder | None, VideoDecoder | None]:
         config = self.loader.metadata(self.checkpoint_path)
@@ -110,12 +122,13 @@ class LTX2VideoVAE:
     ) -> Iterator[torch.Tensor]:
         # 如果启用了tiling但没有提供配置，使用默认配置
         if self.use_tiling and tiling_config is None:
-            tiling_config = TilingConfig.default()
+            tiling_config = self._build_tiling_config()
 
         if self.cpu_offload:
             self.decoder = self.decoder.to(AI_DEVICE)
         try:
-            yield from decode_video(latent, self.decoder, tiling_config, generator)
+            with torch.inference_mode():
+                yield from decode_video(latent, self.decoder, tiling_config, generator)
         finally:
             if self.cpu_offload:
                 self.decoder = self.decoder.to("cpu")
@@ -186,13 +199,14 @@ class LTX2AudioVAE:
         return out
 
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        if self.cpu_offload:
-            self.decoder = self.decoder.to(AI_DEVICE)
-            self.vocoder = self.vocoder.to(AI_DEVICE)
-        out = decode_audio(latent, self.decoder, self.vocoder)
-        if self.cpu_offload:
-            self.decoder = self.decoder.to("cpu")
-            self.vocoder = self.vocoder.to("cpu")
+        with torch.inference_mode():
+            if self.cpu_offload:
+                self.decoder = self.decoder.to(AI_DEVICE)
+                self.vocoder = self.vocoder.to(AI_DEVICE)
+            out = decode_audio(latent, self.decoder, self.vocoder)
+            if self.cpu_offload:
+                self.decoder = self.decoder.to("cpu")
+                self.vocoder = self.vocoder.to("cpu")
         return out
 
 

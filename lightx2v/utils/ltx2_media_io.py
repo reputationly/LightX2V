@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 from collections.abc import Generator, Iterator
 from fractions import Fraction
 from io import BytesIO
@@ -17,6 +18,35 @@ from lightx2v.models.video_encoders.hf.ltx2.audio_vae.ops import Audio
 DEFAULT_IMAGE_CRF = 33
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_video_chunk_stats(name: str, tensor: torch.Tensor) -> None:
+    if os.environ.get("LTX_DEBUG_STATS", "") != "1":
+        return
+    try:
+        sample = tensor.detach()
+        finite = torch.isfinite(sample)
+        finite_count = int(finite.sum().item())
+        total = sample.numel()
+        if finite_count:
+            stats = sample[finite].to(torch.float32)
+            logger.info(
+                "[LTX_DEBUG_STATS] %s: shape=%s dtype=%s device=%s finite=%s/%s min=%.6g max=%.6g mean=%.6g std=%.6g",
+                name,
+                tuple(sample.shape),
+                sample.dtype,
+                sample.device,
+                finite_count,
+                total,
+                stats.min().item(),
+                stats.max().item(),
+                stats.mean().item(),
+                stats.std(unbiased=False).item(),
+            )
+        else:
+            logger.info("[LTX_DEBUG_STATS] %s: shape=%s dtype=%s device=%s finite=0/%s", name, tuple(sample.shape), sample.dtype, sample.device, total)
+    except Exception as exc:
+        logger.warning("[LTX_DEBUG_STATS] failed for %s: %s", name, exc)
 
 
 def resize_aspect_ratio_preserving(image: torch.Tensor, long_side: int) -> torch.Tensor:
@@ -195,6 +225,7 @@ def encode_video(
         video = iter([video])
 
     first_chunk = next(video)
+    _debug_video_chunk_stats("before_save_first_video_chunk", first_chunk)
 
     _, height, width, _ = first_chunk.shape
 

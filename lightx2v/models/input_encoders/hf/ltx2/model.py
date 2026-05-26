@@ -1,4 +1,5 @@
 import gc
+import os
 from pathlib import Path
 
 import torch
@@ -145,13 +146,17 @@ class LTX2TextEncoder:
         Returns:
             List of tuples, each containing (v_context, a_context) tensors for each prompt.
         """
-        if self.cpu_offload:
+        gemma_on_cpu = os.environ.get("LTX_GEMMA_ON_CPU", "") == "1"
+        if self.cpu_offload and not gemma_on_cpu:
             self.text_encoder = self.text_encoder.to(AI_DEVICE)
         result = []
         for prompt in prompts:
             v_context, a_context, _ = self.text_encoder(prompt)
+            if gemma_on_cpu:
+                v_context = v_context.to(AI_DEVICE)
+                a_context = a_context.to(AI_DEVICE)
             result.append((v_context, a_context))
-        if self.cpu_offload:
+        if self.cpu_offload and not gemma_on_cpu:
             self.text_encoder = self.text_encoder.to("cpu")
         return result
 

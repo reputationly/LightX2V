@@ -1,0 +1,27 @@
+# LightX2V ARM64 App 层 — 仅更新 Python 代码，不重新编译 C++ 扩展
+# 用途：代码迭代时快速重建（~10 秒），基础镜像不变
+#
+# 前提：已有 arronlee/lightx2v:arm64-cu128（或本地 lightx2v-arm64:local）
+# 用法：
+#   docker build -f dockerfiles/Dockerfile_aarch64_app \
+#                --build-arg BASE_IMAGE=lightx2v-arm64:ltx \
+#                -t lightx2v-arm64:app .
+#   docker run --gpus all --network host \
+#     -v /shared/models:/shared/models:ro \
+#     -v /data/outputs:/data/outputs \
+#     lightx2v-arm64:app \
+#     python -m lightx2v.server --host 0.0.0.0 --port 8000
+#
+# 多卡 ulysses 再改用 torchrun:
+#   torchrun --nproc_per_node=4 -m lightx2v.server --host 0.0.0.0 --port 8000
+
+ARG BASE_IMAGE=arronlee/lightx2v:arm64-cu128
+FROM ${BASE_IMAGE}
+
+# 只替换 LightX2V Python 代码，不碰已编译的 flash_attn / SageAttention
+COPY . /opt/LightX2V
+RUN pip install --no-cache-dir -e /opt/LightX2V --no-deps
+
+ENV PYTHONPATH=/opt/LightX2V
+WORKDIR /workspace
+CMD ["/bin/bash"]
