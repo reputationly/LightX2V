@@ -1,24 +1,28 @@
 name: Build ARM64 Docker Image
 
-# 构建 ARM64 + CUDA 12.8 镜像并推送 Docker Hub
-# 触发：手动 / Dockerfile 变更 / 上游同步后
+# 构建 ARM64 A100 app 镜像并推送 Docker Hub
+# 依赖 CUDA 扩展的 base 镜像应先在 A100 服务器上低频构建并上传。
 on:
   workflow_dispatch:
     inputs:
-      tag:
-        description: "镜像 tag 后缀"
-        default: "arm64-cu128"
+      base_image:
+        description: "已预编译 CUDA 扩展的 ARM64 A100 base 镜像"
+        default: "arronlee/lightx2v:arm64-cu128-a100-base"
   push:
     branches: [main]
     paths:
-      - "dockerfiles/Dockerfile_aarch64_cu128"
+      - ".dockerignore"
+      - "dockerfiles/Dockerfile_aarch64_app"
+      - "lightx2v/**"
+      - "pyproject.toml"
+      - "setup.py"
       - ".github/workflows/build-arm64-docker.yml"
 
 jobs:
   build-arm64:
-    # GitHub 原生 ARM64 runner（公开仓库免费）。CUDA kernel 用 NVCC 交叉编译，构建期不需要 GPU
+    # GitHub 原生 ARM64 runner。这里只构建 app 层，不重新编译 flash_attn/SageAttention/q8 等 CUDA 扩展。
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 300
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,15 +36,26 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ARM64 image
+      - name: Generate image tags
+        id: image_tags
+        shell: bash
+        run: |
+          short_sha="${GITHUB_SHA::8}"
+          build_time="$(date -u +'%Y%m%d-%H%M')"
+          echo "version_tag=arm64-a100-${build_time}-${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=arm64-a100-latest" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ARM64 A100 app image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: dockerfiles/Dockerfile_aarch64_cu128
+          file: dockerfiles/Dockerfile_aarch64_app
           platforms: linux/arm64
           push: true
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu128-a100-base' }}
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:${{ github.event.inputs.tag || 'arm64-cu128' }}
-            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:arm64-latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:${{ steps.image_tags.outputs.version_tag }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/lightx2v:${{ steps.image_tags.outputs.latest_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
