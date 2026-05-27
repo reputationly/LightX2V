@@ -502,7 +502,9 @@ docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /
 |---|---|---|---|---|---|
 | LTX2.3 蒸馏1.1 | `ltx2_3_distill_v11_hq` 单卡 | 1280×768 / 121帧 / 24fps | 86s | 18.9GB | 干净 ✅ |
 | Wan2.2 Lightning | `test_480p_int8_prequant` int8 单卡 | 832×480 / 49帧 | 56s | 34.8GB | 干净 ✅ |
+| Wan2.2 Lightning | `cmp_720p_seko` int8 **4卡 ulysses** | 1280×720 / 49帧 | 51s | 34.6GB/卡 | 干净 ✅ |
 | Wan2.2（对照·勿用） | `wan22_t2v_lightning_single` 在线LoRA | 1280×720 / 121帧 | 284s | 33GB | ❌ **雪花废片** |
+| LTX2.3（4卡对照·勿用） | `ltx2_3_distill_v11_hq_ul4` **4卡 ulysses** | 1280×768 / 121帧 | >400s 未完 | GPU 全 0% | ❌ gemma 卡 CPU |
 
 ### 14.7 踩过的坑
 
@@ -516,7 +518,98 @@ docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /
 ### 14.8 目前还存在的问题
 
 1. **Wan2.2 在线 LoRA 雪花 bug 未修**（上游代码问题）。绕过：用预量化 int8。**若要上任意新 LoRA**，需先用 `tools/convert/converter.py --device cpu` 离线把 LoRA 合进 base 并 int8 量化，再用 `*_quantized_ckpt` 配置，不能走 `lora_dynamic_apply`。
-2. **Wan2.2 单卡 720p 未实测**：int8 单卡只验证了 480p（峰值已 34.8GB / 40GB）。720p/121帧激活更大，单卡可能 OOM；720p 走多卡 ulysses 预量化配置（`cmp_720p_*` / `test_720p_int8_ulysses2`），多卡需 `--shm-size=32g`。
+2. **Wan2.2 单卡 720p 未实测**（但 **4卡 ulysses 720p 已验证 51s 干净**，见 §14.6/§14.9）：int8 单卡只验证了 480p（峰值 34.8GB/40GB）；720p/121帧激活更大，单卡可能 OOM，故 720p 走多卡 ulysses 预量化配置（`cmp_720p_*` / `test_720p_int8_ulysses2`），多卡需 `--shm-size=32g`。
 3. **调色补丁 `utils_patched.py` 未进仓库**：线上若要那套饱和度/gamma 调色，需把改动提交进 `lightx2v/utils/utils.py` 后重出镜像。
 4. **可选后端未装**：sageattn3 / flashattention4 / sageattn3_sparse / decord 未装；LTX/Wan 基础推理不需要，animate 模型需 decord。
 5. **GHA 国外拉上海 base 慢**（38min）：已用「base 同步到 Docker Hub + build 从 Docker Hub 拉」降到 4.5min，见 §13。
+
+### 14.9 并行与量化能力结论（2026-05-27 4卡实测）
+
+| 模型 | 单卡 | 4卡 ulysses | int8 量化 | 最终建议 |
+|---|---|---|---|---|
+| **LTX2.3 蒸馏1.1** | 1280×768/121帧 **86s ✅** | ❌ >400s 未完（gemma 卡 CPU、GPU 全 0%） | ❌ 不支持 | **固定单卡 bf16** |
+| **Wan2.2 Lightning** | int8 480p 56s ✅ | int8 720p 51s ✅ | ✅ 必须（避雪花） | 单卡或多卡，**必须预量化 int8** |
+
+- **LTX 4卡 ulysses 不实用**：gemma 每 rank 冗余、在 ARM CPU 上串行慢算，4 张卡 GPU 全程 0% 利用率（与 §6 #8 同现象，即使逐层 GPU 也没改善）。**LTX 测试/部署都别加 4卡**，固定单卡。
+- **LTX 不支持 int8 量化**：`tools/convert/converter.py` 不支持 ltx2（只支持 wan_dit/qwen_image_dit 等）→ 无离线预量化路径；在线 `weight_auto_quant` 与 block offload 不兼容（`KeyError weight_scale`）；官方只发 bf16。故 **LTX 只能 bf16**。
+- **Wan 4卡 ulysses 有效**：无 gemma 瓶颈，ulysses 切序列/激活分摊 + 加速，能上 720p。但 **ulysses 不切权重**（每卡全量 int8 ~28GB），省权重只能靠量化（已 int8）或 offload，**加卡不减每卡权重显存**。
+- 两模型量化能力正好相反：**LTX 固定 bf16、Wan 必须 int8**。
+
+---
+
+## 15. 新镜像验收基础用例（出 Docker 后回归测试）
+
+> **每次出新 ARM64 A100 镜像后，跑以下 3 个基础用例确认镜像可用。** 覆盖两个模型 × 单卡/多卡 × bf16/int8。镜像统一用 `IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest`（或具体版本 tag）。权重/配置全在服务器 `edt-vpn`，路径见 §14.2 / §14.3。
+
+### 15.0 前置（每次必做）
+```bash
+# 1. 拉新镜像（国内拉 ACR 快；base 层已在本地只拉 app 层）
+docker pull crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest
+# 2. smoke：确认 torch/CUDA/flash_attn/lightx2v 都在
+docker run --rm --gpus all "$IMG" python -c "import torch,flash_attn,lightx2v;print('cuda',torch.cuda.is_available(),'fa',flash_attn.__version__)"
+#   期望：cuda True / fa 2.7.4.post1
+# 3. 起容器前先清旧容器（避免 8000 端口冲突）
+docker rm -f lightx2v-ltx-new lightx2v-wan-int8 lightx2v-wan-ul4 lightx2v-ltx-server lightx2v-server 2>/dev/null
+```
+
+### 用例总览
+
+| # | 模型 | 卡 | 配置 | 关键权重 | 预期（出片干净） |
+|---|---|---|---|---|---|
+| 1 | LTX2.3 蒸馏1.1 | 单卡 | `ltx2_3_distill_v11_hq.json` | `Lightricks/LTX-2.3` + `google/gemma-3-12b-...` | 1280×768 / 121帧 / 24fps / ~86s / ~18.9GB |
+| 2 | Wan2.2 Lightning | 单卡 | `test_480p_int8_prequant.json` | `wan22_t2v_int8` + `Wan-AI/Wan2.2-T2V-A14B`(T5/VAE) | 832×480 / 49帧 / ~56s / ~34.8GB |
+| 3 | Wan2.2 Lightning | 4卡 ulysses | `cmp_720p_seko.json` | `wan22_t2v_int8_seko` + `Wan-AI/Wan2.2-T2V-A14B` | 1280×720 / 49帧 / ~51s / ~34.6GB/卡 |
+
+> ⚠️ **红线**：Wan 一律走预量化 int8（勿用 `wan22_t2v_lightning_single.json` 等 `lora_dynamic_apply:true` 配置 → 雪花）；LTX 一律单卡（勿加 4卡 ulysses → gemma 卡 CPU）。
+
+### 15.1 用例 1 — LTX2.3 单卡（bf16）
+```bash
+docker run -d --name lightx2v-ltx-new --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e CUDA_VISIBLE_DEVICES=0 -e LTX_GEMMA_ON_CPU=1 -e LTX_GEMMA_LAYERWISE_GPU=1 \
+  -e LTX_VAE_SPATIAL_TILE=256 -e LTX_VAE_SPATIAL_OVERLAP=32 -e LTX_VAE_TEMPORAL_TILE=16 -e LTX_VAE_TEMPORAL_OVERLAP=8 \
+  "$IMG" python -m lightx2v.server --model_cls ltx2 --task t2av \
+  --model_path /data/models/Lightricks/LTX-2.3 \
+  --config_json /data/lightx2v_configs/ltx2_3_distill_v11_hq.json --host 0.0.0.0 --port 8000
+# 等 health 200（~5min 加载）后提交：
+bash /data/ltx_one.sh 121          # 产物 /data/outputs/ltx_test_probe.mp4
+```
+现成脚本：`/data/start_ltx_new.sh`。通过标准：status=completed、`elapsed≈86s`、`peak≈18.9GB`、`ffprobe` 为 1280×768/121帧/24fps、`blackdetect` 无、抽帧肉眼无异常。
+
+### 15.2 用例 2 — Wan2.2 Lightning 单卡（int8 预量化）
+```bash
+docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUDA_VISIBLE_DEVICES=0 \
+  "$IMG" python -m lightx2v.server --model_cls wan2.2_moe --task t2v \
+  --model_path /data/models/Wan-AI/Wan2.2-T2V-A14B \
+  --config_json /data/lightx2v_configs/test_480p_int8_prequant.json --host 0.0.0.0 --port 8000
+# 等 health 200（~3min）后提交：
+bash /data/wan_verify.sh           # 产物 /data/outputs/wan_verify.mp4（POST /v1/tasks/video/ + 轮询）
+```
+现成脚本：`/data/start_wan_int8.sh`。通过标准：completed、`elapsed≈56s`、832×480/49帧、抽帧无雪花。
+
+### 15.3 用例 3 — Wan2.2 Lightning 4卡 ulysses（int8 预量化，720p）
+```bash
+docker run -d --name lightx2v-wan-ul4 --gpus all --shm-size=32g -p 8000:8000 -p 8001:8001 -v /data:/data \
+  -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
+  "$IMG" torchrun --nproc_per_node=4 --master_port=29524 -m lightx2v.server \
+  --model_cls wan2.2_moe --task t2v --model_path /data/models/Wan-AI/Wan2.2-T2V-A14B \
+  --config_json /data/lightx2v_configs/cmp_720p_seko.json --host 0.0.0.0 --port 8000
+# 等 health 200（4 rank 加载 ~5-8min）后提交（同用例2，改 save_result_path）：
+```
+现成脚本：`/data/start_wan_ul4.sh`。通过标准：completed、`elapsed≈51s`、1280×720/49帧、每卡显存 ~28GB（ulysses 不切权重，正常）、抽帧无雪花。多卡必须 `--shm-size=32g`。
+
+### 15.4 通用产物验证
+```bash
+F=/data/outputs/<产物>.mp4
+ffprobe -v error -select_streams v:0 -show_entries stream=width,height,nb_frames,avg_frame_rate -of default=nw=1 "$F"   # 规格
+ffmpeg -v info -i "$F" -vf blackdetect=d=0.1:pix_th=0.10 -an -f null - 2>&1 | grep blackdetect || echo 无黑屏        # 黑屏
+ffmpeg -y -i "$F" -vf "select=eq(n\,20)" -vframes 1 frame.png                                                       # 抽帧肉眼看雪花
+```
+> 雪花 `blackdetect` 检测不出，**必须抽帧肉眼看**；旁证：雪花帧（高熵噪声）单帧 png 体积异常大（720p 雪花 2.4MB vs 干净 1.5MB）。
+
+### 15.5 验收红线（任一不满足即镜像/配置有问题）
+1. 三个用例都 `status=completed`、规格与上表一致、**抽帧无雪花**。
+2. 耗时不显著劣化（LTX ~86s / Wan 单卡 ~56s / Wan 4卡 ~51s，±30% 内）。
+3. 不出现 `KeyError weight_scale`（int8 量化路径正常）、不出现 OOM。
+4. **不踩红线**：Wan 不用 `lora_dynamic_apply` 配置、LTX 不加 4卡。
