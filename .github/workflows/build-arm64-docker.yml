@@ -20,6 +20,9 @@ on:
       - "setup.py"
       - ".github/workflows/build-arm64-docker.yml"
 
+permissions:
+  contents: write
+
 env:
   ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
   ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v
@@ -76,3 +79,39 @@ jobs:
             ${{ env.DOCKERHUB_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION_TAG: ${{ steps.image_tags.outputs.version_tag }}
+          LATEST_TAG: ${{ steps.image_tags.outputs.latest_tag }}
+          BASE_IMAGE: ${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu128-a100-base' }}
+        shell: bash
+        run: |
+          cat > release-notes.md <<EOF
+          ## ARM64 A100 Docker Image
+
+          Commit: \`${GITHUB_SHA}\`
+          Base image: \`${BASE_IMAGE}\`
+
+          ACR:
+          - \`${ACR_REPO}:${VERSION_TAG}\`
+          - \`${ACR_REPO}:${LATEST_TAG}\`
+
+          Docker Hub:
+          - \`${DOCKERHUB_REPO}:${VERSION_TAG}\`
+          - \`${DOCKERHUB_REPO}:${LATEST_TAG}\`
+
+          Build workflow: \`${GITHUB_WORKFLOW}\`
+          EOF
+
+          if gh release view "${VERSION_TAG}" >/dev/null 2>&1; then
+            gh release edit "${VERSION_TAG}" \
+              --title "ARM64 A100 ${VERSION_TAG}" \
+              --notes-file release-notes.md
+          else
+            gh release create "${VERSION_TAG}" \
+              --target "${GITHUB_SHA}" \
+              --title "ARM64 A100 ${VERSION_TAG}" \
+              --notes-file release-notes.md
+          fi
