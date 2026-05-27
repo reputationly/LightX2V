@@ -53,12 +53,6 @@ def get_preprocess_parser():
         default=1,
         help="The number of subdivisions for the grid along the 'h' dimension. A higher value results in a more detailed contour. A value of 1 means no subdivision is performed.",
     )
-    parser.add_argument(
-        "--trim_trailing_blank",
-        action="store_true",
-        default=False,
-        help="Deprecated alias for --drop_tail_invalid_frames.",
-    )
     return parser
 
 
@@ -91,7 +85,7 @@ def process_input_video(args):
         retarget_flag=args.retarget_flag,
         use_flux=args.use_flux,
         replace_flag=args.replace_flag,
-        drop_tail_invalid_frames=args.drop_tail_invalid_frames or args.trim_trailing_blank,
+        drop_tail_invalid_frames=args.drop_tail_invalid_frames,
     )
 
 
