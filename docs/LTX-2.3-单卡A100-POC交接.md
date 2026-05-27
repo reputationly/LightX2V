@@ -1,7 +1,7 @@
 # LTX 2.3 在鲲鹏 ARM + A100 上的本地化 POC — 交接文档
 
 > 面向接手的 agent：读完本文应当能完全复现当前进度、理解每个失败的根因、并直接接着「最新计划」往下做，无需回看历史会话。
-> 最后更新：2026-05-26（已完成单卡 A100 121 帧验证）。
+> 最后更新：2026-05-27（已完成单卡 A100 121 帧验证；已完成代码提交/CI 修复；**ARM64 出包已迁移到阿里云 ACR + Docker Hub 双地分发，见 §13**）。
 
 ---
 
@@ -14,6 +14,11 @@
 - LTX VAE decode 的 generator 消费过程包进 `torch.inference_mode()`，并把 VAE tiling 调小到 `256px / 16 frames`，解决保存视频阶段显存暴涨 OOM。
 
 当前推荐启动脚本：`/data/start_ltx_server_single_fixed.sh`。当前批量验证脚本：`/data/run_ltx5.sh`（已修 `status` 字段并改为 121 帧）。
+
+出包进度（已完成，详见 §13）：
+- ARM64 通用镜像出包已落地「阿里云 ACR + Docker Hub 双地分发」：base 在 A100 服务器构建后**直连推 ACR**，再用 crane 同步到 Docker Hub；日常 app 出包由 GitHub Actions `FROM Docker Hub base` 双推两地，约 4.5 分钟。
+- 地址：ACR `crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v`、Docker Hub `arronlee/lightx2v`。
+- 起因（已解决）：国内直推 Docker Hub 大 layer 被 GFW reset（torch 6.45GB 单层不可切 + Docker Hub 不支持断点续传），换国内 ACR 直连后一次过、零 RST。
 
 ---
 
@@ -251,10 +256,22 @@ GitHub Actions 示例：
     build-args: |
       BASE_IMAGE=arronlee/lightx2v:arm64-cu128-a100-base
     tags: |
+      arronlee/lightx2v:arm64-a100-YYYYMMDD-HHMM-<shortsha>
       arronlee/lightx2v:arm64-a100-latest
 ```
 
 依赖升级时才重建并上传 base；平时只改 LightX2V Python 代码，走 app 镜像即可。
+
+### 已提交的本地代码
+本地 Mac 仓库 `/Users/reputationly/Desktop/code/api/LightX2V` 已 push 到 `origin/main`。关键提交：
+
+| commit | 说明 |
+|---|---|
+| `6651fcc0` | LTX2 A100 offload/黑屏修复：gemma 逐层 GPU、VAE decode inference_mode、debug stats、`.dockerignore`、`Dockerfile_aarch64_app`、交接文档。 |
+| `e3726195` | GitHub Actions 改为 `Dockerfile_aarch64_app`，自动生成 `arm64-a100-YYYYMMDD-HHMM-<shortsha>` 与 `arm64-a100-latest` 两个 tag。 |
+| `01f56a46` | ruff 自动修复 import 顺序；CI lint 已通过。 |
+
+注意：`Dockerfile_aarch64_cu128` 只新增 `torchao` 并把 q8 注释改为通用 q8f 可选路径，**没有删除** Wan2.2 int8/q8/sgl/SpargeAttn 相关能力。通用镜像仍面向 A100 上的 Wan2.2 Lightning + LTX 2.3。
 
 ### 下一步：4 卡 ulysses
 现在 gemma 已经逐层 GPU 流式，4 卡 ulysses 不再会卡在 ARM CPU 文本编码。可直接改造 `/data/start_ltx_server_ul4.sh`，挂载同样补丁或使用 fixed 镜像，并添加上述环境变量。建议测试顺序：
@@ -329,3 +346,177 @@ ffmpeg -v info -i /data/outputs/ltx_night_market_768p121.mp4 \
 - **禁止**未经明确同意 rm/mv/truncate 任何 db/sqlite/dump 文件。
 - fork 新建源码文件**不要**复制上游 AGPL/QuantumNous 版权头。
 - 不擅自做破坏性 git/db 操作。
+
+---
+
+## 13. ARM64 镜像出包方案（阿里云 ACR + Docker Hub 双地分发）
+
+> 本节记录 2026-05-26～27 把 ARM64（鲲鹏 / A100 sm_80）通用镜像出包流程从「卡在 Docker Hub」迁移到「阿里云 ACR + Docker Hub 双地」的完整过程、根因、最终架构与操作手册。**取代 §0 / §9 中关于 Docker Hub 上传的过时描述。**
+
+### 13.1 目标
+通用 A100 镜像（同时服务 Wan2.2 Lightning + LTX 2.3 distill 1.1 等），用 GitHub Actions 出 app 包，部署到国内 A100（鲲鹏 ARM）节点。注意构建 base 的机器与部署机器是**同一台**（`edt-vpn` = 111.172.214.29）。
+
+### 13.2 最初的死结：国内直推 Docker Hub 被 GFW reset
+服务器经 xray（v2rayA，systemd 管理，监听 127.0.0.1:10809）推 29GB base 到 Docker Hub，大 layer 反复 `connection reset by peer`。根因三条：
+1. 最大层是 **torch 单个 pip 包 6.45GB**，一个 pip 包就装在一层里，**无法再切小**；
+2. **Docker Hub 不支持大 blob 断点续传**（单层必须一口气 PUT，断了整层重来）；
+3. 链路撑不住单层连续约 15 分钟（实测上行 ~7MB/s），最好的节点也只撑约 3 分钟就被 RST。
+
+排除掉的方向（都无效）：
+- **换 CF 节点**：v2rayA 里 40+ 个「节点」其实是同一个 vless 配置（同 uuid、同伪装域名 `edt.ovaijisuan.com`、同 ECH+fragment）的不同 Cloudflare 入口。延迟最低的 `saas.sin.fan` 反而每 16s 断，比 `arron.cf.090227`（约 3min）更差。GFW 针对的是流量特征（同 SNI），不是单纯某个 IP。
+- **关 ECH / 关 fragment / 换协议**：`fragment` 是 `tlshello` 模式只管握手；协议（vless/ws）是订阅服务端写死的、客户端改不了；真正能治长连接 RST 的 XHTTP 需要服务端支持，订阅节点没有。
+- **切层**：torch 6.45GB 单包切不动。
+
+### 13.3 解决：换阿里云上海 ACR 直连
+- 服务器在国内、上海 ACR 也在国内 → **直连**，绝不走 VPN（出墙绕回又慢又断）。
+- **必须配 NO_PROXY**：docker daemon 的 systemd proxy drop-in（`/etc/systemd/system/docker.service.d/*.conf`）里 `NO_PROXY` 末尾加 `.aliyuncs.com`，然后 `systemctl daemon-reload && systemctl restart docker`，否则 docker 会把发往上海的流量也塞进 xray 出墙绕回。
+- 用**公网地址**，不是 `-vpc` 那个（VPC 地址只有阿里云 ECS 在同一 VPC 内才能访问）。
+- 结果：29GB **一次过、零 RST**。
+
+### 13.4 最终架构：base/app 分层 + 双地分发
+
+| 阶段 | 做法 | 耗时 |
+|---|---|---|
+| **base 构建**（升级依赖时，低频） | A100 服务器 `dockerfiles/Dockerfile_aarch64_cu128` 本地编译 → 直连推 ACR | 几小时（编译 flash_attn/Sage 等） |
+| **base 同步到 Docker Hub**（base 重建后跑一次） | 手动触发 `sync-base-to-dockerhub.yml`，crane registry→registry 直传 | ~12 分钟 |
+| **日常出包**（改代码） | push → `build-arm64-docker.yml` 在 GHA ARM64 runner 上 `FROM Docker Hub base` → 叠代码层（`Dockerfile_aarch64_app`） → 双推 ACR + Docker Hub | ~4.5 分钟 |
+| **Release 记录** | app 镜像双推成功后，`build-arm64-docker.yml` 自动创建 GitHub Release，release tag 与镜像版本 tag 相同 | 自动 |
+
+地址与 tag：
+- ACR：`crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v`
+- Docker Hub：`arronlee/lightx2v`
+- base tag：`arm64-cu128-a100-base`；app tag：`arm64-a100-<YYYYMMDD-HHMM>-<shortsha>` + `arm64-a100-latest`
+- GitHub Release tag：同 app 版本 tag，例如 `arm64-a100-20260527-0608-27f65081`；Release notes 内记录 ACR/Docker Hub 两套镜像地址、latest tag、base image 与 commit。
+- 两边仓库都设**公开**，拉取免登录。
+
+### 13.5 两条 workflow
+- `.github/workflows/sync-base-to-dockerhub.yml`：手动触发（workflow_dispatch），用 `crane copy` 把 ACR base 搬到 Docker Hub。只登录目标 Docker Hub（源 ACR 公开仓免登录）。仅 base 重建后跑。
+- `.github/workflows/build-arm64-docker.yml`：push 触发。`FROM Docker Hub base`（GHA 国外拉 Docker Hub 快），叠代码层，双推 ACR + Docker Hub；push 成功后自动创建/更新 GitHub Release。
+
+### 13.6 实测耗时对比（为什么这么设计）
+
+| 路径 | 耗时 | 结论 |
+|---|---|---|
+| 服务器直推 Docker Hub | ∞（RST，0 层成功） | 死结，放弃 |
+| 服务器直连推 ACR | 一次过 | ✅ base 落地 ACR |
+| GHA 国外拉**上海** base 构建 | 38min | 太慢，弃 |
+| crane 同步 ACR→Docker Hub | 12min | ✅ 一次性/低频 |
+| GHA 拉 **Docker Hub** base 双推 | **4.5min** | ✅ 日常出包 |
+
+### 13.7 操作手册
+**A. 服务器推 base 到 ACR**（base 重建后）
+```bash
+# 1. 让 docker 直连 ACR：编辑 proxy drop-in，NO_PROXY 末尾加 .aliyuncs.com
+#    Environment="NO_PROXY=localhost,127.0.0.1,10.0.0.0/8,.aliyuncs.com"
+systemctl daemon-reload && systemctl restart docker
+docker info | grep -i "no proxy"   # 确认含 .aliyuncs.com
+# 2. 登录 + 打 tag + 推
+docker login crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+docker tag <本地 base> crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base
+while ! docker push crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base; do sleep 5; done
+```
+**B. 同步到 Docker Hub**：GitHub Actions → 手动触发 `Sync base image (ACR -> Docker Hub)`。
+**C. 日常出包**：push 代码即可，`Build ARM64 Docker Image` 自动跑，4.5 分钟双推两地。
+**D. GHA secrets**：`ACR_USERNAME`/`ACR_PASSWORD`（推 ACR）、`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`（账号 arronlee，同步/双推 Docker Hub）。
+
+### 13.8 已知坑
+- **顺序依赖**：base 必须先跑 Sync 推到 Docker Hub，build 才能 `FROM` 到；base 重建后记得重跑 Sync，否则 build 失败。
+- **NO_PROXY 不配 = 白换**：不配的话 docker 仍把上海流量塞进 xray。
+- **Docker Hub 仓库要设 public**：对外分发 + 拉取免登录。
+- **上游 x86 是另一套**：`dockerfiles/Dockerfile` 单体、`FROM pytorch/pytorch`，一个 Dockerfile 里源码编译全部扩展，从国外推 `lightx2v/lightx2v`（Docker Hub）+ `registry.cn-hangzhou.aliyuncs.com/yongyang/lightx2v`（阿里云杭州）。x86 能单体是因为有预编译 wheel + 国外网络好；ARM64 没这条件才拆 base/app + 走国内 ACR。
+
+---
+
+## 14. 通用镜像可用性验证（LTX2.3 + Wan2.2 Lightning 实测出片）
+
+> 2026-05-27 用发布到 ACR/Docker Hub 的新镜像 `arm64-a100-latest`（已 bake 修复、**无需任何 bind mount 补丁**）实测两个模型端到端出片。**结论：镜像可用，LTX2.3 和 Wan2.2 Lightning 都能出干净片**；Wan2.2 必须走预量化 int8 配置（在线 LoRA 路径会雪花，见 §14.7）。
+
+### 14.1 硬件与镜像
+
+- 服务器 `edt-vpn`（111.172.214.29，root），鲲鹏 ARM **aarch64**，4×A100 **40GB** PCIe（sm_80），CUDA 12.8，宿主内存 251GB。
+- 镜像：`crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest`（与 Docker Hub `arronlee/lightx2v:arm64-a100-latest` 同 digest）。国内 A100 拉 ACR 走国内带宽、快。
+- 镜像 smoke 验证（`docker run --rm --gpus all <img> python -c "import torch,flash_attn,lightx2v"`）：`torch 2.11.0+cu128 / cuda True / flash_attn 2.7.4.post1 / sageattention import OK / lightx2v 在 /opt/LightX2V`。
+- 当前状态：`lightx2v-wan-int8` 容器在 GPU0 常驻（int8 Wan server）。
+
+### 14.2 权重路径（服务器 `/data/models`）
+
+| 模型/组件 | 路径 |
+|---|---|
+| LTX2.3 DiT 蒸馏 | `Lightricks/LTX-2.3/ltx-2.3-22b-distilled-1.1.safetensors`（46GB bf16） |
+| LTX2.3 上采样器 | `Lightricks/LTX-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors` |
+| LTX2.3 gemma 文本编码器 | `google/gemma-3-12b-it-qat-q4_0-unquantized`（bf16 ~24GB） |
+| Wan2.2 base MoE | `Wan-AI/Wan2.2-T2V-A14B`（high_noise + low_noise 各 6 shard，含 T5 `models_t5_umt5-xxl-enc-bf16.pth`） |
+| Wan2.2 Lightning LoRA（在线，**雪花，勿用**） | `lightx2v/Wan2.2-Lightning/Wan2.2-T2V-A14B-4steps-lora-rank64-Seko-V2.0/`（high/low 各 1.2GB） |
+| Wan2.2 预量化 int8（**干净，要用**） | `wan22_t2v_int8`（1217 LoRA 合）、`wan22_t2v_int8_seko`（Seko 合）；各含 `high_noise_model` / `low_noise_model`（`distill_model_partN.safetensors`+index） |
+
+### 14.3 配置文件（`/data/lightx2v_configs`）
+
+| 模型 | 配置 | 说明 |
+|---|---|---|
+| LTX2.3 | `ltx2_3_distill_v11_hq.json` | 单卡基准，8步/121帧/768×1280/flash_attn2/upsampler/tiling ✅ |
+| Wan2.2 int8 单卡 | `test_480p_int8_prequant.json` | 预量化 int8，480p/49帧，单卡 ✅ |
+| Wan2.2 int8 720p 多卡 | `cmp_720p_seko.json`(4卡 Seko) / `cmp_720p_1217.json`(4卡) / `test_720p_int8_ulysses2.json`(2卡) | 预量化 int8 + ulysses |
+| ⚠️ **勿用** | `wan22_t2v_lightning_single.json` / `_ulysses2.json` | `lora_dynamic_apply:true` 在线 LoRA → **雪花废片** |
+
+### 14.4 启动 server（新镜像，无 bind mount 补丁）
+
+LTX2.3（脚本 `/data/start_ltx_new.sh`）：
+```bash
+IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest
+docker rm -f lightx2v-ltx-new 2>/dev/null
+docker run -d --name lightx2v-ltx-new --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+  -e CUDA_VISIBLE_DEVICES=0 -e LTX_GEMMA_ON_CPU=1 -e LTX_GEMMA_LAYERWISE_GPU=1 \
+  -e LTX_VAE_SPATIAL_TILE=256 -e LTX_VAE_SPATIAL_OVERLAP=32 -e LTX_VAE_TEMPORAL_TILE=16 -e LTX_VAE_TEMPORAL_OVERLAP=8 \
+  "$IMG" python -m lightx2v.server --model_cls ltx2 --task t2av \
+  --model_path /data/models/Lightricks/LTX-2.3 \
+  --config_json /data/lightx2v_configs/ltx2_3_distill_v11_hq.json --host 0.0.0.0 --port 8000
+```
+
+Wan2.2 Lightning（预量化 int8，脚本 `/data/start_wan_int8.sh`）：
+```bash
+docker rm -f lightx2v-wan-int8 2>/dev/null
+docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUDA_VISIBLE_DEVICES=0 \
+  "$IMG" python -m lightx2v.server --model_cls wan2.2_moe --task t2v \
+  --model_path /data/models/Wan-AI/Wan2.2-T2V-A14B \
+  --config_json /data/lightx2v_configs/test_480p_int8_prequant.json --host 0.0.0.0 --port 8000
+```
+就绪判据：`curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health` 返回 200（LTX 加载 ~5min，Wan int8 ~3min）。
+
+### 14.5 提交任务 + 验证产物
+
+- **LTX**：`bash /data/ltx_one.sh 121`（提交 night_market、轮询 `status` 字段、每 5s 记 GPU0 显存峰值；产物 `/data/outputs/ltx_test_probe.mp4`）。
+- **Wan**：`POST /v1/tasks/video/`，body `{prompt, negative_prompt, save_result_path, seed}`，轮询 `GET /v1/tasks/{id}/status`（脚本 `/data/wan_verify.sh`）。
+- **验证产物**：
+  ```bash
+  ffprobe -v error -select_streams v:0 -show_entries stream=width,height,nb_frames,avg_frame_rate "$F"   # 规格
+  ffmpeg -v info -i "$F" -vf blackdetect=d=0.1:pix_th=0.10 -an -f null - 2>&1 | grep blackdetect          # 黑屏
+  ffmpeg -y -i "$F" -vf "select=eq(n\,20)" -vframes 1 frame.png                                            # 抽帧肉眼看雪花
+  ```
+  ⚠️ **雪花用 blackdetect 检测不出**（不是黑屏），必须抽帧肉眼看；旁证：雪花帧（高熵噪声）压缩后单帧 png 体积异常大（雪花 720p 单帧 2.4MB vs 干净 480p 645KB）。
+
+### 14.6 实测结果
+
+| 模型 | 配置 | 规格 | 耗时 | 显存峰值 | 画质 |
+|---|---|---|---|---|---|
+| LTX2.3 蒸馏1.1 | `ltx2_3_distill_v11_hq` 单卡 | 1280×768 / 121帧 / 24fps | 86s | 18.9GB | 干净 ✅ |
+| Wan2.2 Lightning | `test_480p_int8_prequant` int8 单卡 | 832×480 / 49帧 | 56s | 34.8GB | 干净 ✅ |
+| Wan2.2（对照·勿用） | `wan22_t2v_lightning_single` 在线LoRA | 1280×720 / 121帧 | 284s | 33GB | ❌ **雪花废片** |
+
+### 14.7 踩过的坑
+
+1. **Wan 雪花**：`lora_dynamic_apply:true` 在线 LoRA 在 Wan2.2 T2V 上有 bug（2026-05-24 已定位，见 `new-api/docs/local-video-poc-checklist.md` §2.10.X），与镜像/sageattention/boundary 无关。解法：预量化 int8 配置。
+2. **端口 8000 already allocated**：旧容器没停干净就 run 新的。先 `docker rm -f` 所有相关容器（`lightx2v-ltx-* / lightx2v-wan-* / lightx2v-server`）、确认 `docker ps | grep 8000` 为空再启。
+3. **`sageattention not found` 日志**：只是 LightX2V 在探测高级变体（sageattn3 / flashattention4 / sageattn3_sparse），**基础 `sage_attn2` 实际可用**（`import sageattention` OK）。
+4. **`utils_patched.py`**：只是给 ffmpeg 加调色滤镜（`saturation=0.78,gamma=1.05,colorbalance`）的补丁，**非功能必需**，不挂不影响能否出片。
+5. **SSH/出墙网络不稳**：操作服务器用「短命令 + 重试循环」；长操作（push / 测速 / 生成）用 `nohup` 后台写日志 + 短 ssh `tail` 读日志，避免长连接半路断。
+6. **LTX 不再需要 patches**：gemma 逐层 GPU、VAE inference_mode 等修复已在 `origin/main`（`6651fcc0`）、即在镜像里，启动只需环境变量，不用 `/data/patches/*.py` bind mount。
+
+### 14.8 目前还存在的问题
+
+1. **Wan2.2 在线 LoRA 雪花 bug 未修**（上游代码问题）。绕过：用预量化 int8。**若要上任意新 LoRA**，需先用 `tools/convert/converter.py --device cpu` 离线把 LoRA 合进 base 并 int8 量化，再用 `*_quantized_ckpt` 配置，不能走 `lora_dynamic_apply`。
+2. **Wan2.2 单卡 720p 未实测**：int8 单卡只验证了 480p（峰值已 34.8GB / 40GB）。720p/121帧激活更大，单卡可能 OOM；720p 走多卡 ulysses 预量化配置（`cmp_720p_*` / `test_720p_int8_ulysses2`），多卡需 `--shm-size=32g`。
+3. **调色补丁 `utils_patched.py` 未进仓库**：线上若要那套饱和度/gamma 调色，需把改动提交进 `lightx2v/utils/utils.py` 后重出镜像。
+4. **可选后端未装**：sageattn3 / flashattention4 / sageattn3_sparse / decord 未装；LTX/Wan 基础推理不需要，animate 模型需 decord。
+5. **GHA 国外拉上海 base 慢**（38min）：已用「base 同步到 Docker Hub + build 从 Docker Hub 拉」降到 4.5min，见 §13。
