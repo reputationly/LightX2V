@@ -26,6 +26,12 @@ def get_preprocess_parser():
     parser.add_argument("--replace_flag", action="store_true", default=False, help="Whether to use replacement mode.")
     parser.add_argument("--retarget_flag", action="store_true", default=False, help="Whether to use pose retargeting. Currently only supported in animation mode")
     parser.add_argument(
+        "--drop_tail_invalid_frames",
+        action="store_true",
+        default=False,
+        help="Drop continuous invalid frames at the end of the driving video when body keypoints cannot be detected.",
+    )
+    parser.add_argument(
         "--use_flux",
         action="store_true",
         default=False,
@@ -51,7 +57,7 @@ def get_preprocess_parser():
         "--trim_trailing_blank",
         action="store_true",
         default=False,
-        help="Trim trailing frames with no detectable human action/pose at the end of the driving video.",
+        help="Deprecated alias for --drop_tail_invalid_frames.",
     )
     return parser
 
@@ -85,7 +91,7 @@ def process_input_video(args):
         retarget_flag=args.retarget_flag,
         use_flux=args.use_flux,
         replace_flag=args.replace_flag,
-        trim_trailing_blank=args.trim_trailing_blank,
+        drop_tail_invalid_frames=args.drop_tail_invalid_frames or args.trim_trailing_blank,
     )
 
 

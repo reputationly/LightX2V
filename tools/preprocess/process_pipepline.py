@@ -37,12 +37,14 @@ from utils import (
     get_face_bboxes,
     get_frame_indices,
     get_mask_body_img,
-    is_valid_action_pose_meta,
     padding_resize,
     resize_by_area,
     skip_replace_frame_outputs,
-    trim_trailing_blank_end,
 )
+
+BODY_KEYPOINT_CONF_THRESHOLD = 0.3
+MIN_VALID_BODY_KEYPOINTS = 4
+MASK_BODY_KEYPOINT_INDICES = [0, 1, 2, 5, 8, 11, 10, 13]
 
 
 class ProcessPipeline:
@@ -59,15 +61,108 @@ class ProcessPipeline:
 
             self.flux_kontext = FluxKontextPipeline.from_pretrained(flux_kontext_path, torch_dtype=torch.bfloat16).to("cuda")
 
-    def _trim_trailing_blank_end(self, valid_flags, trim_trailing_blank, mode_name):
-        if not trim_trailing_blank:
-            return len(valid_flags)
-        end = trim_trailing_blank_end(valid_flags)
-        if end == 0:
-            raise ValueError(f"{mode_name} preprocessing failed: no detectable human action in driving video")
-        if end < len(valid_flags):
-            logger.info(f"trim_trailing_blank: trimmed {len(valid_flags) - end} trailing blank frames, keeping {end}/{len(valid_flags)}")
-        return end
+    @staticmethod
+    def _get_body_keypoints(pose_meta):
+        if pose_meta is None:
+            return None
+        body_keypoints = pose_meta.get("keypoints_body")
+        if body_keypoints is None:
+            return None
+        try:
+            body_keypoints = np.asarray(body_keypoints, dtype=np.float32)
+        except (TypeError, ValueError):
+            return None
+        if body_keypoints.ndim != 2 or body_keypoints.shape[1] < 3:
+            return None
+        return body_keypoints
+
+    @classmethod
+    def _get_valid_body_keypoint_mask(cls, pose_meta, keypoint_indices=None):
+        body_keypoints = cls._get_body_keypoints(pose_meta)
+        if body_keypoints is None:
+            return None, None
+        if keypoint_indices is not None:
+            valid_indices = [idx for idx in keypoint_indices if idx < body_keypoints.shape[0]]
+            body_keypoints = body_keypoints[valid_indices] if valid_indices else body_keypoints[:0]
+        if body_keypoints.shape[0] == 0:
+            return body_keypoints, np.zeros((0,), dtype=bool)
+
+        coords = body_keypoints[:, :2]
+        scores = body_keypoints[:, 2]
+        valid_mask = (
+            np.isfinite(coords).all(axis=1) & np.isfinite(scores) & (coords[:, 0] >= 0) & (coords[:, 0] <= 1) & (coords[:, 1] >= 0) & (coords[:, 1] <= 1) & (scores >= BODY_KEYPOINT_CONF_THRESHOLD)
+        )
+        return body_keypoints, valid_mask
+
+    @classmethod
+    def _count_valid_body_keypoints(cls, pose_meta):
+        _, valid_mask = cls._get_valid_body_keypoint_mask(pose_meta)
+        if valid_mask is None:
+            return 0
+        return int(np.count_nonzero(valid_mask))
+
+    @classmethod
+    def _is_valid_pose_meta(cls, pose_meta):
+        return cls._count_valid_body_keypoints(pose_meta) >= MIN_VALID_BODY_KEYPOINTS
+
+    @classmethod
+    def _get_pose_valid_flags(cls, pose_metas):
+        return [cls._is_valid_pose_meta(meta) for meta in pose_metas]
+
+    @staticmethod
+    def _trim_tail_invalid_frames(frames, pose_metas, pose_valid_flags, mode_name):
+        last_valid_idx = None
+        for idx in range(len(pose_valid_flags) - 1, -1, -1):
+            if pose_valid_flags[idx]:
+                last_valid_idx = idx
+                break
+
+        if last_valid_idx is None:
+            raise ValueError(f"{mode_name} preprocessing failed: no valid human body keypoints detected in driving video")
+
+        drop_count = len(pose_valid_flags) - last_valid_idx - 1
+        if drop_count > 0:
+            logger.info(f"{mode_name} preprocessing: dropped {drop_count} trailing invalid frame(s) without valid body keypoints")
+
+        keep_end = last_valid_idx + 1
+        return frames[:keep_end], pose_metas[:keep_end], pose_valid_flags[:keep_end]
+
+    @staticmethod
+    def _empty_face_image(frame):
+        return np.zeros((512, 512, frame.shape[2]), dtype=frame.dtype)
+
+    def _build_face_images(self, frames, pose_metas, pose_valid_flags=None):
+        face_images = []
+        for idx, meta in enumerate(pose_metas):
+            frame = frames[idx]
+            if pose_valid_flags is not None and not pose_valid_flags[idx]:
+                logger.warning(f"Frame {idx}: no valid body keypoints, using empty face crop")
+                face_images.append(self._empty_face_image(frame))
+                continue
+
+            try:
+                face_bbox_for_image = get_face_bboxes(meta["keypoints_face"][:, :2], scale=1.3, image_shape=(frames[0].shape[0], frames[0].shape[1]))
+                x1, x2, y1, y2 = face_bbox_for_image
+                face_image = frame[y1:y2, x1:x2]
+                if face_image.size == 0:
+                    raise ValueError("empty face crop")
+                face_image = cv2.resize(face_image, (512, 512))
+            except (KeyError, TypeError, ValueError, cv2.error) as e:
+                logger.warning(f"Frame {idx}: invalid face keypoints ({e}), using empty face crop")
+                face_image = self._empty_face_image(frame)
+            face_images.append(face_image)
+        return face_images
+
+    @classmethod
+    def _get_body_prompt_points(cls, pose_meta, width, height):
+        if not cls._is_valid_pose_meta(pose_meta):
+            return np.zeros((0, 2), dtype=np.int32)
+        body_keypoints, valid_mask = cls._get_valid_body_keypoint_mask(pose_meta, keypoint_indices=MASK_BODY_KEYPOINT_INDICES)
+        if body_keypoints is None or valid_mask is None or not valid_mask.any():
+            return np.zeros((0, 2), dtype=np.int32)
+        keypoints_body = body_keypoints[valid_mask][:, :2]
+        wh = np.array([[width, height]])
+        return (keypoints_body * wh).astype(np.int32)
 
     def __call__(
         self,
@@ -83,7 +178,7 @@ class ProcessPipeline:
         retarget_flag=False,
         use_flux=False,
         replace_flag=False,
-        trim_trailing_blank=False,
+        drop_tail_invalid_frames=False,
     ):
         if replace_flag:
             video_reader = VideoReader(video_path)
@@ -115,15 +210,15 @@ class ProcessPipeline:
             logger.info(f"Processing pose meta")
 
             tpl_pose_metas = self.pose2d(frames)
+            pose_valid_flags = self._get_pose_valid_flags(tpl_pose_metas)
+            if drop_tail_invalid_frames:
+                frames, tpl_pose_metas, pose_valid_flags = self._trim_tail_invalid_frames(frames, tpl_pose_metas, pose_valid_flags, "Animate replace")
 
-            face_images = []
-            for idx, meta in enumerate(tpl_pose_metas):
-                face_bbox_for_image = get_face_bboxes(meta["keypoints_face"][:, :2], scale=1.3, image_shape=(frames[0].shape[0], frames[0].shape[1]))
+            invalid_pose_count = len(pose_valid_flags) - sum(pose_valid_flags)
+            if invalid_pose_count > 0:
+                logger.info(f"Animate replace preprocessing: {invalid_pose_count}/{len(pose_valid_flags)} frame(s) have invalid body keypoints")
 
-                x1, x2, y1, y2 = face_bbox_for_image
-                face_image = frames[idx][y1:y2, x1:x2]
-                face_image = cv2.resize(face_image, (512, 512))
-                face_images.append(face_image)
+            face_images = self._build_face_images(frames, tpl_pose_metas, pose_valid_flags)
 
             logger.info(f"Processing reference image: {refer_image_path}")
             refer_img = cv2.imread(refer_image_path)
@@ -142,14 +237,20 @@ class ProcessPipeline:
                 cond_images.append(conditioning_image)
             masks = self.get_mask(frames, 400, tpl_pose_metas)
 
-            pose_valid = [is_valid_action_pose_meta(meta) for meta in tpl_pose_metas]
             bg_images = []
             aug_masks = []
-            replace_frame_valid = []
+            replace_frame_count = 0
 
             for frame_idx, (frame, mask) in enumerate(zip(frames, masks)):
+                if not pose_valid_flags[frame_idx]:
+                    logger.warning(f"Frame {frame_idx}: no valid body keypoints, skipping character replacement for this frame")
+                    each_bg_image, each_aug_mask = skip_replace_frame_outputs(frame)
+                    bg_images.append(each_bg_image)
+                    aug_masks.append(each_aug_mask)
+                    continue
+
                 each_aug_mask = None
-                if pose_valid[frame_idx] and mask is not None and mask.sum() > 0:
+                if mask is not None and mask.sum() > 0:
                     if iterations > 0:
                         _, each_mask = get_mask_body_img(frame, mask, iterations=iterations, k=k)
                         if each_mask.sum() > 0:
@@ -158,33 +259,19 @@ class ProcessPipeline:
                         each_aug_mask = mask
 
                 if each_aug_mask is None or each_aug_mask.sum() == 0:
-                    if not pose_valid[frame_idx]:
-                        logger.warning(f"Frame {frame_idx}: no valid pose, skipping character replacement for this frame")
-                    else:
-                        logger.warning(f"Frame {frame_idx}: no valid person mask, skipping character replacement for this frame")
+                    logger.warning(f"Frame {frame_idx}: no valid person mask, skipping character replacement for this frame")
                     each_bg_image, each_aug_mask = skip_replace_frame_outputs(frame)
-                    replace_frame_valid.append(False)
                 else:
                     each_bg_image = frame * (1 - each_aug_mask[:, :, None])
-                    replace_frame_valid.append(True)
+                    replace_frame_count += 1
 
                 bg_images.append(each_bg_image)
                 aug_masks.append(each_aug_mask)
 
-            end = self._trim_trailing_blank_end(pose_valid, trim_trailing_blank, "Animate replace")
-            face_images = face_images[:end]
-            cond_images = cond_images[:end]
-            bg_images = bg_images[:end]
-            aug_masks = aug_masks[:end]
-            replace_frame_valid = replace_frame_valid[:end]
-            replace_frame_count = sum(replace_frame_valid)
-
             if replace_frame_count == 0:
                 raise ValueError("Animate replace preprocessing failed: no stable human body detected in driving video")
-            if replace_frame_count < len(replace_frame_valid):
-                logger.info(
-                    f"Replace preprocessing: {replace_frame_count}/{len(replace_frame_valid)} frames will be replaced, {len(replace_frame_valid) - replace_frame_count} frames kept as original"
-                )
+            if replace_frame_count < len(frames):
+                logger.info(f"Replace preprocessing: {replace_frame_count}/{len(frames)} frames will be replaced, {len(frames) - replace_frame_count} frames kept as original")
 
             src_face_path = os.path.join(output_path, "src_face.mp4")
             mpy.ImageSequenceClip(face_images, fps=fps).write_videofile(src_face_path)
@@ -237,25 +324,12 @@ class ProcessPipeline:
 
             logger.info(f"Processing pose meta")
 
-            tpl_pose_meta0 = self.pose2d(frames[:1])[0]
             tpl_pose_metas = self.pose2d(frames)
-
-            face_images = []
-            for idx, meta in enumerate(tpl_pose_metas):
-                face_bbox_for_image = get_face_bboxes(meta["keypoints_face"][:, :2], scale=1.3, image_shape=(frames[0].shape[0], frames[0].shape[1]))
-
-                x1, x2, y1, y2 = face_bbox_for_image
-                face_image = frames[idx][y1:y2, x1:x2]
-                face_image = cv2.resize(face_image, (512, 512))
-                face_images.append(face_image)
-
-            frame_valid = [is_valid_action_pose_meta(meta) for meta in tpl_pose_metas]
-            end = self._trim_trailing_blank_end(frame_valid, trim_trailing_blank, "Animate")
-            frames = frames[:end]
-            tpl_pose_metas = tpl_pose_metas[:end]
-            face_images = face_images[:end]
-            if len(tpl_pose_metas) == 0:
-                raise ValueError("Animate preprocessing failed: no frames left after trimming trailing blank frames")
+            pose_valid_flags = self._get_pose_valid_flags(tpl_pose_metas)
+            if drop_tail_invalid_frames:
+                frames, tpl_pose_metas, pose_valid_flags = self._trim_tail_invalid_frames(frames, tpl_pose_metas, pose_valid_flags, "Animate")
+            tpl_pose_meta0 = tpl_pose_metas[0]
+            face_images = self._build_face_images(frames, tpl_pose_metas, pose_valid_flags)
 
             if retarget_flag:
                 if use_flux:
@@ -366,7 +440,7 @@ class ProcessPipeline:
 
         return tpl_prompt, refer_prompt
 
-    def get_mask(self, frames, th_step, kp2ds_all):
+    def get_mask(self, frames, th_step, kp2ds_all, use_valid_body_keypoints=True):
         frame_num = len(frames)
         masks = [None] * frame_num
         if frame_num < th_step:
@@ -388,25 +462,37 @@ class ProcessPipeline:
 
             key_frame_step = max(len(kp2ds) // key_frame_num, 1)
             key_frame_index_list = list(range(0, len(kp2ds), key_frame_step))[:key_frame_num]
+            if use_valid_body_keypoints:
+                key_frame_index_list = [key_frame_index for key_frame_index in key_frame_index_list if self._is_valid_pose_meta(kp2ds[key_frame_index])]
+                if len(key_frame_index_list) == 0:
+                    valid_frame_indices = [idx for idx, meta in enumerate(kp2ds) if self._is_valid_pose_meta(meta)]
+                    if len(valid_frame_indices) > key_frame_num:
+                        selected_indices = np.linspace(0, len(valid_frame_indices) - 1, key_frame_num, dtype=np.int32)
+                        key_frame_index_list = [valid_frame_indices[idx] for idx in selected_indices]
+                    else:
+                        key_frame_index_list = valid_frame_indices
 
             key_points_index = [0, 1, 2, 5, 8, 11, 10, 13]
             key_frame_body_points_list = []
             for key_frame_index in key_frame_index_list:
-                keypoints_body_list = []
-                body_key_points = kp2ds[key_frame_index]["keypoints_body"]
-                for each_index in key_points_index:
-                    each_keypoint = body_key_points[each_index]
-                    if None is each_keypoint:
+                if use_valid_body_keypoints:
+                    points = self._get_body_prompt_points(kp2ds[key_frame_index], kp2ds[0]["width"], kp2ds[0]["height"])
+                else:
+                    keypoints_body_list = []
+                    body_key_points = kp2ds[key_frame_index]["keypoints_body"]
+                    for each_index in key_points_index:
+                        each_keypoint = body_key_points[each_index]
+                        if None is each_keypoint:
+                            continue
+                        keypoints_body_list.append(each_keypoint)
+
+                    if len(keypoints_body_list) == 0:
+                        key_frame_body_points_list.append(np.zeros((0, 2), dtype=np.int32))
                         continue
-                    keypoints_body_list.append(each_keypoint)
 
-                if len(keypoints_body_list) == 0:
-                    key_frame_body_points_list.append(np.zeros((0, 2), dtype=np.int32))
-                    continue
-
-                keypoints_body = np.array(keypoints_body_list)[:, :2]
-                wh = np.array([[kp2ds[0]["width"], kp2ds[0]["height"]]])
-                points = (keypoints_body * wh).astype(np.int32)
+                    keypoints_body = np.array(keypoints_body_list)[:, :2]
+                    wh = np.array([[kp2ds[0]["width"], kp2ds[0]["height"]]])
+                    points = (keypoints_body * wh).astype(np.int32)
                 key_frame_body_points_list.append(points)
 
             chunk_masks = {}

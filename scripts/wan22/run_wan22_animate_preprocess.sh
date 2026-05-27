@@ -11,7 +11,7 @@ export CUDA_VISIBLE_DEVICES=0
 # set environment variables
 source ${lightx2v_path}/scripts/base/base.sh
 
-# animate preprocess without trim trailing blank
+# animate preprocess without drop_tail_invalid_frames
 python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
     --ckpt_path ${model_path}/process_checkpoint \
     --video_path $video_path  \
@@ -20,7 +20,7 @@ python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
     --resolution_area 1280 720 \
     --retarget_flag
 
-# # animate preprocess with trim trailing blank
+# animate preprocess with drop_tail_invalid_frames
 # python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --ckpt_path ${model_path}/process_checkpoint \
 #     --video_path $video_path  \
@@ -28,9 +28,9 @@ python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --save_path ${lightx2v_path}/save_results/animate/process_results \
 #     --resolution_area 1280 720 \
 #     --retarget_flag \
-#     --trim_trailing_blank
+#     --drop_tail_invalid_frames
 
-# # replace preprocess without trim trailing blank
+# replace preprocess without drop_tail_invalid_frames
 # python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --ckpt_path ${model_path}/process_checkpoint \
 #     --video_path $video_path  \
@@ -43,7 +43,7 @@ python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --h_len 1 \
 #     --replace_flag
 
-# # replace preprocess with trim trailing blank
+# replace preprocess with drop_tail_invalid_frames
 # python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --ckpt_path ${model_path}/process_checkpoint \
 #     --video_path $video_path  \
@@ -55,4 +55,4 @@ python ${lightx2v_path}/tools/preprocess/preprocess_data.py \
 #     --w_len 1 \
 #     --h_len 1 \
 #     --replace_flag \
-#     --trim_trailing_blank
+#     --drop_tail_invalid_frames
