@@ -10,15 +10,6 @@ on:
       base_image:
         description: "base 镜像(默认 Docker Hub;需先跑 Sync base 流水线把 base 同步过去)"
         default: "arronlee/lightx2v:arm64-cu128-a100-base"
-  push:
-    branches: [main]
-    paths:
-      - ".dockerignore"
-      - "dockerfiles/Dockerfile_aarch64_app"
-      - "lightx2v/**"
-      - "pyproject.toml"
-      - "setup.py"
-      - ".github/workflows/build-arm64-docker.yml"
 
 permissions:
   contents: write
