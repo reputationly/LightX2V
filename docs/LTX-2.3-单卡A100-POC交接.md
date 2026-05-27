@@ -613,3 +613,78 @@ ffmpeg -y -i "$F" -vf "select=eq(n\,20)" -vframes 1 frame.png                   
 2. 耗时不显著劣化（LTX ~86s / Wan 单卡 ~56s / Wan 4卡 ~51s，±30% 内）。
 3. 不出现 `KeyError weight_scale`（int8 量化路径正常）、不出现 OOM。
 4. **不踩红线**：Wan 不用 `lora_dynamic_apply` 配置、LTX 不加 4卡。
+
+---
+
+## 16. 标准内容测试集 + 压测方案
+
+> 在 §15 基础验收通过后，用本节做**内容质量测试**（8 个 prompt × 2 模型）和**能力压测**（找 OOM 边界）。Prompt 按官方推荐结构化：主体+外观+动作+环境+光影+镜头运动+风格。
+
+### 16.1 测试矩阵
+8 个 prompt（4 真人短剧 + 4 动漫，4 风格各异）**在两个模型上都跑**：
+- **Wan2.2 Lightning**：4 卡 ulysses + int8 预量化（`cmp_720p_seko.json`，720p），`task t2v`。
+- **LTX2.3 蒸馏1.1**：单卡 bf16（`ltx2_3_distill_v11_hq.json`，1280×768），`task t2av`。
+
+共 16 次生成。每次验证：`status=completed` + `ffprobe` 规格 + **抽帧 Read 比对画质**（雪花/崩坏/语义偏离，见 §15.4）。
+
+### 16.2 八个 Prompt（中英文最终版）
+
+**真人短剧（亚洲人 + 简单剧情，中文优先）**
+
+1. `cafe_reunion` 雨天咖啡馆重逢
+   - 中：暖色调电影感画面。一位二十多岁的亚洲年轻女性独自坐在咖啡馆靠窗的位置，手捧一杯热咖啡，窗外下着小雨、玻璃上挂满水珠。她抬头透过窗户看到一位老朋友推门进来，脸上露出惊喜的微笑，放下杯子起身挥手。浅景深，背景虚化的暖黄灯光，镜头缓缓推近。
+   - EN: Warm cinematic tone. A young Asian woman in her twenties sits alone by a café window holding a hot coffee, light rain streaking the glass. She looks up, sees an old friend pushing the door open, her face lighting up with a surprised smile as she sets down the cup and stands to wave. Shallow depth of field, blurred warm golden bokeh, slow dolly-in.
+
+2. `night_market_wok` 夜市小吃摊
+   - 中：霓虹夜市，手持跟拍。一位亚洲中年男厨师在小吃摊前熟练颠勺翻炒，锅中火光腾起、热气与油烟升腾，旁边几位顾客排队等候、边看边聊。背景是模糊的彩色霓虹招牌。烟火气十足，暖橙色调。
+   - EN: Neon night market, handheld tracking shot. A middle-aged Asian male cook skillfully tosses food in a wok at a street stall, flames leaping and steam rising. A few customers wait in line, chatting and watching. Blurred colorful neon signs behind. Lively street-food atmosphere, warm orange tone.
+
+3. `subway_commute` 清晨地铁通勤
+   - 中：冷色调，固定机位。早高峰的地铁车厢里，一位穿西装的亚洲上班族站在扶手旁低头刷手机，周围乘客拥挤。列车缓缓进站、车门打开，人流涌动进出。车厢内日光灯偏冷白，窗外站台灯光掠过。写实纪实风格。
+   - EN: Cool tone, static shot. Inside a crowded rush-hour subway car, an Asian office worker in a suit stands by the handrail scrolling his phone, surrounded by commuters. The train slows into the station, doors slide open, crowds flow in and out. Cool white fluorescent light, platform lights sweeping past windows. Realistic documentary style.
+
+4. `park_taichi` 公园晨练太极
+   - 中：金色晨光，慢镜头环绕。一位亚洲老人在公园的树下缓慢打太极拳，动作舒展平和，几片落叶从空中飘过。清晨阳光透过树叶洒下斑驳光影，薄雾笼罩。镜头围绕老人缓缓旋转，宁静祥和。
+   - EN: Golden morning light, slow orbiting shot. An elderly Asian man practices Tai Chi slowly under a tree in a park, movements graceful and calm, a few leaves drifting by. Morning sunlight filters through leaves casting dappled light, thin mist. Camera slowly orbits him. Serene and peaceful.
+
+**动漫（4 种区分明显的风格）**
+
+5. `anime_sakura` 日系赛璐璐
+   - 中：日本动画赛璐璐风格，鲜艳明亮。樱花树下，一位身穿校服的少女抬头仰望，微风吹起她的长发和飘落的粉色花瓣。蓝天白云，阳光明媚。清晰的线条和色块，经典 TV 动画质感。
+   - EN: Japanese anime cel-shaded style, vibrant and bright. Under a cherry blossom tree, a schoolgirl looks up, a gentle breeze lifting her long hair and the falling pink petals. Blue sky with white clouds, bright sunshine. Clean lines and flat color shading, classic TV-anime look.
+
+6. `ghibli_field` 吉卜力水彩
+   - 中：吉卜力工作室水彩手绘风格，柔和温暖。乡间绿色的田野上，一个少年张开双臂奔跑，远处是翻涌的云海和连绵的山丘。柔和的自然光，细腻的水彩笔触，治愈系氛围。
+   - EN: Studio Ghibli hand-painted watercolor style, soft and warm. A boy runs with arms outstretched across green countryside fields, rolling hills and a sea of clouds in the distance. Soft natural light, delicate watercolor brushwork, healing nostalgic atmosphere.
+
+7. `cyberpunk_girl` 赛博朋克霓虹
+   - 中：赛博朋克动画风格，高对比霓虹。雨夜的未来都市街道，霓虹灯牌倒映在湿漉漉的地面上，一位机械义体少女缓缓回眸，发丝间闪烁蓝紫色光芒。强烈的青色与品红撞色，电影级氛围。
+   - EN: Cyberpunk anime style, high-contrast neon. A rainy-night futuristic city street, neon signs reflecting on wet ground. A cyborg girl slowly turns to look back, blue-purple glow shimmering through her hair. Strong cyan-magenta color clash, cinematic mood.
+
+8. `ink_crane` 国风水墨
+   - 中：中国水墨动画风格，大量留白。青绿山水之间，一只白鹤展翅缓缓掠过，云雾在山峰间缭绕流动。淡雅的墨色晕染，写意笔触，古典诗意，宁静悠远。
+   - EN: Chinese ink-wash animation style, generous negative space. Among blue-green mountains and rivers, a white crane glides slowly with spread wings, mist swirling between peaks. Elegant ink washes, freehand brushstrokes, classical poetic, tranquil and distant.
+
+### 16.3 执行
+1. 起两个 server（不同时，单机 8000 端口复用）：Wan 用 §15.3 启动、LTX 用 §15.1 启动。
+2. 每个 prompt 提交，`save_result_path` 命名 `/data/outputs/<model>_<slug>.mp4`（如 `wan_cafe_reunion.mp4` / `ltx_cafe_reunion.mp4`）：
+   ```bash
+   curl -s -X POST http://localhost:8000/v1/tasks/video/ -H 'Content-Type: application/json' \
+     -d '{"prompt":"<上面对应 prompt>","negative_prompt":"low quality, blurry, distorted","save_result_path":"/data/outputs/<model>_<slug>.mp4","seed":42}'
+   # 轮询 GET /v1/tasks/{id}/status 至 completed
+   ```
+3. 逐个抽帧 Read 比对画质（雪花/手部崩坏/语义偏离/风格是否到位）。
+
+### 16.4 压测方案（找 OOM 边界，记录最大能力）
+只压两组（按你定）：**Wan2.2 4卡 int8** 与 **LTX2.3 单卡 bf16**。固定一维、爬另一维到 OOM。
+
+- **维度 A 分辨率**：480p(832×480) → 720p(1280×720) → 1080p(1920×1080) → 2K …
+- **维度 B 帧数**：49 → 81 → 121 → 161 → 201 → 241 …
+- 每档记录：通过/OOM、显存峰值、耗时；OOM 后回退一档确认稳定上限。
+
+| 组 | 起始基线 | 压测记录（待填） | 最大稳定能力（待填） |
+|---|---|---|---|
+| Wan2.2 4卡 int8 | 720p / 49帧 / 51s / 34.6GB/卡 | | |
+| LTX2.3 单卡 bf16 | 1280×768 / 121帧 / 86s / 18.9GB | | |
+
+> 注意：Wan 改分辨率/帧数直接在请求体加 `target_height/target_width/target_video_length`（覆盖 config）；LTX 同理。每次 OOM 后该 server 可能需重启清显存。
