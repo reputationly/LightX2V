@@ -18,6 +18,7 @@
 # 开关(环境变量):
 #   SKIP_PULL=1        跳过镜像拉取(离线/已确认本地即目标镜像时); 默认总是 pull 刷新
 #   SKIP_PREFLIGHT=1   跳过前置镜像 smoke(import 检查); 默认执行
+#   SKIP_GPU_GUARD=1   跳过 GPU 空闲检查; 默认检查(有残留计算进程则终止)
 #
 # 前提: 在 A100 服务器(edt-vpn)上运行, /data 下有权重/配置, 且有
 #       /data/ltx_one.sh 与 /data/wan_verify.sh 两个提交脚本。
@@ -94,6 +95,19 @@ verify(){  # $1=file $2=W $3=H $4=F $5=snow_kb $6=case ; 返回 0=通过
   fi
   bad "用例$cs 验证失败 -${notes}  (抽帧图 $png 可肉眼复核)"
   return 1
+}
+
+gpu_guard(){  # 确认要用的卡空闲: 容器预清理后仍有残留计算进程则列出并终止 (SKIP_GPU_GUARD=1 跳过)
+  command -v nvidia-smi >/dev/null 2>&1 || { warn "无 nvidia-smi, 跳过 GPU 空闲检查"; return 0; }
+  local procs
+  procs=$(nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader 2>/dev/null)
+  if [ -n "$procs" ]; then
+    bad "GPU 上有残留计算进程, 可能 OOM/冲突, 终止 (确认无碍可 SKIP_GPU_GUARD=1 跳过):"
+    echo "$procs" | sed 's/^/    /'
+    warn "如确认是你自己的旧容器, 先 docker ps 找到并 docker rm -f, 或 kill 对应 PID 后重跑"
+    exit 3
+  fi
+  ok "GPU 空闲检查通过 (无残留计算进程, 4 卡可用)"
 }
 
 preflight(){  # 镜像级 smoke: 秒级确认依赖/server 可 import, 坏镜像立即终止, 不浪费每用例 5~10min 加载
@@ -196,6 +210,9 @@ fi
 
 # 预清理所有相关容器, 避免 8000 端口冲突
 for c in lightx2v-ltx-new lightx2v-wan-int8 lightx2v-wan-ul4 lightx2v-ltx-server lightx2v-server; do rm_container "$c"; done
+
+# 清理后检查 GPU 是否真的空闲 (排除别的容器/裸进程占卡; 可用 SKIP_GPU_GUARD=1 跳过)
+[ "${SKIP_GPU_GUARD:-0}" = "1" ] || gpu_guard
 
 for c in $CASES; do
   case "$c" in
