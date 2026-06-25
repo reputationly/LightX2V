@@ -706,10 +706,17 @@ class LTX2Runner(DefaultRunner):
         prompt = input_info.prompt
         neg_prompt = input_info.negative_prompt
 
-        v_context_p, a_context_p, v_context_n, a_context_n = self.text_encoders[0].infer(
-            prompt=prompt,
-            negative_prompt=neg_prompt,
-        )
+        if self.config.get("enable_cfg", False):
+            v_context_p, a_context_p, v_context_n, a_context_n = self.text_encoders[0].infer(
+                prompt=prompt,
+                negative_prompt=neg_prompt,
+            )
+        else:
+            # CFG disabled (distilled models): the negative context is never consumed during
+            # denoising (see pre_infer infer_condition branch). Skip encoding the negative prompt
+            # to halve the text-encoder time. The placeholders below are never used.
+            ((v_context_p, a_context_p),) = self.text_encoders[0].encode_text([prompt])
+            v_context_n, a_context_n = v_context_p, a_context_p
         text_encoder_output = {
             "v_context_p": v_context_p,
             "a_context_p": a_context_p,
