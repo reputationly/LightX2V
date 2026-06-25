@@ -792,10 +792,11 @@ ffmpeg -y -i "$F" -vf "select=eq(n\,20)" -vframes 1 frame.png                   
 | 3 卡 ulysses | `seq_p_size:3` | ❌ 同上 | gemma 冗余瓶颈与卡数无关 |
 | 3 实例数据并行（gemma 留 CPU） | 3 个 docker 各绑 1 卡，`LTX_GEMMA_ON_CPU=1` | ❌ 严重劣化 | 单任务 **600–710s**（单实例 86s 的 7–8 倍）；8 任务 round-robin，906s 只出 6 个 |
 | 多实例 + gemma 整搬 GPU | 关 `LTX_GEMMA_ON_CPU` | ❌ OOM | 2 实例 49 帧都 OOM（GPU 顶满 40431MiB，247s failed） |
+| 3 实例 + CPU 绑核 | 各绑 1 个 NUMA node 32 核（`--cpuset-cpus`）+ 1 GPU，gemma 留 CPU | ❌ 仍劣化 | 3 并发各 539-559s（不绑核 600-710s，仅快 ~15%，仍是单卡 86s 的 6 倍）；证实瓶颈是**内存带宽**而非核竞争 |
 
 ### 18.2 根因：gemma 困境
 LTX 的 gemma-3-12b 文本编码器（bf16 ~24GB）是并发瓶颈，两条路都堵死：
-- **留 CPU**（`LTX_GEMMA_ON_CPU=1` + 逐层 GPU）：单卡不 OOM（常驻仅 ~2GB），但多实例/多卡 encode 时**争抢 ARM CPU 算力 + 内存带宽** → 严重拖慢。
+- **留 CPU**（`LTX_GEMMA_ON_CPU=1` + 逐层 GPU）：单卡不 OOM（常驻仅 ~2GB），但多实例/多卡 encode 时**争抢 ARM CPU 内存带宽** → 严重拖慢。CPU 绑核（每实例独占一个 NUMA node 32 核）实测只快 ~15%（650s→550s），证实主因是**内存带宽竞争**而非核竞争——绑核也救不了。
 - **整搬 GPU**（关 `LTX_GEMMA_ON_CPU`）：不争 CPU，但单卡 24GB gemma + DiT + 上采样器 + 激活 **> 40GB → OOM**。
 
 Wan2.2 没有这个问题（用 T5 + int8 量化，4 卡 ulysses 有效），所以 Wan 能多卡、LTX 不能。
