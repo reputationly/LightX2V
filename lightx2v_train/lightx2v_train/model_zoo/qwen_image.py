@@ -26,7 +26,15 @@ class QwenImageModel(BaseModel):
 
     pipeline_cls = QwenImagePipeline
 
-    def load_components(self):
+    def load_components(self, transformer_only=False, reference_model=None):
+        if transformer_only:
+            if reference_model is not None:
+                self.text_pipeline = reference_model.text_pipeline
+                self.vae = reference_model.vae
+                self.vae_scale_factor = reference_model.vae_scale_factor
+                self.image_processor = reference_model.image_processor
+            self.transformer = self.load_transformer()
+            return
         model_path = self.config["model"]["pretrained_model_name_or_path"]
         self.text_pipeline = QwenImagePipeline.from_pretrained(
             model_path,
@@ -35,12 +43,32 @@ class QwenImageModel(BaseModel):
             torch_dtype=self.running_dtype,
         ).to(self.device)
         self.vae = AutoencoderKLQwenImage.from_pretrained(model_path, subfolder="vae").to(self.device, dtype=self.running_dtype)
-        self.transformer = QwenImageTransformer2DModel.from_pretrained(model_path, subfolder="transformer").to(self.device, dtype=self.running_dtype)
+        self.transformer = self.load_transformer()
 
         self.text_pipeline.text_encoder.requires_grad_(False)
         self.vae.requires_grad_(False)
         self.vae_scale_factor = 2 ** len(self.vae.temperal_downsample)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
+
+    def load_transformer(self):
+        model_path = self.config["model"]["pretrained_model_name_or_path"]
+        return QwenImageTransformer2DModel.from_pretrained(model_path, subfolder="transformer").to(self.device, dtype=self.running_dtype)
+
+    def denoiser_module(self):
+        return self.transformer
+
+    def fsdp2_shard_plan(self, fsdp_config):
+        reshard_config = fsdp_config["reshard_after_forward"]
+        return [
+            {
+                "modules": self.transformer.transformer_blocks,
+                "reshard_after_forward": reshard_config["block_reshard"],
+            },
+            {
+                "module": self.transformer,
+                "reshard_after_forward": reshard_config["root_reshard"],
+            },
+        ]
 
     def encode_to_latent(self, sample):
         image = sample["target_image"].to(device=self.device, dtype=self.running_dtype)
@@ -53,6 +81,9 @@ class QwenImageModel(BaseModel):
 
     def encode_condition(self, sample):
         prompt = sample["prompt"]
+        return self.encode_prompt_condition(prompt)
+
+    def encode_prompt_condition(self, prompt):
         prompt_embed, prompt_embed_mask = self.text_pipeline.encode_prompt(
             prompt=prompt,
             device=self.device,
@@ -64,7 +95,7 @@ class QwenImageModel(BaseModel):
             "prompt_embed_mask": prompt_embed_mask,
         }
 
-    def prepare_denoiser_input(self, noisy_latent):
+    def prepare_denoiser_input(self, noisy_latent, condition=None):
         # noisy_latent: (B, C, T, H, W)
         n = noisy_latent.shape[0]
         h, w = noisy_latent.shape[3], noisy_latent.shape[4]
@@ -100,6 +131,15 @@ class QwenImageModel(BaseModel):
         latent_w = width // self.vae_scale_factor
         shape = (1, self.vae.config.z_dim, 1, latent_h, latent_w)
         return torch.randn(shape, generator=generator, device=self.device, dtype=self.running_dtype)
+
+    def dmd_latent_shape(self, batch_size, height, width):
+        return (
+            int(batch_size),
+            int(self.vae.config.z_dim),
+            1,
+            int(height) // self.vae_scale_factor,
+            int(width) // self.vae_scale_factor,
+        )
 
     def decode_latent(self, latent):
         # Reverse the normalization from encode_to_latent:

@@ -10,10 +10,9 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
-try:
-    from lightx2v.models.runners.flux2.flux2_runner import Flux2DevRunner, Flux2KleinRunner  # noqa: F401
-except (ImportError, ModuleNotFoundError) as e:
-    logger.warning(f"Flux2 runners not available: {e}")
+from lightx2v.common.ops import *
+from lightx2v.models.runners.ernie_image.ernie_image_runner import ErnieImageRunner  # noqa: F401
+from lightx2v.models.runners.flux2.flux2_runner import Flux2DevRunner, Flux2KleinRunner  # noqa: F401
 from lightx2v.models.runners.hunyuan_video.hunyuan_video_15_runner import HunyuanVideo15Runner  # noqa: F401
 from lightx2v.models.runners.longcat_image.longcat_image_runner import LongCatImageRunner  # noqa: F401
 from lightx2v.models.runners.ltx2.ltx2_runner import LTX2Runner  # noqa: F401
@@ -24,6 +23,7 @@ from lightx2v.models.runners.wan.wan_animate_runner import WanAnimateRunner  # n
 from lightx2v.models.runners.wan.wan_audio_runner import Wan22AudioRunner, WanAudioRunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_distill_runner import WanDistillRunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_lingbot_fast_runner import LingbotFastRunner  # noqa: F401
+from lightx2v.models.runners.wan.wan_lingbot_va_runner import LingbotVARunner  # noqa: F401
 from lightx2v.models.runners.wan.wan_matrix_game2_runner import WanSFMtxg2Runner  # noqa: F401
 from lightx2v.models.runners.wan.wan_matrix_game3_runner import WanMatrixGame3Runner  # noqa: F401
 from lightx2v.models.runners.wan.wan_runner import Wan22MoeRunner, WanRunner  # noqa: F401
@@ -104,6 +104,7 @@ class LightX2VPipeline:
             "wan2.2_audio",
             "wan2.2_moe_distill",
             "wan2.2_animate",
+            "wan2.2_s2v",
         ]:
             self.vae_stride = (4, 8, 8)
             if self.model_cls.startswith("wan2.2"):
@@ -135,6 +136,10 @@ class LightX2VPipeline:
                 self.prompt_template_encode_start_idx = 34
         elif self.model_cls in ["z_image"]:
             self.model_cls = "z_image"
+        elif model_cls in ["ernie_image", "ernie-image", "ERNIE-Image"]:
+            self.model_cls = "ernie_image"
+        elif model_cls in ["ernie_image_turbo", "ernie-image-turbo", "ERNIE-Image-Turbo"]:
+            self.model_cls = "ernie_image_turbo"
         elif self.model_cls in ["flux2_klein"]:
             self.model_cls = "flux2_klein"
         elif self.model_cls in ["flux2_dev"]:
@@ -337,6 +342,7 @@ class LightX2VPipeline:
             "wan2.2_audio",
             "wan2.2_moe_distill",
             "wan2.2_animate",
+            "wan2.2_s2v",
         ]:
             self.t5_cpu_offload = text_encoder_offload
             self.clip_encoder_offload = image_encoder_offload
@@ -426,6 +432,7 @@ class LightX2VPipeline:
         action_path=None,
         video_path=None,  # For SR task (video super-resolution)
         image_strength=None,
+        i2i_denoise_strength=None,
         image_frame_idx=None,
         last_frame_path=None,
         audio_path=None,
@@ -439,6 +446,7 @@ class LightX2VPipeline:
         # Run inference (following LightX2V pattern)
         # Note: image_path supports comma-separated paths for multiple images
         # image_strength can be a scalar (float/int) or a list matching the number of images
+        # i2i_denoise_strength controls single-image edit redraw strength when explicitly set
         # image_frame_idx: optional list of pixel frame indices (one per image), or None to evenly space in [0, num_frames-1]
         self.seed = seed
         self.image_path = image_path
@@ -456,6 +464,7 @@ class LightX2VPipeline:
         self.return_result_tensor = return_result_tensor
         self.target_shape = target_shape
         self.image_strength = image_strength
+        self.i2i_denoise_strength = i2i_denoise_strength
         self.image_frame_idx = image_frame_idx
         if task is not None:
             self.task = task

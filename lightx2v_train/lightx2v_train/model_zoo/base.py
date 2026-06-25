@@ -1,12 +1,19 @@
+import json
 import os
 
 import torch
+from diffusers.models.modeling_utils import SAFETENSORS_WEIGHTS_NAME, SAFE_WEIGHTS_INDEX_NAME
 from diffusers.utils import convert_state_dict_to_diffusers
 from diffusers.utils.peft_utils import get_adapter_name
+from huggingface_hub import split_torch_state_dict_into_shards
+from loguru import logger
 from peft import LoraConfig
-from peft.utils import get_peft_model_state_dict
-from safetensors.torch import save_file
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+from safetensors.torch import load_file, save_file
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 
+from lightx2v_train.runtime.distributed import is_main_process
+from lightx2v_train.runtime.fsdp import is_fsdp2_module
 from lightx2v_train.utils.utils import get_running_dtype
 
 
@@ -14,12 +21,14 @@ class BaseModel:
     def __init__(self, config):
         self.config = config
         self.running_dtype = get_running_dtype(config["model"]["running_dtype"])
-        self.device = torch.device("cuda")
-        self.transformer = None
+        self.device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         self.vae = None
 
-    def load_components(self):
+    def load_components(self, transformer_only=False, reference_model=None):
         raise NotImplementedError
+
+    def denoiser_module(self):
+        raise NotImplementedError(f"{self.__class__.__name__} must define denoiser_module().")
 
     def add_lora(self, rank, alpha, target_modules):
         lora_config = LoraConfig(
@@ -28,24 +37,55 @@ class BaseModel:
             init_lora_weights="gaussian",
             target_modules=target_modules,
         )
-        self.transformer.add_adapter(lora_config)
+        self.denoiser_module().add_adapter(lora_config)
 
     def set_lora_trainable(self):
-        self.transformer.requires_grad_(False)
-        self.transformer.train()
-        for name, param in self.transformer.named_parameters():
+        denoiser = self.denoiser_module()
+        denoiser.requires_grad_(False)
+        denoiser.train()
+        for name, param in denoiser.named_parameters():
             param.requires_grad = "lora" in name
 
     def set_full_trainable(self):
-        self.transformer.requires_grad_(True)
-        self.transformer.train()
+        denoiser = self.denoiser_module()
+        denoiser.requires_grad_(True)
+        denoiser.train()
 
     def trainable_parameters(self):
-        return (p for p in self.transformer.parameters() if p.requires_grad)
+        return (p for p in self.denoiser_module().parameters() if p.requires_grad)
 
     def enable_gradient_checkpointing(self):
-        if hasattr(self.transformer, "enable_gradient_checkpointing"):
-            self.transformer.enable_gradient_checkpointing()
+        denoiser = self.denoiser_module()
+        if hasattr(denoiser, "enable_gradient_checkpointing"):
+            denoiser.enable_gradient_checkpointing()
+
+    def set_denoiser_eval(self):
+        self.denoiser_module().eval()
+
+    def is_fsdp2_wrapped(self):
+        return is_fsdp2_module(self.denoiser_module())
+
+    def fsdp2_state_module(self):
+        return self.denoiser_module()
+
+    def set_fsdp2_gradient_sync(self, enabled):
+        denoiser = self.denoiser_module()
+        if hasattr(denoiser, "set_requires_gradient_sync"):
+            denoiser.set_requires_gradient_sync(enabled)
+        if hasattr(denoiser, "set_is_last_backward"):
+            denoiser.set_is_last_backward(enabled)
+
+    def fsdp2_shard_plan(self, fsdp_config):
+        raise NotImplementedError(f"{self.__class__.__name__} must define fsdp2_shard_plan().")
+
+    def log_model_structure(self):
+        logger.info("[model] class={}", self.__class__.__name__)
+        text_encoder = getattr(getattr(self, "text_pipeline", None), "text_encoder", None)
+        if text_encoder is not None:
+            logger.info("[model] text_encoder structure:\n{}", text_encoder)
+        if self.vae is not None:
+            logger.info("[model] vae structure:\n{}", self.vae)
+        logger.info("[model] denoiser structure:\n{}", self.denoiser_module())
 
     def encode_to_latent(self, sample):
         raise NotImplementedError
@@ -53,7 +93,7 @@ class BaseModel:
     def encode_condition(self, sample):
         raise NotImplementedError
 
-    def prepare_denoiser_input(self, noisy_latent, sample, condition):
+    def prepare_denoiser_input(self, noisy_latent, condition=None):
         raise NotImplementedError
 
     def denoise(self, denoiser_input, timesteps, condition):
@@ -64,6 +104,12 @@ class BaseModel:
 
     def prepare_infer_latents(self, height, width, generator=None):
         raise NotImplementedError
+
+    def dmd_latent_shape(self, batch_size, height, width):
+        raise NotImplementedError(f"{self.__class__.__name__} must define dmd_latent_shape().")
+
+    def cfg_on_denoiser_output(self):
+        return False
 
     def decode_latent(self, latent):
         raise NotImplementedError
@@ -80,29 +126,51 @@ class BaseModel:
             "guidance_scale": infer_config.get("cfg_guidance_scale", 4.0),
         }
 
+    def get_pipeline_sample_kwargs(self, sample):
+        """Return per-sample kwargs to pass to pipeline.__call__ during native inference."""
+        return {}
+
     def load_lora_for_infer(self, lora_path, adapter_name=None):
+        denoiser = self.denoiser_module()
         if adapter_name is None:
-            adapter_name = get_adapter_name(self.transformer)
-        self.transformer.load_lora_adapter(lora_path, adapter_name=adapter_name)
+            adapter_name = get_adapter_name(denoiser)
+        denoiser.load_lora_adapter(lora_path, adapter_name=adapter_name)
         self._infer_lora_adapter_name = adapter_name
 
     def unload_lora_for_infer(self):
         adapter_name = getattr(self, "_infer_lora_adapter_name", None)
         if adapter_name is not None:
-            self.transformer.delete_adapters(adapter_name)
+            self.denoiser_module().delete_adapters(adapter_name)
             self._infer_lora_adapter_name = None
 
     def save_lora_weights(self, save_dir):
-        lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(self.transformer))
+        peft_state_dict = self._get_lora_state_dict_for_save()
+        if not is_main_process():
+            return
+
+        lora_state_dict = convert_state_dict_to_diffusers(peft_state_dict)
         if hasattr(self.pipeline_cls, "save_lora_weights"):
             self.pipeline_cls.save_lora_weights(save_dir, lora_state_dict, safe_serialization=True)
         else:
             save_file(lora_state_dict, f"{save_dir}/pytorch_lora_weights.safetensors")
 
-    def load_lora_weights_for_resume(self, lora_path):
-        from peft.utils import set_peft_model_state_dict
-        from safetensors.torch import load_file
+    def _get_lora_state_dict_for_save(self):
+        denoiser = self.denoiser_module()
+        if not is_fsdp2_module(denoiser):
+            return get_peft_model_state_dict(denoiser)
 
+        options = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            ignore_frozen_params=True,
+            strict=False,
+        )
+        state_dict, _ = get_state_dict(denoiser, (), options=options)
+        if not is_main_process():
+            return {}
+        return get_peft_model_state_dict(denoiser, state_dict=state_dict)
+
+    def load_lora_weights_for_resume(self, lora_path):
         raw = load_file(os.path.join(lora_path, "pytorch_lora_weights.safetensors"))
         peft_state_dict = {}
         for key, value in raw.items():
@@ -111,9 +179,55 @@ class BaseModel:
             new_key = new_key.replace(".lora.up.weight", ".lora_B.weight")
             peft_state_dict[new_key] = value
 
-        incompatible = set_peft_model_state_dict(self.transformer, peft_state_dict)
+        incompatible = set_peft_model_state_dict(self.denoiser_module(), peft_state_dict)
         if incompatible and incompatible.unexpected_keys:
-            print(f"Warning: unexpected keys when resuming LoRA: {incompatible.unexpected_keys}")
+            logger.warning("Unexpected keys when resuming LoRA: {}", incompatible.unexpected_keys)
+
+    def load_full_weights_for_resume(self, resume_ckpt_path):
+        raise NotImplementedError(f"{self.__class__.__name__} must define load_full_weights_for_resume().")
 
     def save_full_model(self, save_dir):
-        self.transformer.save_pretrained(f"{save_dir}/transformer", safe_serialization=True)
+        denoiser = self.denoiser_module()
+        transformer_dir = os.path.join(save_dir, "transformer")
+        if not is_fsdp2_module(denoiser):
+            if is_main_process():
+                denoiser.save_pretrained(transformer_dir, safe_serialization=True)
+            return
+
+        options = StateDictOptions(
+            full_state_dict=True,
+            cpu_offload=True,
+            ignore_frozen_params=False,
+            strict=False,
+        )
+        logger.info("[checkpoint] gathering consolidated full model state dict")
+        state_dict, _ = get_state_dict(denoiser, (), options=options)
+        if is_main_process():
+            self._save_full_state_dict(transformer_dir, denoiser, state_dict)
+
+    def _save_full_state_dict(self, save_dir, denoiser, state_dict):
+        logger.info("[checkpoint] saving consolidated transformer weights to {}", save_dir)
+        os.makedirs(save_dir, exist_ok=True)
+        denoiser.save_config(save_dir)
+
+        weights_name_pattern = SAFETENSORS_WEIGHTS_NAME.replace(".safetensors", "{suffix}.safetensors")
+        state_dict_split = split_torch_state_dict_into_shards(
+            state_dict,
+            max_shard_size="10GB",
+            filename_pattern=weights_name_pattern,
+        )
+
+        for filename, tensors in state_dict_split.filename_to_tensors.items():
+            shard = {tensor: state_dict[tensor].contiguous() for tensor in tensors}
+            save_file(shard, os.path.join(save_dir, filename), metadata={"format": "pt"})
+
+        if state_dict_split.is_sharded:
+            index = {
+                "metadata": state_dict_split.metadata,
+                "weight_map": state_dict_split.tensor_to_filename,
+            }
+            index_path = os.path.join(save_dir, SAFE_WEIGHTS_INDEX_NAME)
+            with open(index_path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(index, indent=2, sort_keys=True) + "\n")
+
+        logger.info("[checkpoint] saved consolidated transformer weights to {}", save_dir)

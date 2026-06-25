@@ -26,6 +26,8 @@ class ImageGenerationService(BaseGenerationService):
 
             if hasattr(message, "aspect_ratio"):
                 task_data["aspect_ratio"] = message.aspect_ratio
+            if hasattr(message, "i2i_denoise_strength"):
+                task_data["i2i_denoise_strength"] = message.i2i_denoise_strength
 
             if stop_event.is_set():
                 logger.info(f"Task {message.task_id} cancelled before processing")
@@ -64,11 +66,13 @@ class ImageGenerationService(BaseGenerationService):
                     result_png = result.get("result_png")
                     if not result_png:
                         raise RuntimeError("Image inference did not return in-memory PNG bytes (result_png)")
+                    usage = result.get("usage")
                     return TaskResponse(
                         task_id=message.task_id,
                         task_status="completed",
                         save_result_path="",
                         result_png=result_png,
+                        usage=usage,
                     )
 
                 return TaskResponse(

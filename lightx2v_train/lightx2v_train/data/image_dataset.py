@@ -6,8 +6,10 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 from lightx2v_train.data.utils import resize_to_target_area
+from lightx2v_train.runtime.distributed import is_distributed
 from lightx2v_train.utils.registry import DATA_REGISTER
 
 
@@ -66,6 +68,8 @@ class ImageDataset(Dataset):
             "target_image": self._resolve_path(target_image, data_dir) if target_image is not None else None,
             "prompt": str(prompt).strip(),
             "source_images": [self._resolve_path(p, data_dir) for p in source_images],
+            "target_height": record.get("target_height"),
+            "target_width": record.get("target_width"),
         }
 
     def _resolve_path(self, path, data_dir):
@@ -95,9 +99,11 @@ def build_image_dataset(data_config_split, train_or_val="train"):
         target_area=target_area,
         prompt_dropout_rate=prompt_dropout_rate,
     )
+    sampler = DistributedSampler(dataset, shuffle=shuffle) if is_distributed() and train_or_val == "train" else None
     return DataLoader(
         dataset,
         batch_size=1,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
     )

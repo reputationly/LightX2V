@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torchaudio as ta
 import torchvision.transforms.functional as TF
@@ -24,6 +25,7 @@ from lightx2v.models.schedulers.wan.audio.scheduler import EulerScheduler, WanAu
 from lightx2v.models.video_encoders.hf.wan.vae_2_2 import Wan2_2_VAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.async_vae import AsyncVAEChunkDecoder
+from lightx2v.utils.audio_io import load_audio_file
 from lightx2v.utils.envs import *
 from lightx2v.utils.input_info import UNSET
 from lightx2v.utils.profiler import *
@@ -183,7 +185,7 @@ class AudioProcessor:
         self.audio_frame_rate = audio_sr // target_fps
 
     def load_audio(self, audio_path: str):
-        audio_array, ori_sr = ta.load(audio_path)
+        audio_array, ori_sr = load_audio_file(audio_path)
         audio_array = ta.functional.resample(audio_array.mean(0), orig_freq=ori_sr, new_freq=self.audio_sr)
         return audio_array
 
@@ -325,7 +327,11 @@ class WanAudioRunner(WanRunner):  # type:ignore
             tvl = ii.target_video_length
             if tvl is not None and tvl is not UNSET and tvl > 0:
                 target_video_length = tvl
-        audio_segments = self._audio_processor.segment_audio(audio_array, expected_frames, target_video_length, self.prev_frame_length)
+        if self.config.get("model_cls") == "seko_talk_ar":
+            audio_start, audio_end = self._audio_processor.get_audio_range(0, expected_frames)
+            audio_segments = [AudioSegment(audio_array[:, audio_start:audio_end], 0, expected_frames)]
+        else:
+            audio_segments = self._audio_processor.segment_audio(audio_array, expected_frames, target_video_length, self.prev_frame_length)
 
         # Mask latent for multi-person s2v
         if mask_files is not None:
@@ -400,7 +406,7 @@ class WanAudioRunner(WanRunner):  # type:ignore
         latent_h = patched_h * self.config["patch_size"][1]
         latent_w = patched_w * self.config["patch_size"][2]
 
-        if hasattr(self.input_info, "target_video_length") and self.input_info.target_video_length is not None:
+        if hasattr(self.input_info, "target_video_length") and self.input_info.target_video_length is not None and self.input_info.target_video_length > 0:
             target_video_length = self.input_info.target_video_length
             latent_shape = self.get_latent_shape_with_lat_hw(latent_h, latent_w, target_video_length)
         else:
@@ -519,7 +525,7 @@ class WanAudioRunner(WanRunner):  # type:ignore
         """Prepare previous latents for conditioning"""
         dtype = GET_DTYPE()
         tgt_h, tgt_w = self.input_info.target_shape[0], self.input_info.target_shape[1]
-        if hasattr(self.input_info, "target_video_length") and self.input_info.target_video_length is not None:
+        if hasattr(self.input_info, "target_video_length") and self.input_info.target_video_length is not None and self.input_info.target_video_length > 0:
             target_video_length = self.input_info.target_video_length
         else:
             target_video_length = self.config["target_video_length"]
@@ -848,7 +854,7 @@ class WanAudioRunner(WanRunner):  # type:ignore
             self.audio_adapter = self.load_audio_adapter()
 
     def get_latent_shape_with_lat_hw(self, latent_h, latent_w, target_video_length=None):
-        target_video_length = target_video_length if target_video_length is not None else self.config["target_video_length"]
+        target_video_length = target_video_length if target_video_length is not None and target_video_length > 0 else self.config["target_video_length"]
         latent_shape = [
             self.config.get("num_channels_latents", 16),
             (target_video_length - 1) // self.config["vae_stride"][0] + 1,
@@ -930,10 +936,65 @@ class WanAudioRunner(WanRunner):  # type:ignore
         return self.run_clip_main()
 
 
-@RUNNER_REGISTER("seko_talk_ar")
-class WanAudioARRunner(WanAudioRunner):
+@RUNNER_REGISTER("wan2.2_audio")
+class Wan22AudioRunner(WanAudioRunner):
     def __init__(self, config):
         super().__init__(config)
+
+    def load_vae_decoder(self):
+        # offload config
+        vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
+        if vae_offload:
+            vae_device = torch.device("cpu")
+        else:
+            vae_device = torch.device(AI_DEVICE)
+        vae_config = {
+            "vae_path": find_torch_model_path(self.config, "vae_path", "Wan2.2_VAE.pth"),
+            "device": vae_device,
+            "cpu_offload": vae_offload,
+            "offload_cache": self.config.get("vae_offload_cache", False),
+            "dummy_model": self.config.get("dummy_model", False),
+        }
+        vae_decoder = Wan2_2_VAE(**vae_config)
+        return vae_decoder
+
+    def load_vae_encoder(self):
+        # offload config
+        vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
+        if vae_offload:
+            vae_device = torch.device("cpu")
+        else:
+            vae_device = torch.device(AI_DEVICE)
+        vae_config = {
+            "vae_path": find_torch_model_path(self.config, "vae_path", "Wan2.2_VAE.pth"),
+            "device": vae_device,
+            "cpu_offload": vae_offload,
+            "offload_cache": self.config.get("vae_offload_cache", False),
+            "dummy_model": self.config.get("dummy_model", False),
+        }
+        if self.config.task not in ["i2v", "s2v", "rs2v"]:
+            return None
+        else:
+            return Wan2_2_VAE(**vae_config)
+
+    def load_vae(self):
+        vae_encoder = self.load_vae_encoder()
+        vae_decoder = self.load_vae_decoder()
+        return vae_encoder, vae_decoder
+
+
+@RUNNER_REGISTER("seko_talk_ar")
+class WanAudioARRunner(WanAudioRunner):
+    @dataclass(frozen=True)
+    class PromptTravelSegment:
+        start_frame: int
+        text: str
+        start_latent: int
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.prompt_travel_segments = None
+        self.prompt_travel_text_encoder_outputs = None
         self.audio_sliding_processor = CausalAudioSlidingProcessor(
             audio_window=self.config.get("audio_window", 1.0),
             look_ahead=self.config.get("look_ahead", 0.0),
@@ -1010,7 +1071,7 @@ class WanAudioARRunner(WanAudioRunner):
         latent_h = target_h // self.config["vae_stride"][1]
         latent_w = target_w // self.config["vae_stride"][2]
         target_video_length = getattr(self.input_info, "target_video_length", None)
-        if target_video_length is not None and target_video_length is not UNSET:
+        if target_video_length is not None and target_video_length is not UNSET and target_video_length > 0:
             latent_shape = self.get_latent_shape_with_lat_hw(latent_h, latent_w, target_video_length)
         else:
             latent_shape = self.get_latent_shape_with_lat_hw(latent_h, latent_w)
@@ -1018,37 +1079,165 @@ class WanAudioARRunner(WanAudioRunner):
         logger.info(f"[wan_audio_ar] image resize target_h: {target_h}, target_w: {target_w}, latent_h: {latent_h}, latent_w: {latent_w}")
         return ref_img, latent_shape, target_shape
 
-    def read_audio_input(self, audio_path):
-        audio_sr = self.config.get("audio_sr", 16000)
-        target_fps = self.config.get("target_fps", 16)
-        self._audio_processor = AudioProcessor(audio_sr, target_fps)
+    def _parse_prompt_travel_segments(self):
+        prompt_travel = self.config.get("prompt_travel")
+        if not isinstance(prompt_travel, dict):
+            raise ValueError("prompt_travel config must be a dict")
+        texts = prompt_travel.get("prompt_travel_text")
+        starts = prompt_travel.get("prompt_travel_start_frames")
+        if not isinstance(texts, list) or not isinstance(starts, list):
+            raise ValueError("Prompt travel requires prompt_travel_text and prompt_travel_start_frames lists")
+        if len(texts) != len(starts):
+            raise ValueError("prompt_travel_text and prompt_travel_start_frames must have the same length")
+        if not texts:
+            raise ValueError("Prompt travel requires at least one segment")
 
-        if not isinstance(audio_path, str):
-            return [], 0, None, 0
+        t_compress = int(self.config["vae_stride"][0])
+        segments = []
+        prev_start_frame = None
+        for idx, (text, start_frame) in enumerate(zip(texts, starts)):
+            if not isinstance(text, str) or text == "":
+                raise ValueError("each prompt travel segment requires non-empty text")
+            if not isinstance(start_frame, int) or start_frame < 0:
+                raise ValueError("each prompt travel segment requires a non-negative integer start_frame")
+            if idx > 0 and start_frame <= prev_start_frame:
+                raise ValueError("prompt_travel_start_frames must be strictly increasing")
+            start_latent = start_frame // t_compress
+            segments.append(self.PromptTravelSegment(start_frame=start_frame, text=text, start_latent=start_latent))
+            prev_start_frame = start_frame
 
-        audio_files, mask_files = self.get_audio_files_from_audio_path(audio_path)
-        if len(audio_files) == 1:
-            audio_array = self._audio_processor.load_audio(audio_files[0]).unsqueeze(0)
-        else:
-            audio_array = self._audio_processor.load_multi_person_audio(audio_files)
+        if segments[0].start_frame != 0:
+            raise ValueError("the first prompt travel segment must start at frame 0")
+        return segments
 
-        audio_len = int(audio_array.shape[1] / audio_sr * target_fps)
+    @staticmethod
+    def _select_prompt_travel_index(segments, latent_idx):
+        selected = 0
+        for idx, segment in enumerate(segments):
+            if latent_idx < segment.start_latent:
+                break
+            selected = idx
+        return selected
+
+    def _pad_text_encoder_outputs(self, contexts):
+        return torch.stack([torch.cat([u, u.new_zeros(self.config["text_len"] - u.size(0), u.size(1))]) for u in contexts])
+
+    def _infer_texts_one_by_one(self, texts):
+        padded_contexts = []
+        for text in texts:
+            padded_contexts.append(self._pad_text_encoder_outputs(self.text_encoders[0].infer([text]))[0])
+        return torch.stack(padded_contexts)
+
+    def _encode_prompt_travel_segments(self, input_info):
+        segments = self._parse_prompt_travel_segments()
+        prompts = [segment.text for segment in segments]
+        start_latents = torch.tensor([segment.start_latent for segment in segments], dtype=torch.long)
+
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            self.text_encoders = self.load_text_encoder()
+
         if GET_RECORDER_MODE():
-            monitor_cli.lightx2v_input_audio_len.observe(audio_len)
+            for prompt in prompts:
+                monitor_cli.lightx2v_input_prompt_len.observe(len(prompt))
 
-        expected_frames = min(max(1, int(self.video_duration * target_fps)), audio_len)
-        if expected_frames < int(self.video_duration * target_fps):
-            logger.warning(f"Input video duration is greater than actual audio duration, using audio duration instead: audio_duration={audio_len / target_fps}, video_duration={self.video_duration}")
-
-        audio_segments = [AudioSegment(audio_array, 0, expected_frames)]
-
-        if mask_files is not None:
-            mask_latents = [self.process_single_mask(mask_file) for mask_file in mask_files]
-            mask_latents = torch.cat(mask_latents, dim=0)
+        neg_prompt = input_info.negative_prompt
+        if self.config.get("enable_cfg", False) and self.config.get("cfg_parallel", False):
+            cfg_p_group = self.config["device_mesh"].get_group(mesh_dim="cfg_p")
+            cfg_p_rank = dist.get_rank(cfg_p_group)
+            if cfg_p_rank == 0:
+                context = self._infer_texts_one_by_one(prompts)
+                encoded = [{"context": context[idx : idx + 1]} for idx in range(len(segments))]
+            else:
+                context_null = self._pad_text_encoder_outputs(self.text_encoders[0].infer([neg_prompt]))
+                encoded = [{"context_null": context_null} for _ in segments]
         else:
-            mask_latents = None
+            context = self._infer_texts_one_by_one(prompts)
+            context_null = None
+            if self.config.get("enable_cfg", False):
+                context_null = self._pad_text_encoder_outputs(self.text_encoders[0].infer([neg_prompt]))
+            encoded = [{"context": context[idx : idx + 1], "context_null": context_null} for idx in range(len(segments))]
 
-        return audio_segments, expected_frames, mask_latents, len(audio_files)
+        for idx, text_encoder_output in enumerate(encoded):
+            text_encoder_output["prompt_travel_start_latents"] = start_latents
+            text_encoder_output["prompt_travel_index"] = idx
+
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            del self.text_encoders[0]
+            torch_device_module.empty_cache()
+            gc.collect()
+
+        logger.info(f"Prompt travel enabled with {len(segments)} prompt segments, start_latents={start_latents.tolist()}")
+        return segments, encoded
+
+    def _prepare_prompt_travel(self, input_info):
+        self.prompt_travel_segments = None
+        self.prompt_travel_text_encoder_outputs = None
+        if not self.config.get("prompt_travel"):
+            return
+        self.prompt_travel_segments, self.prompt_travel_text_encoder_outputs = self._encode_prompt_travel_segments(input_info)
+
+    def _apply_prompt_travel_for_latent(self, latent_idx):
+        if not self.prompt_travel_text_encoder_outputs:
+            return
+        latent_idx = int(latent_idx)
+        prompt_idx = self._select_prompt_travel_index(self.prompt_travel_segments, latent_idx)
+        self.inputs["text_encoder_output"] = self.prompt_travel_text_encoder_outputs[prompt_idx]
+        self.input_info.prompt = self.prompt_travel_segments[prompt_idx].text
+        logger.info(
+            f"Prompt travel latent={latent_idx}: applying segment {prompt_idx}, "
+            f"start_frame={self.prompt_travel_segments[prompt_idx].start_frame}, "
+            f"start_latent={self.prompt_travel_segments[prompt_idx].start_latent}"
+        )
+
+    def _validate_prompt_travel_schedule(self):
+        if not self.prompt_travel_segments:
+            return
+        latent_length = int(self.input_info.latent_shape[1])
+        if self.prompt_travel_segments[0].start_latent != 0:
+            raise ValueError("invalid prompt travel schedule: the first start_latent must be 0")
+        prev_start_latent = -1
+        for segment in self.prompt_travel_segments:
+            if segment.start_latent < prev_start_latent:
+                raise ValueError("invalid prompt travel schedule: start_latents must be non-decreasing")
+            if segment.start_latent == prev_start_latent:
+                logger.warning(f"Prompt travel segment at frame {segment.start_frame} maps to duplicate latent {segment.start_latent}; the later segment will be selected at that latent.")
+            if segment.start_latent >= latent_length:
+                raise ValueError(f"prompt travel start_frame {segment.start_frame} is outside latent length {latent_length}")
+            prev_start_latent = segment.start_latent
+
+    @ProfilingContext4DebugL2("Run Encoders")
+    def _run_input_encoder_local_s2v(self):
+        img, latent_shape, target_shape = self.read_image_input(self.input_info.image_path)
+        if self.config.get("f2v_process", False):
+            self.ref_img = img
+        self.input_info.latent_shape = latent_shape
+        self.input_info.target_shape = target_shape
+        clip_encoder_out = self.run_image_encoder(img) if self.config.get("use_image_encoder", True) else None
+        vae_encode_out = self.run_vae_encoder(img)
+
+        audio_segments, expected_frames, person_mask_latens, audio_num = self.read_audio_input(self.input_info.audio_path)
+        self.input_info.audio_num = audio_num
+        self.input_info.with_mask = person_mask_latens is not None
+
+        if self.config.get("prompt_travel"):
+            self._prepare_prompt_travel(self.input_info)
+            text_encoder_output = self.prompt_travel_text_encoder_outputs[0]
+            self.input_info.prompt = self.prompt_travel_segments[0].text
+        else:
+            text_encoder_output = self.run_text_encoder(self.input_info)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        return {
+            "text_encoder_output": text_encoder_output,
+            "image_encoder_output": {
+                "clip_encoder_out": clip_encoder_out,
+                "vae_encoder_out": vae_encode_out,
+            },
+            "audio_segments": audio_segments,
+            "expected_frames": expected_frames,
+            "person_mask_latens": person_mask_latens,
+        }
 
     def init_run(self):
         self.gen_video_final = None
@@ -1081,12 +1270,6 @@ class WanAudioARRunner(WanAudioRunner):
         self.inputs["audio_encoder_output"] = torch.stack(features_list, dim=0)
         self.inputs["previmg_encoder_output"] = {"prev_latents": None, "prev_mask": None, "prev_len": 0}
 
-    @ProfilingContext4DebugL1(
-        "Init run segment",
-        recorder_mode=GET_RECORDER_MODE(),
-        metrics_func=monitor_cli.lightx2v_run_init_run_segment_duration,
-        metrics_labels=["WanAudioARRunner"],
-    )
     def init_run_segment(self, segment_idx):
         self.segment_idx = segment_idx
 
@@ -1116,7 +1299,7 @@ class WanAudioARRunner(WanAudioRunner):
         self.model.scheduler.set_timesteps(infer_steps, device=AI_DEVICE)
         xt = self.model.scheduler.noise[:, start:end].to(AI_DEVICE)
         for step_index in range(infer_steps):
-            logger.info(f"==> segment: {segment_idx + 1} / {self.video_segment_num}, step_index: {step_index + 1} / {infer_steps}")
+            logger.info(f"==> chunk: {segment_idx + 1} / {self.video_segment_num}, step_index: {step_index + 1} / {infer_steps}")
             self.model.kv_cache_manager.current_step = step_index
             with ProfilingContext4DebugL1("step_pre"):
                 self.model.scheduler.step_pre(segment_idx, step_index, xt)
@@ -1130,17 +1313,26 @@ class WanAudioARRunner(WanAudioRunner):
                 self.progress_callback((current_step / total_all_steps) * 100, 100)
         return xt
 
+    def decode_segment_latents(self, segment_idx: int, segment_latents: torch.Tensor) -> torch.Tensor:
+        is_first = segment_idx == 0
+        is_last = segment_idx == self.video_segment_num - 1
+        return self.vae_decoder.cached_decode_withflag(segment_latents.to(GET_DTYPE()), is_first, is_last)
+
+    @ProfilingContext4DebugL1("init kv cache manager")
     def init_kv_cache_manager(self):
         ref_latents = self.inputs["image_encoder_output"]["vae_encoder_out"]
-        self.model.kv_cache_manager = KVCacheManager(config=self.config, device=torch.device(AI_DEVICE), sp_group=self.model.seq_p_group)
-        self.model.kv_cache_manager.ar_config = dict(self.config.get("ar_config", {}))
         ref_num_frames = 0 if ref_latents is None else int(ref_latents.shape[1])
-        self.model.kv_cache_manager._create_kv_caches(self.input_info.latent_shape, ref_num_frames=ref_num_frames)
-        self.model.transformer_infer.kv_cache_manager = self.model.kv_cache_manager
-
-    def end_run(self):
-        self.model.kv_cache_manager.save_calibration()
-        super().end_run()
+        kv_mgr = getattr(self.model, "kv_cache_manager", None)
+        if kv_mgr is None:
+            kv_mgr = KVCacheManager(config=self.config, device=torch.device(AI_DEVICE), sp_group=self.model.seq_p_group)
+            self.model.kv_cache_manager = kv_mgr
+        kv_mgr.ar_config = dict(self.config.get("ar_config", {}))
+        kv_mgr._create_kv_caches(self.input_info.latent_shape, ref_num_frames=ref_num_frames)
+        self.model.transformer_infer.kv_cache_manager = kv_mgr
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            sp_group = getattr(self.model, "seq_p_group", None)
+            if sp_group is not None or torch.distributed.get_world_size() > 1:
+                torch.distributed.barrier(group=sp_group)
 
     @ProfilingContext4DebugL2("Run DiT")
     def run_main(self):
@@ -1157,44 +1349,51 @@ class WanAudioARRunner(WanAudioRunner):
             self.input_info.latent_shape = latent_shape
             self.model.scheduler.prepare(seed=self.input_info.seed, latent_shape=latent_shape, infer_steps=self.config.get("infer_steps"))
             self.get_video_segment_num()
+            self._validate_prompt_travel_schedule()
             self.init_kv_cache_manager()
             self.prefill_reference_kv()
             segment_videos = []
             lazy_vae = self.config.get("lazy_load", False) or self.config.get("unload_modules", False)
             if lazy_vae:
                 self.vae_decoder = self.load_vae_decoder()
-            if not hasattr(self.vae_decoder, "cached_decode_withflag"):
-                raise RuntimeError("WanAudioARRunner requires cached_decode_withflag for AR VAE decoding.")
-            async_vae_decoder = AsyncVAEChunkDecoder.from_config(self.config, device=AI_DEVICE)
-            if async_vae_decoder.is_async:
-                logger.info("[WanAudioARRunner] async VAE decode enabled")
+            vae_decoder = AsyncVAEChunkDecoder.from_config(self.config, device=AI_DEVICE, vae_decoder=self.vae_decoder)
 
-            def decode_segment_latents(segment_latents: torch.Tensor, is_first: bool, is_last: bool) -> torch.Tensor:
-                return self.vae_decoder.cached_decode_withflag(segment_latents.to(GET_DTYPE()), is_first, is_last)
+            with (
+                no_sync_profiling(enabled=vae_decoder.is_async),
+                ProfilingContext4DebugL1(
+                    f"AR chunk total {self.video_segment_num} chunks",
+                    recorder_mode=GET_RECORDER_MODE(),
+                    metrics_func=monitor_cli.lightx2v_run_segments_end2end_duration,
+                    metrics_labels=["WanAudioARRunner"],
+                ),
+            ):
+                try:
+                    for segment_idx in range(self.video_segment_num):
+                        logger.info(f"start chunk {segment_idx + 1}/{self.video_segment_num}")
+                        chunk_size = int(self.model.scheduler.chunk_size)
+                        chunk_start_latent = segment_idx * chunk_size
+                        self._apply_prompt_travel_for_latent(chunk_start_latent)
 
-            try:
-                for segment_idx in range(self.video_segment_num):
-                    logger.info(f"start segment {segment_idx + 1}/{self.video_segment_num}")
-                    with ProfilingContext4DebugL1(
-                        f"segment end2end {segment_idx + 1}/{self.video_segment_num}",
-                        recorder_mode=GET_RECORDER_MODE(),
-                        metrics_func=monitor_cli.lightx2v_run_segments_end2end_duration,
-                        metrics_labels=["WanAudioARRunner"],
-                    ):
-                        self.check_stop()
-                        self.init_run_segment(segment_idx)
-                        segment_latents = self.run_segment(segment_idx)
-                        is_first = segment_idx == 0
-                        is_last = segment_idx == self.video_segment_num - 1
-                        async_vae_decoder.submit(decode_segment_latents, segment_latents, is_first, is_last)
-                segment_videos = async_vae_decoder.finish()
-            finally:
-                if "async_vae_decoder" in locals():
-                    async_vae_decoder.finish()
-                if lazy_vae:
-                    del self.vae_decoder
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                        with ProfilingContext4DebugL1(
+                            f"chunk end2end {segment_idx + 1}/{self.video_segment_num}",
+                            recorder_mode=GET_RECORDER_MODE(),
+                            metrics_func=monitor_cli.lightx2v_run_segments_end2end_duration,
+                            metrics_labels=["WanAudioARRunner"],
+                        ):
+                            self.check_stop()
+                            self.init_run_segment(segment_idx)
+                            segment_latents = self.run_segment(segment_idx)
+
+                        vae_decoder.submit(self.decode_segment_latents, segment_idx, segment_latents)
+                    segment_videos = vae_decoder.finish()
+                finally:
+                    if "vae_decoder" in locals():
+                        vae_decoder.finish()
+                    if lazy_vae:
+                        del self.vae_decoder
+                        torch.cuda.empty_cache()
+                        gc.collect()
+
             self.gen_video = torch.cat(segment_videos, dim=2)
             self.check_stop()
             self.end_run_segment(0)
@@ -1205,50 +1404,3 @@ class WanAudioARRunner(WanAudioRunner):
             if getattr(self, "va_controller", None) is not None:
                 self.va_controller.clear()
                 self.va_controller = None
-
-
-@RUNNER_REGISTER("wan2.2_audio")
-class Wan22AudioRunner(WanAudioRunner):
-    def __init__(self, config):
-        super().__init__(config)
-
-    def load_vae_decoder(self):
-        # offload config
-        vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
-        if vae_offload:
-            vae_device = torch.device("cpu")
-        else:
-            vae_device = torch.device(AI_DEVICE)
-        vae_config = {
-            "vae_path": find_torch_model_path(self.config, "vae_path", "Wan2.2_VAE.pth"),
-            "device": vae_device,
-            "cpu_offload": vae_offload,
-            "offload_cache": self.config.get("vae_offload_cache", False),
-            "dummy_model": self.config.get("dummy_model", False),
-        }
-        vae_decoder = Wan2_2_VAE(**vae_config)
-        return vae_decoder
-
-    def load_vae_encoder(self):
-        # offload config
-        vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
-        if vae_offload:
-            vae_device = torch.device("cpu")
-        else:
-            vae_device = torch.device(AI_DEVICE)
-        vae_config = {
-            "vae_path": find_torch_model_path(self.config, "vae_path", "Wan2.2_VAE.pth"),
-            "device": vae_device,
-            "cpu_offload": vae_offload,
-            "offload_cache": self.config.get("vae_offload_cache", False),
-            "dummy_model": self.config.get("dummy_model", False),
-        }
-        if self.config.task not in ["i2v", "s2v", "rs2v"]:
-            return None
-        else:
-            return Wan2_2_VAE(**vae_config)
-
-    def load_vae(self):
-        vae_encoder = self.load_vae_encoder()
-        vae_decoder = self.load_vae_decoder()
-        return vae_encoder, vae_decoder
