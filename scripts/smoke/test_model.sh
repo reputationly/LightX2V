@@ -35,7 +35,8 @@ docker rm -f "$NAME" >/dev/null 2>&1 || true
 mkdir -p "$(dirname "$OUT")"; rm -f "$OUT"
 
 # 起容器(单卡 python / 多卡 torchrun ulysses)
-DEVS=$(seq -s, 0 $((NP-1)))
+# GPUS 可指定物理卡(逗号分隔, 如 "0,1" 或 "0,2"), 用于挑同 NUMA 卡对做 P2P/PCIe 对比; 不设则默认 0..NP-1
+DEVS="${GPUS:-$(seq -s, 0 $((NP-1)))}"
 if [ "$NP" -gt 1 ]; then RUNCMD="torchrun --nproc_per_node=$NP --master_port=29533 -m lightx2v.server"; SHM="--shm-size=32g"; else RUNCMD="python -m lightx2v.server"; SHM=""; fi
 log "起容器 $NAME (cls=$MODEL_CLS task=$TASK np=$NP) 配置=$CFG"
 # shellcheck disable=SC2086
@@ -75,16 +76,24 @@ RESP=$(curl -sS -m 30 -X POST "$API/v1/tasks/$EP/" -H "Content-Type: application
 TID=$(echo "$RESP" | python3 -c "import json,sys;print(json.load(sys.stdin)['task_id'])" 2>/dev/null)
 [ -z "${TID:-}" ] && { printf '%s提交失败: %s%s\n' "$R" "$RESP" "$N"; docker rm -f "$NAME" >/dev/null 2>&1; exit 1; }
 
-# 轮询(带超时 + 探活, 不死循环)
-PEAK=0; MISS=0; MAXW=$(( 60*60 )); ST=""
+# 内存字符串(如 "64.2GiB"/"512MiB")转 MiB 整数, 便于取峰值
+to_mib(){ awk -v s="$1" 'BEGIN{n=s+0; u=tolower(s); m=(index(u,"gi")||index(u,"gb"))?n*1024:(index(u,"ki")||index(u,"kb"))?n/1024:n; printf "%.0f", m}'; }
+# 轮询(带超时 + 探活, 不死循环);峰值: 显存 / GPU利用率% / 容器CPU% / 容器内存
+PEAK=0; UPEAK=0; CPUPK=0; MEMPK=0; MISS=0; MAXW=$(( 60*60 )); ST=""
 while true; do
   sleep 5; EL=$(( $(date +%s)-G0 ))
   [ "$EL" -gt "$MAXW" ] && { printf '%s超 %ss 未完成, 放弃%s\n' "$R" "$MAXW" "$N"; break; }
   M=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -rn | head -1 || echo 0)   # 所有卡取最大(多卡峰值才准)
   [ "$M" -gt "$PEAK" ] && PEAK=$M
+  U=$(nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null | sort -rn | head -1 || echo 0)   # GPU 利用率%(所有卡取最大)
+  [ "${U:-0}" -gt "$UPEAK" ] 2>/dev/null && UPEAK=$U
+  DS=$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' "$NAME" 2>/dev/null || echo "0%|0MiB")   # 容器 CPU% / 内存
+  CPU=${DS%%|*}; CPU=${CPU%\%}; MEMU=${DS#*|}; MEMU=${MEMU%% *}
+  CPUPK=$(awk -v a="$CPUPK" -v b="${CPU:-0}" 'BEGIN{print (b>a)?b:a}')     # CPU% 是浮点(多核可>100), 用 awk 比
+  MEMMIB=$(to_mib "${MEMU:-0}"); [ "${MEMMIB:-0}" -gt "$MEMPK" ] 2>/dev/null && MEMPK=$MEMMIB
   HC=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "$API/health" 2>/dev/null || echo 000)
   ST=$(curl -sS -m 10 "$API/v1/tasks/$TID/status" 2>/dev/null | python3 -c "import json,sys;print(json.load(sys.stdin).get('status') or '')" 2>/dev/null)
-  printf "  t=%ss status=%s gpu=%sMiB peak=%sMiB\n" "$EL" "${ST:-?}" "$M" "$PEAK"
+  printf "  t=%ss status=%s gpu=%sMiB(util%s%%) cpu=%s%% mem=%sMiB\n" "$EL" "${ST:-?}" "$M" "${U:-?}" "${CPU:-?}" "${MEMMIB:-?}"
   case "$ST" in
     completed) break ;;
     failed) curl -sS "$API/v1/tasks/$TID/status" 2>/dev/null | python3 -c "import json,sys;print('ERR:',(json.load(sys.stdin).get('error') or '')[:200])" 2>/dev/null; break ;;
@@ -104,7 +113,7 @@ if [ "$ST" != "completed" ]; then
   RC=1
 elif [ -f "$OUT" ]; then
   SZB=$(stat -c%s "$OUT" 2>/dev/null || echo 0); SZ=$((SZB/1024))
-  log "${G}完成${N} | 加载${LOAD}s | 生成${GEN}s | 峰值${PEAK}MiB | ${SZ}KB | $OUT"
+  log "${G}完成${N} | 加载${LOAD}s | 生成${GEN}s | 显存峰值${PEAK}MiB | GPU利用峰值${UPEAK}% | CPU峰值${CPUPK}% | 内存峰值${MEMPK}MiB | ${SZ}KB | $OUT"
   command -v ffprobe >/dev/null && ffprobe -v error -select_streams v:0 -show_entries stream=width,height,nb_frames,r_frame_rate -of default=noprint_wrappers=1 "$OUT" 2>/dev/null | sed 's/^/  /'
   if [ "$SZB" -lt 51200 ]; then printf '%s⚠️ 产物仅 %sKB, 疑似空/黑屏/损坏(生成没真跑通)%s\n' "$R" "$SZ" "$N"; RC=1; fi
 else
