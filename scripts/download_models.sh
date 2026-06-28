@@ -12,11 +12,17 @@
 #   qwen_image   58G  Qwen/Qwen-Image(文生图)
 #   z_image      33G  Tongyi-MAI/Z-Image-Turbo(文生图, 快)
 #   全下 ≈ 406G(NFS 还有 ~2.2T)
+#   --- 以下为可选, 不在默认全下里, 用 MODELS=... 显式触发 ---
+#   seedvr_3b   ~15G  魔搭 bytedance-community/SeedVR2-3B(超分; DiT+VAE+emb 全, 可直接跑)
+#   seedvr_7b   ~66G  魔搭 bytedance-community/SeedVR2-7B(取普通版+锐化版两个 DiT 对比)
+#                      ⚠️ 7B 仓库缺 pos/neg_emb, 必须连 seedvr_3b 一起下(借 3B 的 vae+emb)
+#                      源: 魔搭社区镜像(快), 回退 HF 官方 ByteDance-Seed/*
 #
 # 用法(服务器上, 先 scp 到 /data):
 #   tmux new -s dl -d 'bash /data/download_models.sh'   # 挂后台(默认全下)
 #   tail -f /nfs-data/dl_models.log                     # 看速度+进度
 #   MODELS="wan_audio wan_i2v" bash /data/download_models.sh   # 只下指定
+#   MODELS="seedvr_3b seedvr_7b" bash /data/download_models.sh # 下 SeedVR2 超分(3B+7B)
 # 中断后重跑本脚本会自动续传。
 # =============================================================================
 set -u
@@ -94,7 +100,12 @@ case "$m" in
   wan_audio)   dl Wan-AI/Wan2.2-S2V-14B     "Wan2.2-S2V-14B"     Wan-AI/Wan2.2-S2V-14B ;;
   qwen_image)  dl Qwen/Qwen-Image           "Qwen-Image"         Qwen/Qwen-Image ;;
   z_image)     dl Tongyi-MAI/Z-Image-Turbo  "Z-Image-Turbo"      Tongyi-MAI/Z-Image-Turbo ;;
-  *) echo "!! 未知模型标签: $m (支持: hy15 wan_i2v wan_animate wan_audio qwen_image z_image)"; FAILED="$FAILED $m";;
+  # SeedVR2 视频超分: 走魔搭社区镜像 bytedance-community/*(快), HF官方 ByteDance-Seed/* 作回退
+  seedvr_3b)   # 3B 整仓: DiT(seedvr2_ema_3b.pth)+ ema_vae.pth + pos/neg_emb.pt, 可直接跑
+    dl bytedance-community/SeedVR2-3B "ByteDance-Seed/SeedVR2-3B" ByteDance-Seed/SeedVR2-3B ;;
+  seedvr_7b)   # 7B 缺 emb, 取普通版+锐化版两个 DiT 对比; 跑时 model_path 指 3B 目录, config dit_original_ckpt 指其一
+    dl bytedance-community/SeedVR2-7B "ByteDance-Seed/SeedVR2-7B" ByteDance-Seed/SeedVR2-7B seedvr2_ema_7b.pth seedvr2_ema_7b_sharp.pth ;;
+  *) echo "!! 未知模型标签: $m (支持: hy15 wan_i2v wan_animate wan_audio qwen_image z_image seedvr_3b seedvr_7b)"; FAILED="$FAILED $m";;
 esac
 done
 
@@ -108,6 +119,8 @@ for m in $MODELS; do
     wan_audio)   d="Wan2.2-S2V-14B" ;;
     qwen_image)  d="Qwen-Image" ;;
     z_image)     d="Z-Image-Turbo" ;;
+    seedvr_3b)   d="ByteDance-Seed/SeedVR2-3B" ;;
+    seedvr_7b)   d="ByteDance-Seed/SeedVR2-7B" ;;
     *)           continue ;;
   esac
   du -sh "$DEST/$d" 2>/dev/null || echo "  (缺) $DEST/$d"
