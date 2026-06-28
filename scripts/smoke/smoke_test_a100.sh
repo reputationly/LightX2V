@@ -150,7 +150,7 @@ case1(){
   LABEL[1]="LTX2.3 单卡 bf16"
   hr; log "${Y}用例1  ${LABEL[1]}  (1280x768/121帧, 期望 ~86s, 峰值 ~18.9GB)${N}"
   rm_container lightx2v-ltx-new
-  docker run -d --name lightx2v-ltx-new --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  docker run -d --name lightx2v-ltx-new --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data -v /nfs-data:/nfs-data \
     -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e CUDA_VISIBLE_DEVICES=0 -e LTX_GEMMA_ON_CPU=1 -e LTX_GEMMA_LAYERWISE_GPU=1 \
     -e LTX_VAE_SPATIAL_TILE=256 -e LTX_VAE_SPATIAL_OVERLAP=32 -e LTX_VAE_TEMPORAL_TILE=16 -e LTX_VAE_TEMPORAL_OVERLAP=8 \
@@ -166,7 +166,7 @@ case2(){
   LABEL[2]="Wan2.2 int8 单卡 480p"
   hr; log "${Y}用例2  ${LABEL[2]}  (832x480/49帧, 期望 ~56s, 峰值 ~34.8GB)${N}"
   rm_container lightx2v-wan-int8
-  docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data \
+  docker run -d --name lightx2v-wan-int8 --gpus all -p 8000:8000 -p 8001:8001 -v /data:/data -v /nfs-data:/nfs-data \
     -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUDA_VISIBLE_DEVICES=0 \
     "$IMG" python -m lightx2v.server --model_cls wan2.2_moe --task t2v \
     --model_path /data/models/Wan-AI/Wan2.2-T2V-A14B \
@@ -180,7 +180,7 @@ case3(){
   LABEL[3]="Wan2.2 int8 4卡 720p"
   hr; log "${Y}用例3  ${LABEL[3]}  (1280x720/49帧, 期望 ~51s, 峰值 ~34.6GB/卡)${N}"
   rm_container lightx2v-wan-ul4
-  docker run -d --name lightx2v-wan-ul4 --gpus all --shm-size=32g -p 8000:8000 -p 8001:8001 -v /data:/data \
+  docker run -d --name lightx2v-wan-ul4 --gpus all --shm-size=32g -p 8000:8000 -p 8001:8001 -v /data:/data -v /nfs-data:/nfs-data \
     -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
     "$IMG" torchrun --nproc_per_node=4 --master_port=29524 -m lightx2v.server \
     --model_cls wan2.2_moe --task t2v --model_path /data/models/Wan-AI/Wan2.2-T2V-A14B \
@@ -209,7 +209,10 @@ fi
 [ "${SKIP_PREFLIGHT:-0}" = "1" ] || preflight
 
 # 预清理所有相关容器, 避免 8000 端口冲突
-for c in lightx2v-ltx-new lightx2v-wan-int8 lightx2v-wan-ul4 lightx2v-ltx-server lightx2v-server; do rm_container "$c"; done
+for c in lightx2v-ltx-new lightx2v-wan-int8 lightx2v-wan-ul4 lightx2v-ltx-server lightx2v-server \
+         lightx2v-ltx-serve lightx2v-ltx-1080p lightx2v-ltx-nfs; do rm_container "$c"; done
+# 清掉 4k 探针(ltx_4k_ulysses_probe.sh)留下的动态命名容器, 否则占 8000/8001 端口
+docker ps -aq --filter 'name=ltx-probe-' 2>/dev/null | xargs -r docker rm -f >/dev/null 2>&1 || true
 
 # 清理后检查 GPU 是否真的空闲 (排除别的容器/裸进程占卡; 可用 SKIP_GPU_GUARD=1 跳过)
 [ "${SKIP_GPU_GUARD:-0}" = "1" ] || gpu_guard
