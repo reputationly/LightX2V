@@ -13,15 +13,15 @@
 
 z_image:
   variants:
-    - name: z-image/a100-sage
+    - name: z-image/a100-sdpa
       gpus: 1
       task: t2i
-      # Matches design §3.2 z-image/bf16: infer_steps=9, attn_type=sage_attn2,
-      # enable_cfg=false, rope_type=torch (A100-safe; flash_attn3 + flashinfer
-      # rope both crash on A100). A torch_sdpa variant also exists at
-      # configs/z_image/z_image_a100_sdpa.json — switch here if you standardize
-      # on sdpa (see commit a169c04a "attn(sage→sdpa) finding").
-      config_json: /opt/LightX2V/configs/z_image/z_image_a100_sage.json
+      # infer_steps=9, attn_type=torch_sdpa, enable_cfg=false, rope_type=torch.
+      # Uses torch_sdpa (NOT sage_attn2): the A100 image ships no compiled
+      # sageattention, so sage_attn2 falls back / gives no speedup — see the
+      # Z-Image experiment report §5.1 and commit a169c04a. z_image VRAM is
+      # ample (bf16 ~21.8G/40G), so int8/multi-card are unnecessary.
+      config_json: /opt/LightX2V/configs/z_image/z_image_a100_sdpa.json
       # Optional warmup so the first real request is hot. Verify the body first.
       # warmup:
       #   endpoint: /v1/tasks/image/sync
