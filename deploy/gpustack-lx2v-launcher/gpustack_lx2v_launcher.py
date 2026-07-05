@@ -54,9 +54,7 @@ try:
 except Exception:  # pragma: no cover - image is expected to ship PyYAML
     yaml = None
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [lx2v-launcher] %(levelname)s %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [lx2v-launcher] %(levelname)s %(message)s")
 logger = logging.getLogger("gpustack-lx2v-launcher")
 
 # Internal endpoint the launcher polls to decide the engine is up. LightX2V
@@ -113,10 +111,7 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int) -> dict:
         profiles = yaml.safe_load(f) or {}
     model_profiles = profiles.get(model_cls)
     if not model_profiles:
-        raise RuntimeError(
-            f"No profile for model_cls '{model_cls}' in {profiles_file}. "
-            f"Known: {sorted(profiles.keys())}"
-        )
+        raise RuntimeError(f"No profile for model_cls '{model_cls}' in {profiles_file}. Known: {sorted(profiles.keys())}")
     variants = model_profiles.get("variants", [])
     for variant in variants:
         if int(variant.get("gpus", 0)) == gpu_count:
@@ -124,21 +119,14 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int) -> dict:
             # the GPU count. These fields are ADVISORY — the engine reads the
             # real mesh from config["parallel"] in the config JSON (top-level CLI
             # args do not configure parallelism), so they must mirror it.
-            has_parallel = any(
-                k in variant for k in ("cfg_p_size", "seq_p_size", "tensor_p_size")
-            )
+            has_parallel = any(k in variant for k in ("cfg_p_size", "seq_p_size", "tensor_p_size"))
             prod = int(variant.get("cfg_p_size", 1)) * int(variant.get("seq_p_size", 1))
             tp = int(variant.get("tensor_p_size", 0))
             expected = tp if tp else prod
             if has_parallel and expected != gpu_count:
-                raise RuntimeError(
-                    f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: "
-                    f"parallel product {expected} != gpu_count {gpu_count}"
-                )
+                raise RuntimeError(f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: parallel product {expected} != gpu_count {gpu_count}")
             return variant
-    raise RuntimeError(
-        f"No {gpu_count}-GPU variant for model_cls '{model_cls}' in {profiles_file}"
-    )
+    raise RuntimeError(f"No {gpu_count}-GPU variant for model_cls '{model_cls}' in {profiles_file}")
 
 
 def _free_ports(count: int, exclude=()) -> list:
@@ -249,9 +237,7 @@ class _ReadyState:
             return self.ready
 
 
-def _make_handler(
-    internal_base: str, metrics_base: str, state: _ReadyState
-):  # noqa: C901
+def _make_handler(internal_base: str, metrics_base: str, state: _ReadyState):  # noqa: C901
     class _ProxyHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -374,17 +360,11 @@ def _wait_engine_up(internal_base: str, warmup: dict, state: _ReadyState):
 
 def main():
     parser = argparse.ArgumentParser(description="gpustack-lx2v-launcher")
-    parser.add_argument(
-        "--model", required=True, help="Model path (GPUStack {{model_path}})"
-    )
+    parser.add_argument("--model", required=True, help="Model path (GPUStack {{model_path}})")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument(
-        "--port", type=int, required=True, help="Public port ({{port}})"
-    )
+    parser.add_argument("--port", type=int, required=True, help="Public port ({{port}})")
     parser.add_argument("--model-cls", default="", help="Override inferred model_cls")
-    parser.add_argument(
-        "--profile", default="", help="Force a profile key (unused reserve)"
-    )
+    parser.add_argument("--profile", default="", help="Force a profile key (unused reserve)")
     parser.add_argument("--profiles-file", default=_DEFAULT_PROFILES)
     parser.add_argument("--internal-port", type=int, default=0)
     args, passthrough = parser.parse_known_args()
@@ -405,8 +385,7 @@ def main():
         internal_port, metric_port, master_port = _free_ports(3, exclude={args.port})
 
     logger.info(
-        "model_cls=%s gpus=%s profile=%s internal_port=%s metric_port=%s "
-        "master_port=%s public=%s:%s",
+        "model_cls=%s gpus=%s profile=%s internal_port=%s metric_port=%s master_port=%s public=%s:%s",
         model_cls,
         gpu_count,
         profile.get("name", "?"),
@@ -438,9 +417,7 @@ def main():
         daemon=True,
     ).start()
 
-    httpd = ThreadingHTTPServer(
-        (args.host, args.port), _make_handler(internal_base, metrics_base, state)
-    )
+    httpd = ThreadingHTTPServer((args.host, args.port), _make_handler(internal_base, metrics_base, state))
 
     def _shutdown(signum, frame):
         logger.info("received signal %s, shutting down", signum)
