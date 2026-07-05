@@ -22,6 +22,15 @@ FROM ${BASE_IMAGE}
 COPY . /opt/LightX2V
 RUN pip install --no-cache-dir -e /opt/LightX2V --no-deps
 
+# gpustack-lx2v-launcher: front proxy + profile-driven engine spawner used by
+# GPUStack's LightX2V built-in backend (occupies {{port}}, self-answers /ready,
+# spawns python -m lightx2v.server / torchrun per profile). Source lives in the
+# repo at deploy/gpustack-lx2v-launcher/ (copied in above via `COPY .`).
+RUN printf '#!/bin/sh\nexec python /opt/LightX2V/deploy/gpustack-lx2v-launcher/gpustack_lx2v_launcher.py "$@"\n' \
+      > /usr/local/bin/gpustack-lx2v-launcher \
+ && chmod +x /usr/local/bin/gpustack-lx2v-launcher \
+ && python -m py_compile /opt/LightX2V/deploy/gpustack-lx2v-launcher/gpustack_lx2v_launcher.py
+
 ENV PYTHONPATH=/opt/LightX2V
 WORKDIR /workspace
 CMD ["/bin/bash"]
