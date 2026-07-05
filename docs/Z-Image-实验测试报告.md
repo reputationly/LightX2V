@@ -43,7 +43,7 @@
   "aspect_ratio": "16:9",
   "num_channels_latents": 16,
   "infer_steps": 9,                         // turbo 蒸馏 9 步
-  "attn_type": "sage_attn2",                // ⚠️ 改自官方 flash_attn3(A100 跑不了 Hopper kernel)
+  "attn_type": "torch_sdpa",                // ⚠️ 改自官方 flash_attn3(A100 跑不了 Hopper kernel);此镜像没装 sageattention,写 sage_attn2 会静默回退到 sdpa(见 §4.2),直接写 torch_sdpa 更诚实
   "rope_type": "torch",                     // ⚠️ 改自默认 flashinfer(镜像没装 flashinfer,否则崩)
   "enable_cfg": false, "sample_guide_scale": 0.0,
   "patch_size": 2,
@@ -83,6 +83,19 @@
 | 单卡 | 7.64s | 21.84s | **慢 2.86×** |
 | 2卡 | 6.31s | 16.36s | 慢 2.59× |
 
+### 4.2 sage_attn2 vs torch_sdpa:此镜像上无差异(sage 未装,静默回退)
+
+同一 bf16 单卡、16:9、连发 6 张丢首张:
+
+| attn_type | 冷 #1 | **热态均值(#2–6)** |
+|---|---|---|
+| `sage_attn2` | 7.42s | **7.43s** |
+| `torch_sdpa` | 14.4s | **7.44s** |
+
+差 0.01s(<0.2%,噪声级)。原因:**镜像里根本没装 sageattention**——启动日志明写 `sageattention not found, please install sageattention first`,`attn_type=sage_attn2` 于是静默回退到 torch_sdpa,两条配置跑的是同一条内核路径,故一致。
+
+**结论**:此 A100 镜像上 z_image 实际就走 torch_sdpa,没有量化注意力可用 → **无加速空间**。配置显式写 `torch_sdpa`(诚实、且规避量化注意力潜在画质风险)。要真上 sage 提速,得先在镜像内编 sageattention;A100(sm80)能否受益于 sage 仍需另测,收益存疑,当前不做。
+
 ---
 
 ## 5. 原因分析(关键)
@@ -106,11 +119,11 @@ bf16 单卡峰值才 **21.8G < 40G**,余量近一半。int8 省下的 6G 在这�
 | 坑 | 现象 | 修法 |
 |---|---|---|
 | **rope_type 默认 flashinfer** | 镜像没装 flashinfer → 推理 `'NoneType' object is not callable` | config 加 `"rope_type": "torch"`(纯 torch RoPE,零依赖)。**flux2 等用 flashinfer rope 的模型同样会踩。** |
-| **attn_type 默认 flash_attn3** | A100(Ampere)非 Hopper,flash_attn3 跑不了 | 改 `sage_attn2`(此镜像 Wan 已验证) |
+| **attn_type 默认 flash_attn3** | A100(Ampere)非 Hopper,flash_attn3 跑不了 | 改 `torch_sdpa`。⚠️ 别写 `sage_attn2`:此镜像没装 sageattention(启动日志 `sageattention not found`),会**静默回退 sdpa**——看着"用了 sage"其实没有(见 §4.2) |
 | **ulysses 4 卡报错** | `heads (30) not divisible by seq_p_size (4)` | z_image 30 个 head,seq_p_size 只能 2/3/5/6…,**4 卡不可用** |
 | **冷态数字虚高** | 单发首张比稳态慢近一倍 | 单容器连发、丢首张预热取均值 |
 | **`compile: true` 无效** | z_image 无 `compile()` 方法,`hasattr` 为 False → 静默跳过 | 框架级缺失,要真编译需改核心代码(本次未做) |
-| **分辨率转置** | `aspect_ratio=16:9` 出 928×1664 竖图(实际 9:16) | runner bug,见 §7 |
+| ~~分辨率转置~~(**已修复** §7) | 修前 16:9 出 928×1664 竖图 | `z_image_runner.py` 312/329 改 `width,height=` |
 
 ---
 
@@ -137,8 +150,9 @@ z_image_runner.py:311  set_target_shape(): height, width = get_input_target_shap
 | 3:2 | 1584×1056 | 1056×1584(竖) | 12.33s |
 | 2:3 | 1056×1584 | 1584×1056(横) | 8.22s |
 
-- **临时绕过**:要 16:9 横图就请求 `9:16`(标签反着填)。
-- **彻底修**:把两处调用改成 `width, height = self.get_input_target_shape()`(1 行,需验证,本次未改核心)。
+- **✅ 已修复并验证(2026-07-05)**:`z_image_runner.py` line 312(`set_target_shape`)和 329(`set_img_shapes`)把 `height, width = self.get_input_target_shape()` 改成 **`width, height = self.get_input_target_shape()`**(get 返回 (width,height),原按 (h,w) 解包=转置)。挂载补丁文件实测:**16:9→1664×928(横)、9:16→928×1664(竖)、1:1→1328²**,全部正确,不用再反填。
+- **上生产**:重打镜像内置补丁,或 `docker run -v /data/z_image_runner_fixed.py:/opt/LightX2V/lightx2v/models/runners/z_image/z_image_runner.py`(挂载覆盖);建议上游 PR。
+- **~~临时绕过~~**(修复前):要 16:9 横图请求 `9:16`(标签反填)。
 - 提示词内容不影响耗时(stage② 固定词 vs stage③ 轮换词逐行几乎一致)→ DiT 计算只看分辨率。
 
 > ⚠️ **上表耗时是"冷态单形状"**:sweep 每换一个分辨率,kernel 按新 shape 重新 autotune,每个测量都带冷启动开销(与 §4 热态稳态不可直接比——同一张 928×1664 冷态 11.49s / 热态 7.64s)。
@@ -160,7 +174,7 @@ z_image_runner.py:311  set_target_shape(): height, width = get_input_target_shap
 | NUMA | 单图无影响(compute-bound);挑同 NUMA 当习惯 |
 | **要吞吐** | **N×单卡实例 + 负载均衡**;4 单卡实测 **0.530 img/s**(16/16),≈预测 0.52,≫ 2×双卡 0.32 |
 | compile/fp8 | compile 对 z_image 无效(缺方法);fp8 A100 无算力单元,均不提速 |
-| 分辨率 | aspect_ratio 生效但横竖转置(见 §7);7 比例都能出,~1.5MP |
+| 分辨率 | aspect_ratio 生效;横竖转置 **已修复**(§7);7 比例 ~1.5MP |
 
 ### 8.1 多实例生产架构(实测支撑)
 - **不要"每实例绑一种分辨率 + 按分辨率路由"**:autotune 缓存跨切换保留(§7 实测),**一个通用实例跑过 7 种分辨率各一次后全部缓存、之后任意分辨率都热态**,不会因混分辨率反复冷。绑分辨率反而招致负载不均(热门分辨率实例排队、其余闲置)。
@@ -209,7 +223,7 @@ REQS=16 bash /data/test_z_image_4cards.sh
 - [x] 跑 `test_z_image_4cards.sh`:4 单卡实例 **0.530 img/s**(16/16 成功)✓
 - [x] **热态横竖对比**:竖 7.64s vs 横 7.65s,**证伪"竖图慢"**——纯冷态 autotune 假象,热态朝向无影响 ✓
 - [x] 肉眼对比 int8 vs bf16 出图质量:**看不出差异,量化无损** ✓
-- [~] 分辨率转置 bug:**不自行修核心代码,仅记录**(§7),待官方修复后用 `9:16↔16:9` 反填绕过
+- [x] **分辨率转置 bug:已修复并验证**(§7,`z_image_runner.py` 312/329 两行),16:9 出横图正常,不用再反填。生产挂载补丁或重打镜像。
 
 ---
 
@@ -222,6 +236,6 @@ REQS=16 bash /data/test_z_image_4cards.sh
 | 多卡 | 只 1.2×,4 卡不可用(30 head),不划算 |
 | NUMA | 单图无影响(compute-bound) |
 | 吞吐方案 | 4×单卡实例 **实测 0.530 img/s**(≫ 2×双卡 0.32) |
-| 必改配置 | `rope_type=torch`、`attn_type=sage_attn2`、steps 9 |
-| 分辨率 | aspect_ratio 横竖被转置(16:9 出竖图);热态朝向无影响(同像素同耗时);7 比例 ~1.5MP |
+| 必改配置 | `rope_type=torch`、`attn_type=torch_sdpa`(sage 未装会静默回退,实测同速 §4.2)、steps 9 |
+| 分辨率 | aspect_ratio 横竖转置 **已修复**(§7,16:9 正常出横图);热态朝向无影响(同像素同耗时);7 比例 ~1.5MP |
 | 对比 Wan | 完全相反:Wan 显存顶满→int8+多卡刚需;z_image 显存宽裕→全不需要 |

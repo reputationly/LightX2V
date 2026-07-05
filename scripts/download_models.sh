@@ -17,6 +17,8 @@
 #   seedvr_7b   ~66G  魔搭 bytedance-community/SeedVR2-7B(取普通版+锐化版两个 DiT 对比)
 #                      ⚠️ 7B 仓库缺 pos/neg_emb, 必须连 seedvr_3b 一起下(借 3B 的 vae+emb)
 #                      源: 魔搭社区镜像(快), 回退 HF 官方 ByteDance-Seed/*
+#   qwen_lora   ~数G  lightx2v/Qwen-Image-2512-Lightning(Qwen-Image bf16 8步蒸馏 LoRA, 在线挂载)
+#                      ⚠️ 给 2512 基座; 若与普通 Qwen-Image 基座不兼容(出图崩)需另下 Qwen-Image-2512
 #
 # 用法(服务器上, 先 scp 到 /data):
 #   tmux new -s dl -d 'bash /data/download_models.sh'   # 挂后台(默认全下)
@@ -105,7 +107,10 @@ case "$m" in
     dl bytedance-community/SeedVR2-3B "ByteDance-Seed/SeedVR2-3B" ByteDance-Seed/SeedVR2-3B ;;
   seedvr_7b)   # 7B 缺 emb, 取普通版+锐化版两个 DiT 对比; 跑时 model_path 指 3B 目录, config dit_original_ckpt 指其一
     dl bytedance-community/SeedVR2-7B "ByteDance-Seed/SeedVR2-7B" ByteDance-Seed/SeedVR2-7B seedvr2_ema_7b.pth seedvr2_ema_7b_sharp.pth ;;
-  *) echo "!! 未知模型标签: $m (支持: hy15 wan_i2v wan_animate wan_audio qwen_image z_image seedvr_3b seedvr_7b)"; FAILED="$FAILED $m";;
+  qwen_lora)   # Qwen-Image 2512 Lightning 8步蒸馏 LoRA(bf16 在线挂载; config lora_configs.path 指 loras/Qwen-Image-2512-Lightning/<文件>)
+    dl lightx2v/Qwen-Image-2512-Lightning "loras/Qwen-Image-2512-Lightning" lightx2v/Qwen-Image-2512-Lightning \
+       Qwen-Image-2512-Lightning-8steps-V1.0-fp32.safetensors ;;
+  *) echo "!! 未知模型标签: $m (支持: hy15 wan_i2v wan_animate wan_audio qwen_image z_image seedvr_3b seedvr_7b qwen_lora)"; FAILED="$FAILED $m";;
 esac
 done
 
@@ -121,6 +126,7 @@ for m in $MODELS; do
     z_image)     d="Z-Image-Turbo" ;;
     seedvr_3b)   d="ByteDance-Seed/SeedVR2-3B" ;;
     seedvr_7b)   d="ByteDance-Seed/SeedVR2-7B" ;;
+    qwen_lora)   d="loras/Qwen-Image-2512-Lightning" ;;
     *)           continue ;;
   esac
   du -sh "$DEST/$d" 2>/dev/null || echo "  (缺) $DEST/$d"
