@@ -1,0 +1,57 @@
+# LightX2V launcher profiles — measured, fixed per (model_cls, gpu_count).
+# Source of truth: gpustack docs/lightx2v-backend-design.md §3 / §3.2.
+#
+# config_json points at configs baked INTO this image. The engine app image
+# (dockerfiles/Dockerfile_aarch64_app) does `COPY . /opt/LightX2V`, so every
+# repo config is available at /opt/LightX2V/configs/... at runtime — no NFS
+# dependency for profiles. Calibrating a profile = edit config here + rebuild
+# the engine image; GPUStack is never touched.
+#
+# The launcher keys on model_cls (inferred from the model path or --model-cls),
+# picks the variant whose `gpus` matches the container's GPU count, and asserts
+# cfg_p_size * seq_p_size (or tensor_p_size) == gpus.
+
+z_image:
+  variants:
+    - name: z-image/a100-sage
+      gpus: 1
+      task: t2i
+      # Matches design §3.2 z-image/bf16: infer_steps=9, attn_type=sage_attn2,
+      # enable_cfg=false, rope_type=torch (A100-safe; flash_attn3 + flashinfer
+      # rope both crash on A100). A torch_sdpa variant also exists at
+      # configs/z_image/z_image_a100_sdpa.json — switch here if you standardize
+      # on sdpa (see commit a169c04a "attn(sage→sdpa) finding").
+      config_json: /opt/LightX2V/configs/z_image/z_image_a100_sage.json
+      # Optional warmup so the first real request is hot. Verify the body first.
+      # warmup:
+      #   endpoint: /v1/tasks/image/sync
+      #   timeout: 600
+      #   body: {prompt: "warmup", aspect_ratio: "1:1"}
+
+# TODO(calibration): the int8 4-card ulysses config for wan2.2 i2v is NOT yet in
+# this repo. configs/deploy/wan_i2v.json uses flash_attn3 (A100 can't run) and a
+# disaggregated sub_servers layout — NOT what we want. Create an A100 int8 4-card
+# ulysses config and point config_json at it. Left here as a placeholder so a
+# 4-GPU wan deploy fails loudly, not silently.
+#
+# IMPORTANT: the parallel mesh MUST live in that config JSON's "parallel" block —
+# the engine reads config["parallel"], and top-level CLI args do NOT configure
+# parallelism (set_config.py). The seq_p_size/cfg_p_size fields below are
+# ADVISORY (the launcher only uses them to validate gpus); they must MIRROR the
+# JSON. The config JSON must therefore contain, e.g.:
+#   "parallel": {"seq_p_size": 4, "cfg_p_size": 1, "seq_p_attn_type": "ulysses"}
+#   plus int8-torchao, t5_cpu_offload=true, resize_mode=null, attn=sage_attn2,
+#   rope=torch.
+# Do NOT base it on configs/deploy/wan_i2v.json's disaggregated "sub_servers"
+# block (fixed ports 9000-9004): those would collide across co-located instances
+# on the shared host network. Use a single in-process torchrun server.
+wan2.2_moe:
+  variants:
+    - name: wan2.2-i2v/int8-4card
+      gpus: 4
+      task: i2v
+      config_json: /opt/LightX2V/configs/deploy/wan22_i2v_int8_4card_a100.json  # TODO: create
+      # advisory (validated against gpus; real mesh lives in config_json.parallel)
+      seq_p_size: 4
+      seq_p_attn_type: ulysses
+      cfg_p_size: 1
