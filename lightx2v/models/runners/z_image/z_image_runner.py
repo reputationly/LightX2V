@@ -309,7 +309,7 @@ class ZImageRunner(DefaultRunner):
         raise NotImplementedError
 
     def set_target_shape(self):
-        height, width = self.get_input_target_shape()
+        width, height = self.get_input_target_shape()  # get_input_target_shape 返回 (width,height);原为 height,width 导致横竖转置
 
         # VAE applies 8x compression on images but we must also account for packing which requires
         # latent height and width to be divisible by 2.
@@ -326,7 +326,7 @@ class ZImageRunner(DefaultRunner):
                 raise ValueError(f"target_shape must be 4D [B, C, H, W], got {len(self.input_info.target_shape)}D: {self.input_info.target_shape}")
             _, _, latent_height, latent_width = self.input_info.target_shape
         else:
-            height, width = self.get_input_target_shape()
+            width, height = self.get_input_target_shape()  # 同上修转置
 
             vae_scale_factor = self.config["vae_scale_factor"]
             latent_height = 2 * (int(height) // (vae_scale_factor * 2))
