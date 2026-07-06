@@ -28,30 +28,80 @@ z_image:
       #   timeout: 600
       #   body: {prompt: "warmup", aspect_ratio: "1:1"}
 
-# TODO(calibration): the int8 4-card ulysses config for wan2.2 i2v is NOT yet in
-# this repo. configs/deploy/wan_i2v.json uses flash_attn3 (A100 can't run) and a
-# disaggregated sub_servers layout — NOT what we want. Create an A100 int8 4-card
-# ulysses config and point config_json at it. Left here as a placeholder so a
-# 4-GPU wan deploy fails loudly, not silently.
+# IMPORTANT (all multi-GPU variants): the parallel mesh MUST live in the config
+# JSON's "parallel" block — the engine reads config["parallel"], and top-level
+# CLI args do NOT configure parallelism (set_config.py). The seq_p_size /
+# cfg_p_size fields on a variant are ADVISORY (the launcher only uses them to
+# validate the GPU count); they must MIRROR the JSON. Never use the
+# disaggregated "sub_servers" layout (fixed ports 9000-9004) — those collide
+# across co-located instances on the shared host network; use a single
+# in-process torchrun server.
 #
-# IMPORTANT: the parallel mesh MUST live in that config JSON's "parallel" block —
-# the engine reads config["parallel"], and top-level CLI args do NOT configure
-# parallelism (set_config.py). The seq_p_size/cfg_p_size fields below are
-# ADVISORY (the launcher only uses them to validate gpus); they must MIRROR the
-# JSON. The config JSON must therefore contain, e.g.:
-#   "parallel": {"seq_p_size": 4, "cfg_p_size": 1, "seq_p_attn_type": "ulysses"}
-#   plus int8-torchao, t5_cpu_offload=true, resize_mode=null, attn=sage_attn2,
-#   rope=torch.
-# Do NOT base it on configs/deploy/wan_i2v.json's disaggregated "sub_servers"
-# block (fixed ports 9000-9004): those would collide across co-located instances
-# on the shared host network. Use a single in-process torchrun server.
+# GPUStack side: multi-GPU profiles must be deployed with
+# gpu_selector.gpus_per_replica (or pinned gpu_ids) — the LightX2V resource-fit
+# selector reads it to reserve whole GPUs (defaults to 1 GPU/replica otherwise).
+
+# Wan2.2 T2V (Wan2.2-T2V-A14B). Production calibration from the Wan2.2 T2V
+# runbook (gpustack docs/lightx2v-gpustack-部署实录.md §12.2, measured on
+# dev-gpustack-a100-0002): int8 4-card ulysses is the production optimum —
+# int8 single-card runs but is slow, bf16 multi-card CPU-OOMs (4 ranks ×
+# (57G+11G) > 256G). ~35G/GPU at seq_p=4; 480p long-form, 720p caps at 161
+# frames; frames must be 4n+1.
 wan2.2_moe:
   variants:
-    - name: wan2.2-i2v/int8-4card
+    - name: wan2.2-t2v/int8-4card
       gpus: 4
-      task: i2v
-      config_json: /opt/LightX2V/configs/deploy/wan22_i2v_int8_4card_a100.json  # TODO: create
+      task: t2v
+      config_json: /opt/LightX2V/configs/deploy/wan22_t2v_int8_4card_a100.json
       # advisory (validated against gpus; real mesh lives in config_json.parallel)
       seq_p_size: 4
       seq_p_attn_type: ulysses
       cfg_p_size: 1
+
+# Wan2.2 I2V (Wan2.2-I2V-A14B) — the launcher maps model paths containing
+# i2v/flf2v to this DISTILL cls (docs/Wan2.2-I2V-实验测试报告.md: model_cls=
+# wan2.2_moe_distill, task=i2v or flf2v). Same production shape as T2V:
+# int8 4-card ulysses (~33-35G/GPU), int8 single-card OOMs at 720p, bf16
+# multi-card CPU-OOMs. int8 DiT ckpts live on shared NFS (models-int8/).
+# flf2v needs its own variant + calibration before use.
+wan2.2_moe_distill:
+  variants:
+    - name: wan2.2-i2v/int8-4card
+      gpus: 4
+      task: i2v
+      config_json: /opt/LightX2V/configs/deploy/wan22_i2v_int8_4card_a100.json
+      # advisory (validated against gpus; real mesh lives in config_json.parallel)
+      seq_p_size: 4
+      seq_p_attn_type: ulysses
+      cfg_p_size: 1
+
+# Qwen-Image-Edit-2511 (i2i editing). Production calibration from
+# docs/Qwen-Image-Edit实验测试报告.md: Lightning offline-merged 8-step +
+# qwen25vl_cpu_offload=false (text encoder stays on GPU — offloaded to the ARM
+# CPU the VLM forward takes ~7min and looks like a hang) = 21.6s/image hot,
+# single GPU, attn MUST be torch_sdpa (sage_attn2 black-images).
+# Deploy the MERGED model dir as Model Path; the merged DiT safetensors path is
+# pinned in the config JSON (shared NFS).
+# ⚠️ Host-memory red line: the block-offloaded DiT keeps ~60G Shmem per
+# instance — cap at 2 replicas per 251G node for mixed traffic (3 absolute
+# max, the 4th gets OOM-killed). This is a per-NODE cap the scheduler cannot
+# see (it books VRAM, not host Shmem) — enforce it at deploy time.
+# Both variants are 1-GPU, so the launcher disambiguates by TASK: model paths
+# containing "edit" resolve to i2i; otherwise pass --task t2i / --task i2i as a
+# backend parameter at deploy time (ambiguity fails loudly, never guesses).
+qwen_image:
+  variants:
+    - name: qwen-image-edit-2511/lightning-merged-8step
+      gpus: 1
+      task: i2i
+      config_json: /opt/LightX2V/configs/deploy/qwen_edit_2511_lightning_merged_a100.json
+    # Qwen-Image t2i (docs/Qwen-Image-实验测试报告.md): bf16 merged 8-step +
+    # qwen25vl_cpu_offload=false = 17.0s/image hot, single GPU, torch_sdpa only
+    # (sage_attn2 NaN-black-images). Same ~60G-Shmem-per-instance host-memory
+    # red line as edit: cap 2 replicas per 251G node for mixed traffic
+    # (3 absolute max; the 4th wedges the node — enforce at deploy time, the
+    # scheduler only books VRAM).
+    - name: qwen-image-2512/lightning-merged-8step
+      gpus: 1
+      task: t2i
+      config_json: /opt/LightX2V/configs/deploy/qwen_2512_lightning_merged_a100.json
