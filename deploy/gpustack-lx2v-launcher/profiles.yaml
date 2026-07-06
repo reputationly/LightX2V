@@ -58,11 +58,17 @@ wan2.2_moe:
       seq_p_attn_type: ulysses
       cfg_p_size: 1
 
-# Wan2.2 I2V (Wan2.2-I2V-A14B) — the launcher maps model paths containing
-# i2v/flf2v to this DISTILL cls (docs/Wan2.2-I2V-实验测试报告.md: model_cls=
-# wan2.2_moe_distill, task=i2v or flf2v). Same production shape as T2V:
-# int8 4-card ulysses (~33-35G/GPU), int8 single-card OOMs at 720p, bf16
-# multi-card CPU-OOMs. int8 DiT ckpts live on shared NFS (models-int8/).
+# Wan2.2 I2V — the launcher maps model paths containing i2v/flf2v to this
+# DISTILL cls (docs/Wan2.2-I2V-实验测试报告.md: model_cls=wan2.2_moe_distill,
+# task=i2v or flf2v). Same production shape as T2V: int8 4-card ulysses
+# (~33-35G/GPU), int8 single-card OOMs at 720p, bf16 multi-card CPU-OOMs.
+# int8 DiT ckpts live on shared NFS (models-int8/).
+#
+# DEPLOY NOTE: there is no separate I2V base dir — the I2V pipeline takes
+# VAE/T5 from the T2V base (report §2), so deploy with
+#   Model Path = .../models/Wan-AI/Wan2.2-T2V-A14B
+#   backend parameters: --model-cls wan2.2_moe_distill --task i2v
+# (without them the launcher infers t2v from the path and fails loudly).
 # flf2v needs its own variant + calibration before use.
 wan2.2_moe_distill:
   variants:
