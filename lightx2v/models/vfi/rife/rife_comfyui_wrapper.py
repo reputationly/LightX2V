@@ -56,6 +56,12 @@ class RIFEWrapper:
         if source_fps == target_fps:
             return images
 
+        # RIFE (IFNet) weights are fp32; the diffusion pipeline emits bf16 frames
+        # (use_bfloat16), which would hit "Input type (BFloat16) and bias type
+        # (float) should be the same" in the conv layers. Cast frames to fp32 to
+        # match the model (RIFE is tiny + numerically sensitive → fp32 is right).
+        images = images.float()
+
         total_source_frames = images.shape[0]
         height, width = images.shape[1:3]
 
