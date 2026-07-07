@@ -70,3 +70,21 @@ CUDA_VISIBLE_DEVICES=0 python deploy/gpustack-lx2v-launcher/gpustack_lx2v_launch
   by GPUStack. z_image = 1-card replicas, wan = one 4-card replica; the launcher
   asserts `parallel_product == gpu_count`.
 - PyYAML must be present in the image (it already is for LightX2V).
+
+## Lint before you push
+
+The repo's `lint` GitHub workflow runs `pre-commit run --all-files`, which is a
+**separate** workflow from `Build ARM64 Docker Image` — the build can go green
+while `lint` fails, so check `lint` after pushing Python changes. The failing
+hook is almost always `ruff-format`. It is pinned to **ruff v0.11.0** with
+`--config=pyproject.toml` (line-length 200); pre-commit runs it in its own
+isolated env, so a locally-installed newer ruff can disagree. Reproduce the CI
+result with the exact version:
+
+```
+python3 -m venv /tmp/rufflint
+/tmp/rufflint/bin/pip install ruff==0.11.0
+/tmp/rufflint/bin/ruff format --check --config=pyproject.toml .   # lists files to reformat
+/tmp/rufflint/bin/ruff format        --config=pyproject.toml <file>   # fix in place
+/tmp/rufflint/bin/ruff check         --config=pyproject.toml .   # the `ruff` (lint) hook
+```
