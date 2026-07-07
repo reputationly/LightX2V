@@ -28,6 +28,6 @@
   "video_frame_interpolation": {
     "algo": "rife",
     "target_fps": 32,
-    "model_path": "/nfs-models/wuhanjisuan894/models/rife"
+    "model_path": "/nfs-models/wuhanjisuan894/models/rife-model/flownet.pkl"
   }
 }
