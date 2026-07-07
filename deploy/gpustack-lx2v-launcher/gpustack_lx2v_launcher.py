@@ -144,9 +144,7 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint:
         if len(matched) != 1:
             names = [f"{v.get('name', '?')} (task={v.get('task', '?')})" for v in candidates]
             raise RuntimeError(
-                f"Ambiguous {gpu_count}-GPU variants for model_cls '{model_cls}': {names}. "
-                f"Pass --task <task> as a backend parameter to pick one "
-                f"(inferred task hint: '{task_hint or 'none'}')."
+                f"Ambiguous {gpu_count}-GPU variants for model_cls '{model_cls}': {names}. Pass --task <task> as a backend parameter to pick one (inferred task hint: '{task_hint or 'none'}')."
             )
         candidates = matched
     variant = candidates[0]
@@ -407,9 +405,7 @@ def main():
     parser.add_argument(
         "--task",
         default="",
-        help="Override the task hint used to pick between same-GPU-count "
-        "variants (e.g. qwen_image t2i vs i2i); the engine still receives "
-        "the selected variant's task",
+        help="Override the task hint used to pick between same-GPU-count variants (e.g. qwen_image t2i vs i2i); the engine still receives the selected variant's task",
     )
     parser.add_argument("--profile", default="", help="Force a profile key (unused reserve)")
     parser.add_argument("--profiles-file", default=_DEFAULT_PROFILES)
