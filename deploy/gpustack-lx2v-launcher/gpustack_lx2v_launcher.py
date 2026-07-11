@@ -99,6 +99,15 @@ def _infer_model_cls(model_path: str, override: str) -> str:
     # GPUStack backend parameters) when the path is ambiguous.
     if "z_image" in name or "z-image" in name or "zimage" in name:
         return "z_image"
+    # Checked BEFORE the "wan" branch: these model dirs usually contain "wan"
+    # too (e.g. Wan2.2-VACE-Fun-*, InfiniteTalk rides the Wan2.1 distill DiT)
+    # and would otherwise be misclassified as plain wan2.2_moe.
+    if "infinitetalk" in name:
+        return "infinitetalk"
+    if "seedvr" in name:
+        return "seedvr2"
+    if "vace" in name:
+        return "wan2.2_moe_vace"
     if "wan" in name:
         # I2V/FLF2V is the distill cls (Wan2.2-I2V experiment report:
         # model_cls=wan2.2_moe_distill); T2V is the plain MoE cls (§12.2).
@@ -117,6 +126,16 @@ def _infer_task_hint(model_path: str, override: str) -> str:
     if override:
         return override
     name = os.path.basename(os.path.normpath(model_path)).lower()
+    # Single-task model classes first — infer their task before the generic
+    # heuristics below (mirrors _infer_model_cls checking these before "wan").
+    # A VACE dir named e.g. "wan2.2-vace-video-editing" must NOT fall to the
+    # "edit"->i2i case, or _load_profile rejects its only (task=vace) variant.
+    if "infinitetalk" in name:
+        return "s2v"
+    if "seedvr" in name:
+        return "sr"
+    if "vace" in name:
+        return "vace"
     if "edit" in name:
         return "i2i"
     for task in ("flf2v", "i2v", "t2v", "s2v", "i2i", "t2i"):
@@ -125,7 +144,7 @@ def _infer_task_hint(model_path: str, override: str) -> str:
     return ""
 
 
-def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint: str = "") -> dict:
+def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint: str = "", profile_name: str = "") -> dict:
     if yaml is None:
         raise RuntimeError("PyYAML is required to read the launcher profiles file")
     with open(profiles_file, "r") as f:
@@ -134,21 +153,39 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint:
     if not model_profiles:
         raise RuntimeError(f"No profile for model_cls '{model_cls}' in {profiles_file}. Known: {sorted(profiles.keys())}")
     variants = model_profiles.get("variants", [])
-    candidates = [v for v in variants if int(v.get("gpus", 0)) == gpu_count]
-    if not candidates:
-        raise RuntimeError(f"No {gpu_count}-GPU variant for model_cls '{model_cls}' in {profiles_file}")
-    if len(candidates) > 1:
-        # Same GPU count, different tasks (e.g. qwen_image t2i vs i2i):
-        # disambiguate by task, never guess.
-        matched = [v for v in candidates if task_hint and str(v.get("task", "")) == task_hint]
-        if len(matched) != 1:
-            names = [f"{v.get('name', '?')} (task={v.get('task', '?')})" for v in candidates]
+    if profile_name:
+        # Explicit variant pin (--profile backend parameter). Needed when
+        # neither GPU count nor task disambiguates — e.g. the two InfiniteTalk
+        # archives are both (infinitetalk, 4 GPUs, s2v) and differ only in
+        # resolution. Still validated against the actual GPU count below.
+        named = [v for v in variants if str(v.get("name", "")) == profile_name]
+        if len(named) != 1:
+            names = [v.get("name", "?") for v in variants]
             raise RuntimeError(
-                f"Ambiguous {gpu_count}-GPU variants for model_cls '{model_cls}': {names}. Pass --task <task> as a backend parameter to pick one (inferred task hint: '{task_hint or 'none'}')."
+                f"--profile '{profile_name}' does not match exactly one variant of model_cls '{model_cls}' in {profiles_file}. Known variants: {names}"
             )
-        candidates = matched
+        variant = named[0]
+        if int(variant.get("gpus", 0)) != gpu_count:
+            raise RuntimeError(
+                f"--profile '{profile_name}' needs {variant.get('gpus', '?')} GPU(s) but the container has {gpu_count}"
+            )
+        candidates = named
+    else:
+        candidates = [v for v in variants if int(v.get("gpus", 0)) == gpu_count]
+        if not candidates:
+            raise RuntimeError(f"No {gpu_count}-GPU variant for model_cls '{model_cls}' in {profiles_file}")
+        if len(candidates) > 1:
+            # Same GPU count, different tasks (e.g. qwen_image t2i vs i2i):
+            # disambiguate by task, never guess.
+            matched = [v for v in candidates if task_hint and str(v.get("task", "")) == task_hint]
+            if len(matched) != 1:
+                names = [f"{v.get('name', '?')} (task={v.get('task', '?')})" for v in candidates]
+                raise RuntimeError(
+                    f"Ambiguous {gpu_count}-GPU variants for model_cls '{model_cls}': {names}. Pass --task <task> (or --profile <name> when tasks tie, e.g. the two InfiniteTalk resolutions) as a backend parameter to pick one (inferred task hint: '{task_hint or 'none'}')."
+                )
+            candidates = matched
     variant = candidates[0]
-    if task_hint and variant.get("task") and str(variant["task"]) != task_hint:
+    if not profile_name and task_hint and variant.get("task") and str(variant["task"]) != task_hint:
         raise RuntimeError(
             f"Model path suggests task '{task_hint}' but the only {gpu_count}-GPU "
             f"variant for '{model_cls}' is task '{variant['task']}' "
@@ -407,7 +444,11 @@ def main():
         default="",
         help="Override the task hint used to pick between same-GPU-count variants (e.g. qwen_image t2i vs i2i); the engine still receives the selected variant's task",
     )
-    parser.add_argument("--profile", default="", help="Force a profile key (unused reserve)")
+    parser.add_argument(
+        "--profile",
+        default="",
+        help="Pin a specific variant by its profile `name` (e.g. infinitetalk-720p/int8-4card); required when GPU count + task cannot disambiguate",
+    )
     parser.add_argument("--profiles-file", default=_DEFAULT_PROFILES)
     parser.add_argument("--internal-port", type=int, default=0)
     args, passthrough = parser.parse_known_args()
@@ -415,7 +456,7 @@ def main():
     gpu_count = _count_gpus()
     model_cls = _infer_model_cls(args.model, args.model_cls)
     task_hint = _infer_task_hint(args.model, args.task)
-    profile = _load_profile(args.profiles_file, model_cls, gpu_count, task_hint)
+    profile = _load_profile(args.profiles_file, model_cls, gpu_count, task_hint, args.profile)
     # Distinct ephemeral ports, all unique per instance and != public port:
     #  - engine HTTP  (the engine otherwise takes the public --port)
     #  - metrics      (the engine otherwise pins a fixed 8001)
