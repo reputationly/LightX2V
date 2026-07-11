@@ -94,6 +94,10 @@ class TorchrunInferenceWorker:
                 else:
                     logger.warning(f"Target FPS {target_fps} is set, but video frame interpolation is not configured")
 
+            # fresh input_info per request: the upstream service only forwards fields the
+            # client explicitly set, so reusing the previous object would leak media paths
+            # (src_video/src_ref_images/...) and scalars (sr_ratio) across requests
+            self.input_info = init_empty_input_info(self.runner.config["task"])
             update_input_info_from_dict(self.input_info, task_data)
 
             self.runner.set_config(task_data)
