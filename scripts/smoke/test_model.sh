@@ -15,11 +15,15 @@
 #   NP=1            卡数(>1 走 torchrun ulysses)
 #   IMAGE=...       输入图(i2v/s2v/animate, 容器内可达路径, 如 /opt/LightX2V/assets/inputs/imgs/girl.png)
 #   AUDIO=...       输入音频(s2v)
+#   VIDEO_PATH=...  输入视频(seedvr2 sr 超分, 容器内可达路径; server 不下载视频, 必须挂卷)
+#   VIDEO_DURATION=秒  s2v 生成时长(schema 默认 5; 实际受音频长度 cap)
 #   FRAMES=81       帧数
 #   SEED=42
 #   STEPS=4         infer_steps
 #   EXTRA_ENV="-e KEY=VAL ..."   额外容器环境变量
+#   EXTRA_VOL="-v src:dst ..."   额外挂卷(如单文件补丁覆盖 /opt/LightX2V 内源码, 免重建镜像)
 #   HEALTH_TO=900   health 超时秒
+#   PORT=8000       宿主映射端口(节点上 8000 被 gpustack/其他服务占时换, 如 8100)
 #   KEEP=1          测完不停容器(便于复用/调试)
 # =============================================================================
 set -uo pipefail
@@ -27,7 +31,8 @@ IMG="${LX_IMG:-crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputa
 : "${NAME:?需设 NAME}"; : "${MODEL_CLS:?需设 MODEL_CLS}"; : "${TASK:?需设 TASK}"
 : "${MODEL_PATH:?需设 MODEL_PATH}"; : "${CFG:?需设 CFG}"; : "${PROMPT:?需设 PROMPT}"; : "${OUT:?需设 OUT}"
 NP="${NP:-1}"; FRAMES="${FRAMES:-81}"; SEED="${SEED:-42}"; STEPS="${STEPS:-4}"; HEALTH_TO="${HEALTH_TO:-900}"
-API=http://localhost:8000
+PORT="${PORT:-8000}"
+API=http://localhost:$PORT
 G=$'\e[32m'; R=$'\e[31m'; B=$'\e[36m'; N=$'\e[0m'
 log(){ printf '%s[%s]%s %s\n' "$B" "$(date +%T)" "$N" "$*"; }
 
@@ -40,7 +45,7 @@ DEVS="${GPUS:-$(seq -s, 0 $((NP-1)))}"
 if [ "$NP" -gt 1 ]; then RUNCMD="torchrun --nproc_per_node=$NP --master_port=29533 -m lightx2v.server"; SHM="--shm-size=32g"; else RUNCMD="python -m lightx2v.server"; SHM=""; fi
 log "起容器 $NAME (cls=$MODEL_CLS task=$TASK np=$NP) 配置=$CFG"
 # shellcheck disable=SC2086
-docker run -d --name "$NAME" --gpus all --memory="${MEM:-240g}" --memory-swap="${MEM:-240g}" $SHM -p 8000:8000 -p 8001:8001 -v /data:/data -v /nfs-data:/nfs-data \
+docker run -d --name "$NAME" --gpus all --memory="${MEM:-240g}" --memory-swap="${MEM:-240g}" $SHM -p "$PORT":8000 -v /data:/data -v /nfs-data:/nfs-data ${EXTRA_VOL:-} \
   -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e CUDA_VISIBLE_DEVICES="$DEVS" ${EXTRA_ENV:-} \
   "$IMG" $RUNCMD --model_cls "$MODEL_CLS" --task "$TASK" \
@@ -58,13 +63,15 @@ done; printf '\n'
 LOAD=$(( $(date +%s)-T0 )); log "${G}ready 加载 ${LOAD}s${N}, 提交生成..."
 
 # 组装提交体(按需带 image_path/audio_path)
-BODY=$(P="$PROMPT" O="$OUT" NF="$FRAMES" SD="$SEED" ST="$STEPS" IMG_P="${IMAGE:-}" LF="${LAST_FRAME:-}" AUD="${AUDIO:-}" RSZ="${RESIZE_MODE:-}" NP_="${NEG_PROMPT:-}" python3 -c '
+BODY=$(P="$PROMPT" O="$OUT" NF="$FRAMES" SD="$SEED" ST="$STEPS" IMG_P="${IMAGE:-}" LF="${LAST_FRAME:-}" AUD="${AUDIO:-}" VID="${VIDEO_PATH:-}" DUR="${VIDEO_DURATION:-}" RSZ="${RESIZE_MODE:-}" NP_="${NEG_PROMPT:-}" python3 -c '
 import json,os
 d={"prompt":os.environ["P"],"negative_prompt":os.environ.get("NP_",""),"save_result_path":os.environ["O"],
    "target_video_length":int(os.environ["NF"]),"infer_steps":int(os.environ["ST"]),"seed":int(os.environ["SD"])}
 if os.environ.get("IMG_P"): d["image_path"]=os.environ["IMG_P"]
 if os.environ.get("LF"): d["last_frame_path"]=os.environ["LF"]   # flf2v 尾帧
 if os.environ.get("AUD"): d["audio_path"]=os.environ["AUD"]
+if os.environ.get("VID"): d["video_path"]=os.environ["VID"]      # seedvr2 sr 超分输入(容器内路径)
+if os.environ.get("DUR"): d["video_duration"]=int(os.environ["DUR"])   # s2v 时长(秒)
 rsz=os.environ.get("RSZ","")   # resize_mode: "null"->JSON null(触发 wan i2v 的 max_area=target_h*w 分辨率路径), 其余非空->原样字符串, 空->不传(默认adaptive走480p)
 if rsz.lower() in ("null","none"): d["resize_mode"]=None
 elif rsz: d["resize_mode"]=rsz

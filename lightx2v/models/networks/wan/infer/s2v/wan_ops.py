@@ -83,6 +83,22 @@ def flash_attention(
     def half(x):
         return x if x.dtype in half_dtypes else x.to(dtype)
 
+    if flash_attn_interface is None:
+        # No flash_attn3 (e.g. A100/Ampere): torch SDPA fallback on the dense [b, l, n, d]
+        # tensors before varlen packing. Padded keys are masked via k_lens; q_lens is left
+        # as-is (S2V passes full-length queries on this path).
+        qd = half(q).transpose(1, 2)
+        kd = half(k).transpose(1, 2)
+        vd = half(v).transpose(1, 2)
+        if q_scale is not None:
+            qd = qd * q_scale
+        attn_mask = None
+        if k_lens is not None:
+            idx = torch.arange(lk, device=kd.device)
+            attn_mask = (idx[None, :] < k_lens.to(kd.device)[:, None])[:, None, None, :]
+        x = torch.nn.functional.scaled_dot_product_attention(qd, kd, vd, attn_mask=attn_mask, scale=softmax_scale, is_causal=causal)
+        return x.transpose(1, 2).type(out_dtype)
+
     if q_lens is None:
         q = half(q.flatten(0, 1))
         q_lens = torch.tensor([lq] * b, dtype=torch.int32, device=q.device)

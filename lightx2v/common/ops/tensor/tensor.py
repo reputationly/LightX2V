@@ -40,6 +40,14 @@ class DefaultTensor:
             else:
                 self.tensor = weight_dict[self.tensor_name]
 
+    def __getattr__(self, name):
+        # cpu_offload keeps the weight in pin_tensor and never sets .tensor; consumers
+        # that read .tensor directly (e.g. S2V modulation / casual_audio_encoder) get the
+        # pinned copy moved to device on demand instead of an AttributeError.
+        if name == "tensor" and "pin_tensor" in self.__dict__:
+            return self.__dict__["pin_tensor"].to(AI_DEVICE)
+        raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
     def _get_tensor(self, weight_dict=None, use_infer_dtype=False):
         if self.lazy_load:
             if Path(self.lazy_load_file).is_file():

@@ -1,0 +1,28 @@
+{
+  "infer_steps": 40,
+  "target_video_length": 81,
+  "text_len": 512,
+  "target_height": 720,
+  "target_width": 1280,
+  "self_attn_1_type": "flash_attn2",
+  "cross_attn_1_type": "flash_attn2",
+  "cross_attn_2_type": "flash_attn2",
+  "sample_guide_scale": [
+    4.0,
+    3.0
+  ],
+  "sample_shift": 5.0,
+  "enable_cfg": true,
+  "cpu_offload": true,
+  "t5_cpu_offload": true,
+  "vae_cpu_offload": false,
+  "rope_type": "torch",
+  "boundary": 0.875,
+  "fps": 16,
+  "video_frame_interpolation": {
+    "algo": "rife",
+    "target_fps": 32,
+    "model_path": "/nfs-data/models/rife-model/flownet.pkl"
+  },
+  "offload_granularity": "model"
+}

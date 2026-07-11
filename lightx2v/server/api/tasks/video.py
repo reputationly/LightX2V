@@ -26,6 +26,7 @@ async def create_video_task(message: VideoTaskRequest):
 
         task_id = task_manager.create_task(message)
         message.task_id = task_id
+        logger.info(f"[latency-probe] task submitted task_id={task_id} pending={task_manager.get_pending_task_count()}")
 
         return TaskResponse(
             task_id=task_id,
@@ -98,6 +99,7 @@ async def create_video_task_form(
     try:
         task_id = task_manager.create_task(message)
         message.task_id = task_id
+        logger.info(f"[latency-probe] task submitted task_id={task_id} pending={task_manager.get_pending_task_count()}")
 
         return TaskResponse(
             task_id=task_id,
