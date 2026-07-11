@@ -17,7 +17,7 @@
   "use_image_encoder": false,
   "rope_type": "torch",
   "dit_quantized": true,
-  "dit_quant_scheme": "int8-torchao",
+  "dit_quant_scheme": "int8-triton",
   "high_noise_quantized_ckpt": "/nfs-models/wuhanjisuan894/models-int8/Wan2.2-I2V-720p-int8/high_noise",
   "low_noise_quantized_ckpt": "/nfs-models/wuhanjisuan894/models-int8/Wan2.2-I2V-720p-int8/low_noise",
   "parallel": {

@@ -16,8 +16,9 @@
   "denoising_step_list": [1000, 750, 500, 250],
   "rope_type": "torch",
   "boundary": 0.875,
+  "boundary_step_index": 2,
   "dit_quantized": true,
-  "dit_quant_scheme": "int8-torchao",
+  "dit_quant_scheme": "int8-triton",
   "high_noise_quantized_ckpt": "/nfs-models/wuhanjisuan894/models/wan22_t2v_int8_seko/high_noise_model",
   "low_noise_quantized_ckpt": "/nfs-models/wuhanjisuan894/models/wan22_t2v_int8_seko/low_noise_model",
   "parallel": {

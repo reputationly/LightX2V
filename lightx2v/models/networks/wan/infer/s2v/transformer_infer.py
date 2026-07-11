@@ -14,6 +14,7 @@ from lightx2v.models.networks.wan.infer.s2v.wan_ops import (
     wan_layer_norm_float,
     wan_rms_norm,
 )
+from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
 from lightx2v.models.networks.wan.infer.transformer_infer import WanTransformerInfer
 from lightx2v_platform.base.global_var import AI_DEVICE
 
@@ -155,4 +156,45 @@ class WanS2VTransformerInfer(WanTransformerInfer):
         with torch.amp.autocast(AI_DEVICE, dtype=torch.float32):
             y = segment_gate_bld(y, e[5], seg_idx)
             x = x + y
+        return x
+
+
+class WanS2VOffloadTransformerInfer(WanS2VTransformerInfer, WanOffloadTransformerInfer):
+    """Block-granularity cpu_offload for S2V.
+
+    Standard block weights (self_attn / cross_attn / ffn / modulation) rotate through the
+    offload manager's cuda double-buffers exactly like base Wan; the S2V-specific
+    audio_inject modules are small (a few hundred MB total) and are moved to GPU once and
+    kept resident, since the manager's buffers only mirror the standard block layout.
+    Only "block" (and trivially "model") offload granularity is supported.
+    """
+
+    def __init__(self, config):
+        super().__init__(config)
+        if config.get("cpu_offload", False) and config.get("offload_granularity", "block") == "phase":
+            raise NotImplementedError("S2V offload supports granularity 'block' or 'model', not 'phase'")
+
+    def infer_with_blocks_offload(self, blocks, x, pre_infer_out):
+        # Keep a handle on the real (source) blocks: audio_inject lives there, not in the
+        # rotating cuda buffers.
+        self._s2v_source_blocks = blocks
+        if not getattr(self, "_audio_inject_resident", False):
+            for layer_idx in self.injected_block_id:
+                inj = getattr(blocks[layer_idx], "audio_inject", None)
+                if inj is not None:
+                    inj.to_cuda()
+            self._audio_inject_resident = True
+        return super().infer_with_blocks_offload(blocks, x, pre_infer_out)
+
+    def infer_block(self, block, x, pre_infer_out):
+        # `block` is the manager's cuda buffer holding the current block's standard weights.
+        x = self.infer_s2v_block(block, x, pre_infer_out)
+        if self.block_idx in self.injected_block_id:
+            source_block = self._s2v_source_blocks[self.block_idx]
+            if self.config["seq_parallel"]:
+                x_full = self._gather_along_seq(x)
+                x_full = apply_audio_inject(source_block, x_full, pre_infer_out, self.config)
+                x = self._chunk_along_seq(x_full)
+            else:
+                x = apply_audio_inject(source_block, x, pre_infer_out, self.config)
         return x

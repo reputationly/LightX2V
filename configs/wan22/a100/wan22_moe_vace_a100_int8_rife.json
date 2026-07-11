@@ -1,0 +1,34 @@
+{
+    "infer_steps": 40,
+    "target_video_length": 81,
+    "target_height": 480,
+    "target_width": 832,
+    "self_attn_1_type": "sage_attn2",
+    "cross_attn_1_type": "sage_attn2",
+    "cross_attn_2_type": "sage_attn2",
+    "sample_guide_scale": [
+        3.5,
+        3.5
+    ],
+    "sample_shift": 8,
+    "enable_cfg": true,
+    "cpu_offload": true,
+    "offload_granularity": "model",
+    "t5_cpu_offload": true,
+    "vae_cpu_offload": true,
+    "boundary": 0.9,
+    "use_image_encoder": false,
+    "rope_type": "torch",
+    "rope_chunk": true,
+    "rope_chunk_size": 100,
+    "dit_quantized": true,
+    "dit_quant_scheme": "int8-triton",
+    "high_noise_quantized_ckpt": "/nfs-data/models-int8/Wan2.2-VACE-Fun-int8/high_noise",
+    "low_noise_quantized_ckpt": "/nfs-data/models-int8/Wan2.2-VACE-Fun-int8/low_noise",
+    "fps": 16,
+    "video_frame_interpolation": {
+        "algo": "rife",
+        "target_fps": 32,
+        "model_path": "/nfs-data/models/rife-model/flownet.pkl"
+    }
+}

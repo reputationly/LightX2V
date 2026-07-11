@@ -1,4 +1,5 @@
 import gc
+import time
 from pathlib import Path
 
 import torch
@@ -42,9 +43,14 @@ def _stream_file_response(file_path: Path, filename: str | None = None) -> Strea
         }
 
         def file_stream_generator(file_path: str, chunk_size: int = 1024 * 1024):
+            stream_start = time.time()
+            sent_bytes = 0
             with open(file_path, "rb") as file:
                 while chunk := file.read(chunk_size):
+                    sent_bytes += len(chunk)
                     yield chunk
+            elapsed = max(time.time() - stream_start, 0.001)
+            logger.info(f"[latency-probe] result stream done file={Path(file_path).name} bytes={sent_bytes} cost={elapsed:.2f}s speed={sent_bytes / 1048576 / elapsed:.1f}MB/s")
 
         return StreamingResponse(
             file_stream_generator(str(resolved_path)),
@@ -81,7 +87,11 @@ async def get_queue_status():
 async def get_task_status(task_id: str):
     status = task_manager.get_task_status(task_id)
     if not status:
+        # unknown task_id on this instance: with round-robin routing upstream this is
+        # the signature of a status poll landing on the wrong worker (affinity miss)
+        logger.warning(f"[latency-probe] status poll MISS task_id={task_id}")
         raise HTTPException(status_code=404, detail="Task not found")
+    logger.info(f"[latency-probe] status poll task_id={task_id} status={status.get('status')}")
     return status
 
 
@@ -103,6 +113,8 @@ async def get_task_result(task_id: str):
         save_result_path = task_status.get("save_result_path")
         if not save_result_path:
             raise HTTPException(status_code=404, detail="Task result file does not exist")
+
+        logger.info(f"[latency-probe] result fetch begin task_id={task_id}")
 
         full_path = Path(save_result_path)
         if not full_path.is_absolute():

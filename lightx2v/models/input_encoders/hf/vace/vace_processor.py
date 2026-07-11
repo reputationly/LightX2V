@@ -4,6 +4,37 @@ import torch
 import torch.nn.functional as F
 
 
+class _PyAVVideoReader:
+    """Minimal decord.VideoReader stand-in backed by PyAV (torch bridge semantics)."""
+
+    def __init__(self, path):
+        import av
+
+        container = av.open(path)
+        stream = container.streams.video[0]
+        self._fps = float(stream.average_rate)
+        self._frames = [torch.from_numpy(f.to_ndarray(format="rgb24")) for f in container.decode(stream)]
+        container.close()
+        self._idx = 0
+
+    def get_avg_fps(self):
+        return self._fps
+
+    def __len__(self):
+        return len(self._frames)
+
+    def get_frame_timestamp(self, i):
+        return np.array([i / self._fps, (i + 1) / self._fps], dtype=np.float32)
+
+    def next(self):
+        frame = self._frames[self._idx]
+        self._idx += 1
+        return frame
+
+    def get_batch(self, frame_ids):
+        return torch.stack([self._frames[i] for i in frame_ids])
+
+
 class VaceVideoProcessor(object):
     def __init__(self, downsample, min_area, max_area, min_fps, max_fps, zero_start, seq_len, keep_last, **kwargs):
         self.downsample = downsample
@@ -128,13 +159,17 @@ class VaceVideoProcessor(object):
     def load_video_batch(self, *data_key_batch, crop_box=None, seed=2024, **kwargs):
         rng = np.random.default_rng(seed + hash(data_key_batch[0]) % 10000)
         # read video
-        import decord
+        try:
+            import decord
 
-        decord.bridge.set_bridge("torch")
-        readers = []
-        for data_k in data_key_batch:
-            reader = decord.VideoReader(data_k)
-            readers.append(reader)
+            decord.bridge.set_bridge("torch")
+            readers = []
+            for data_k in data_key_batch:
+                reader = decord.VideoReader(data_k)
+                readers.append(reader)
+        except (ImportError, AttributeError):
+            # decord unusable (no functional wheel on some platforms, e.g. ARM) — PyAV fallback
+            readers = [_PyAVVideoReader(data_k) for data_k in data_key_batch]
 
         fps = readers[0].get_avg_fps()
         length = min([len(r) for r in readers])

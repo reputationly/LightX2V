@@ -3,7 +3,7 @@ import torch.distributed as dist
 
 from lightx2v.models.networks.wan.infer.s2v.post_infer import WanS2VPostInfer
 from lightx2v.models.networks.wan.infer.s2v.pre_infer import WanS2VPreInfer
-from lightx2v.models.networks.wan.infer.s2v.transformer_infer import WanS2VTransformerInfer
+from lightx2v.models.networks.wan.infer.s2v.transformer_infer import WanS2VOffloadTransformerInfer, WanS2VTransformerInfer
 from lightx2v.models.networks.wan.model import WanModel
 from lightx2v.models.networks.wan.weights.s2v.pre_weights import WanS2VPreWeights
 from lightx2v.models.networks.wan.weights.s2v.transformer_weights import WanS2VTransformerWeights
@@ -29,7 +29,9 @@ class WanS2VModel(WanModel):
         super()._init_infer_class()
         self.pre_infer_class = WanS2VPreInfer
         self.post_infer_class = WanS2VPostInfer
-        self.transformer_infer_class = WanS2VTransformerInfer
+        # Mirror the parent's cpu_offload switch: the plain S2V infer class has no weight
+        # rotation, so under cpu_offload it reads None/pinned weights and crashes.
+        self.transformer_infer_class = WanS2VOffloadTransformerInfer if self.cpu_offload else WanS2VTransformerInfer
 
     def _seq_p_group(self):
         if not self.config.get("seq_parallel"):

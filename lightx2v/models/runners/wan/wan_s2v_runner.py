@@ -275,8 +275,11 @@ class WanS2VRunner(WanRunner):
                 self.vae_encoder.to_cuda()
 
             with torch.amp.autocast(str(AI_DEVICE), dtype=self.vae_encoder.dtype):
-                ref_latents = self.vae_encoder.encode(inputs["ref_pixel_values"]).unsqueeze(0)
-                motion_latents = self.vae_encoder.encode(inputs["motion_latents"]).unsqueeze(0)
+                # cpu_offload: inputs were staged on the VAE's original (cpu) device but the
+                # VAE itself was just moved to cuda -- mixed-device conv3d dispatches to
+                # slow_conv3d_forward which has no CUDA kernel.
+                ref_latents = self.vae_encoder.encode(inputs["ref_pixel_values"].to(AI_DEVICE)).unsqueeze(0)
+                motion_latents = self.vae_encoder.encode(inputs["motion_latents"].to(AI_DEVICE)).unsqueeze(0)
             if offload:
                 self.vae_encoder.to_cpu()
 

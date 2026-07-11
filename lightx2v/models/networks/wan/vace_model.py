@@ -16,8 +16,8 @@ class WanVaceModel(WanModel):
     pre_weight_class = WanPreWeights
     transformer_weight_class = WanVaceTransformerWeights
 
-    def __init__(self, model_path, config, device, model_type="wan2.1"):
-        super().__init__(model_path, config, device, model_type)
+    def __init__(self, model_path, config, device, model_type="wan2.1", lora_path=None, lora_strength=1.0):
+        super().__init__(model_path, config, device, model_type, lora_path, lora_strength)
 
     def _init_infer(self):
         super()._init_infer()

@@ -47,6 +47,8 @@ def _get_read_video():
             import av
 
             def read_video(filename, start_pts=0, end_pts=None, pts_unit="pts", output_format="THWC"):
+                # honor start_pts/end_pts (seconds) — segmented SR relies on them; decoding
+                # the whole file here would silently repeat the first segment everywhere
                 container = av.open(filename)
                 try:
                     if not container.streams.video:
@@ -56,12 +58,19 @@ def _get_read_video():
                         fps = float(stream.average_rate) if stream.average_rate else 0.0
                     except ZeroDivisionError:
                         fps = 0.0
+                    time_base = float(stream.time_base) if stream.time_base else None
                     frames = []
                     for frame in container.decode(video=0):
+                        ts = frame.pts * time_base if (frame.pts is not None and time_base) else None
+                        if ts is not None and pts_unit == "sec":
+                            if ts < float(start_pts) - 1e-6:
+                                continue
+                            if end_pts is not None and ts > float(end_pts) + 1e-6:
+                                break
                         img = frame.to_ndarray(format="rgb24")
                         frames.append(img)
                     if not frames:
-                        raise ValueError(f"No frames decoded from {filename}")
+                        raise ValueError(f"No frames decoded from {filename} in range [{start_pts}, {end_pts}]")
                 finally:
                     container.close()
                 video = torch.from_numpy(np.stack(frames))  # T H W C
@@ -143,13 +152,32 @@ class SeedVRRunner(DefaultRunner):
             self.config["fps"] = fps
 
     def _probe_video(self, video_path):
-        from torchvision.io import read_video_timestamps
-
+        # torchvision >= 0.23 removed read_video_timestamps; fall back to PyAV (same as _get_read_video)
         try:
-            pts, fps = read_video_timestamps(video_path, pts_unit="sec")
-        except Exception as e:
-            logger.warning(f"[SeedVRRunner] read_video_timestamps failed: {e}")
-            pts, fps = [], None
+            from torchvision.io import read_video_timestamps
+        except ImportError:
+            read_video_timestamps = None
+
+        pts, fps = [], None
+        if read_video_timestamps is not None:
+            try:
+                pts, fps = read_video_timestamps(video_path, pts_unit="sec")
+            except Exception as e:
+                logger.warning(f"[SeedVRRunner] read_video_timestamps failed: {e}")
+                pts, fps = [], None
+        else:
+            try:
+                import av
+
+                with av.open(video_path) as container:
+                    stream = container.streams.video[0]
+                    fps = float(stream.average_rate) if stream.average_rate else None
+                    time_base = float(stream.time_base) if stream.time_base else None
+                    pts = [float(p.pts) * time_base for p in container.demux(stream) if p.pts is not None and time_base]
+                    pts.sort()
+            except Exception as e:
+                logger.warning(f"[SeedVRRunner] PyAV probe failed: {e}")
+                pts, fps = [], None
 
         total_frames = len(pts) if pts is not None else 0
         fps_for_seek = fps

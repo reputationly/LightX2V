@@ -233,6 +233,10 @@ class WanInfiniteTalkTransformerInfer(WanOffloadTransformerInfer):
             max_seqlen_q=spatial_tokens,
             max_seqlen_kv=audio_tokens,
         )
+        if attn_out.dim() == 3:
+            # torch_sdpa returns (t, s, h*d) for batched 4D input while sage/flash return
+            # the varlen-flattened (t*s, h*d); flatten so proj's torch.mm gets a matrix.
+            attn_out = attn_out.reshape(-1, attn_out.shape[-1])
         return phase.proj.apply(attn_out).view_as(x)
 
     def _apply_multi_human_audio_rope(self, q, encoder_k, x_ref_attn_map, grid_t):
