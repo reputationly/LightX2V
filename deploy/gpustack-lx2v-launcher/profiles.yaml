@@ -111,3 +111,72 @@ qwen_image:
       gpus: 1
       task: t2i
       config_json: /opt/LightX2V/configs/deploy/qwen_2512_lightning_merged_a100.json
+
+# InfiniteTalk digital human (audio-driven video, task=s2v). Production shapes
+# from the 现网部署清单 (2026-07-11): both tiers run 4-card ulysses × 1
+# instance/node (latency-first, user decision 2026-07-11). 480p ≈ 54.4s/5s
+# clip, 720p ≈ 136.7s/5s clip. Single-DiT model, so load_from_rank0 is safe
+# (MoE models must NOT use it) and speeds up loading.
+#
+# ⚠️ BOTH variants are (infinitetalk, 4 GPUs, s2v) — GPU count and task cannot
+# disambiguate them. Deploys MUST pin the tier explicitly:
+#   backend parameters: --model-cls infinitetalk --profile infinitetalk-480p/int8-4card
+#   (or .../infinitetalk-720p/int8-4card)
+# Duration red lines are enforced UPSTREAM (gateway/new-api limits per tier):
+# 480p ≤60-75s audio, 720p start at ≤25-30s (frame volume is 3×; config
+# video_duration=30 caps the default).
+# Model Path = the Wan2.1 distill base dir (VAE/T5/CLIP); the tier's int8 DiT
+# and the InfiniteTalk adapter are pinned inside the config JSON (shared NFS).
+infinitetalk:
+  variants:
+    - name: infinitetalk-480p/int8-4card
+      gpus: 4
+      task: s2v
+      config_json: /opt/LightX2V/configs/infinitetalk/a100/infinitetalk_480p_ul4_distilled_int8triton.json
+      # advisory (validated against gpus; real mesh lives in config_json.parallel)
+      seq_p_size: 4
+      seq_p_attn_type: ulysses
+      cfg_p_size: 1
+    - name: infinitetalk-720p/int8-4card
+      gpus: 4
+      task: s2v
+      config_json: /opt/LightX2V/configs/deploy/infinitetalk_720p_4card_a100.json
+      # advisory (validated against gpus; real mesh lives in config_json.parallel)
+      seq_p_size: 4
+      seq_p_attn_type: ulysses
+      cfg_p_size: 1
+
+# SeedVR2-3B video super-resolution (task=sr). Atomic capability (ruling
+# upgraded 2026-07-11): single card, bf16, ≤121 frames per seamless segment
+# (longer inputs auto-segment; the PyAV segment-pts bug is fixed in this
+# release). 480p→2× ≈ 80s, 720p→2× ≈ 200s. sr_ratio is a request-level field
+# (default 2.0), output clamped by the config's target size (runner:114).
+# fps passes through — SR never interpolates.
+# Resources: ~22.7G VRAM peak, ~42G host per instance — pairs with VACE on one
+# node (2×VACE + 2×SeedVR2; watch MemAvailable, that node runs near the line).
+# Input cap (≤720p in) is enforced upstream (gateway/new-api), not here.
+seedvr2:
+  variants:
+    - name: seedvr2-3b/seg121-1card
+      gpus: 1
+      task: sr
+      config_json: /opt/LightX2V/configs/seedvr/a100/seedvr2_3b_seg121.json
+
+# Wan2.2 VACE video editing, atomic tier (task=vace): single-card offload,
+# int8-triton, 4-step Lightning LoRA (13× speedup, P8/P9), native 720p + RIFE
+# 32fps. ~418s single / ~485s per instance with two instances (measured under
+# load). Inputs: src_video / src_mask / src_ref_images (V2V / MV2V / R2V modes).
+# ⚠️ Host-memory red line: each instance pins ~55G host RAM (offload) — HARD
+# cap 2 instances/node (4-instance test: host at 61MB free + cold-start NFS
+# read storms, 3×T5 took 18min). Stagger instance starts ≥2min apart.
+# The scheduler books VRAM only — enforce the per-node cap at deploy time.
+# Model Path contains "vace" → model_cls infers wan2.2_moe_vace (checked before
+# the generic "wan" branch); the canvas-tier 480p config
+# (wan22_moe_vace_a100_int8_lora4step.json) is kept on file but NOT deployed
+# until the canvas ships.
+wan2.2_moe_vace:
+  variants:
+    - name: wan2.2-vace/int8-lora4step-720p-1card
+      gpus: 1
+      task: vace
+      config_json: /opt/LightX2V/configs/wan22/a100/wan22_moe_vace_a100_int8_lora4step_720p_rife.json
