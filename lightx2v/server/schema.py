@@ -80,6 +80,9 @@ class VideoTaskRequest(BaseTaskRequest):
         description="Number of prefix segments to reuse from the previous successful request",
     )
     video_path: str = Field("", description="Input video path (for SR/V2V-like tasks)")
+    src_video: str = Field("", description="Control/source video path (VACE V2V/MV2V)")
+    src_mask: str = Field("", description="Mask video path, white=repaint (VACE MV2V; gray-fill the masked area in src_video for true inpaint)")
+    src_ref_images: str = Field("", description="Reference image path(s), comma-separated (VACE R2V)")
     sr_ratio: float = Field(2.0, gt=0, description="Super-resolution scale factor used when target_shape is not set")
     audio_path: str = Field("", description="Input audio path (Wan-Audio)")
     video_duration: int = Field(5, description="Video duration (Wan-Audio)")

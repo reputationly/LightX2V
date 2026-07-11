@@ -99,10 +99,11 @@ class TorchrunInferenceWorker:
                 else:
                     logger.warning(f"Target FPS {target_fps} is set, but video frame interpolation is not configured")
 
-            if self.runner.config.get("model_cls") in {"sensenova_vision", "swiftvr"}:
-                # These services accept different input modes through one runner.
-                # Recreate request state so fields cannot leak between requests.
-                self.input_info = init_empty_input_info(self.runner.config["task"])
+            # 每个请求都重建 input_info。上游只对 {sensenova_vision, swiftvr} 重置,
+            # 但 update_input_info_from_dict 只覆盖客户端显式传的字段,复用旧对象会让
+            # 媒体路径(src_video/src_ref_images/...)和标量(sr_ratio)跨请求泄漏 —— VACE/SR
+            # 实测踩过。无条件重置是上游做法的超集,同样覆盖它关心的那两个 model_cls。
+            self.input_info = init_empty_input_info(self.runner.config["task"])
             update_input_info_from_dict(self.input_info, task_data)
 
             self.runner.set_reuse(reuse, reuse_prefix_segments)

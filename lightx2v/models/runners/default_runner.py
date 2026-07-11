@@ -488,9 +488,11 @@ class DefaultRunner(BaseRunner):
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_vace(self):
-        src_video = self.input_info.src_video
-        src_mask = self.input_info.src_mask
-        src_ref_images = self.input_info.src_ref_images
+        # server requests leave unset fields as "" (dataclass default) while the
+        # downstream vace path only checks `is None` — normalize before dispatch
+        src_video = self.input_info.src_video or None
+        src_mask = self.input_info.src_mask or None
+        src_ref_images = self.input_info.src_ref_images or None
         src_video, src_mask, src_ref_images = self.prepare_source(
             [src_video],
             [src_mask],
