@@ -85,9 +85,9 @@ case "$m" in
   # ---- SCAIL-2(Wan2.1-I2V-14B 骨架) ----
   scail2)        dl ZhipuAI/SCAIL-2  "SCAIL-2"  zai-org/SCAIL-2 ;;
   scail2_dpo)    dl Comfy-Org/SCAIL-2 "loras/SCAIL-2-DPO" Comfy-Org/SCAIL-2 "*.safetensors" ;;
-  # LightX2V Wan2.1-I2V 4步蒸馏 LoRA(加速核心)。⚠️ 很可能已在 NFS(InfiniteTalk 用过)→先查再决定
+  # LightX2V Wan2.1-I2V 4步蒸馏 LoRA(加速核心, SCAIL-2 是 i2v 底座用 i2v 版)
   scail2_lx2v)   dl lightx2v/Wan2.1-Distill-Loras "loras/Wan2.1-Distill-Loras" lightx2v/Wan2.1-Distill-Loras \
-                    "*lightx2v*rank64*.safetensors" ;;
+                    wan2.1_i2v_lora_rank64_lightx2v_4step.safetensors ;;
 
   # ---- Bernini(Wan2.2 渲染器) ----
   bernini_r_14b) dl ByteDance/Bernini-R-Diffusers      "Bernini-R-Diffusers"      ByteDance/Bernini-R-Diffusers ;;
