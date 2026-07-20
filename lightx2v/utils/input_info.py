@@ -103,6 +103,37 @@ class VaceInputInfo:
 
 
 @dataclass
+class V2VInputInfo:
+    """Bernini-R in-context video editing (v2v / mv2v / rv2v).
+
+    Source video(s) are VAE-encoded, (z-mean)/std normalized, patch-embedded and
+    concatenated as *context tokens* before the noisy target along the sequence dim
+    (target last), with per-source-id RoPE. Unlike i2v (channel-concat before
+    patch-embed), this is a sequence-dim token concat. See memory
+    `bernini-editing-line-mechanism` for the verified upstream mechanism.
+
+    - v2v:  src_video = one source clip to edit (comma-separated allowed → mv2v).
+    - rv2v: additionally src_ref_images for reference guidance (future).
+    """
+
+    seed: int = field(default_factory=int)
+    prompt: str = field(default_factory=str)
+    prompt_enhanced: str = field(default_factory=str)
+    negative_prompt: str = field(default_factory=str)
+    src_video: str = field(default_factory=str)  # one path, or comma-separated for mv2v
+    src_ref_images: str = field(default_factory=str)  # rv2v reference image(s), comma-separated
+    save_result_path: str = field(default_factory=str)
+    return_result_tensor: bool = field(default_factory=lambda: False)
+    # shape related
+    resize_mode: str = field(default_factory=str)
+    original_shape: list = field(default_factory=list)
+    resized_shape: list = field(default_factory=list)
+    latent_shape: list = field(default_factory=list)
+    target_shape: list = field(default_factory=list)
+    target_video_length: int = field(default_factory=int)
+
+
+@dataclass
 class S2VInputInfo:
     seed: int = field(default_factory=int)
     prompt: str = field(default_factory=str)
@@ -432,6 +463,7 @@ task_dict = {
     "sr": SRInputInfo,
     "flf2v": Flf2vInputInfo,
     "vace": VaceInputInfo,
+    "v2v": V2VInputInfo,
     "s2v": S2VInputInfo,
     "rs2v": RS2VInputInfo,
     "animate": AnimateInputInfo,

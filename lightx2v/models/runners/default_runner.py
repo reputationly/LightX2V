@@ -112,8 +112,19 @@ class DefaultRunner(BaseRunner):
             self.run_input_encoder = self._run_input_encoder_local_flf2v
         elif self.config["task"] == "t2v":
             self.run_input_encoder = self._run_input_encoder_local_t2v
+        elif self.config["task"] == "t2i":
+            # Wan/Bernini t2i = single-frame t2v (config target_video_length=1);
+            # reuse the text-only t2v encoder. Image-model runners (Qwen etc.)
+            # assign their own t2i encoder AFTER super().init_modules()
+            # (qwen_image_runner.py:185-193), so this branch only serves runners
+            # without a t2i override — previously `--task t2i` crashed with an
+            # AttributeError (run_input_encoder never assigned).
+            self.run_input_encoder = self._run_input_encoder_local_t2v
         elif self.config["task"] == "vace":
             self.run_input_encoder = self._run_input_encoder_local_vace
+        elif self.config["task"] == "v2v":
+            # bernini wan_diffusion.py:522 — in-context video editing (v2v guidance_mode)
+            self.run_input_encoder = self._run_input_encoder_local_v2v
         elif self.config["task"] == "animate":
             self.run_input_encoder = self._run_input_encoder_local_animate
         elif self.config["task"] in ["s2v", "rs2v"]:
@@ -383,6 +394,70 @@ class DefaultRunner(BaseRunner):
         torch_device_module.empty_cache()
         gc.collect()
         return self.get_encoder_output_i2v(None, vae_encoder_out, text_encoder_output)
+
+    # bernini v2v system prompt (bernini_template.py:113). The pure-t2v Bernini
+    # path uses the T5 text encoder; task_type only swaps this system-prompt
+    # prefix, so we prepend it to the prompt for v2v.
+    _V2V_SYSTEM_PROMPT = "You are a helpful assistant specialized in video editing."
+
+    @ProfilingContext4DebugL2("Run Encoders")
+    def _run_input_encoder_local_v2v(self):
+        # mv2v = comma-separated source videos (each own source_id). Only single
+        # source is fully supported now; multi is parsed but only first is used
+        # for the target-shape / context beyond a TODO. bernini wan_diffusion.py:430
+        raw = (self.input_info.src_video or "").strip()
+        if not raw:
+            raise ValueError("v2v task requires --src_video (source clip to edit).")
+        video_paths = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(video_paths) > 1:
+            # TODO(bernini mv2v): support a LIST of sources; first joins V-combo,
+            # all join VI-combo. For now use every clip as VI context sources.
+            logger.warning(f"v2v: {len(video_paths)} source videos given; mv2v is future work, encoding all as VI context.")
+
+        # VAE-encode full source clip(s) into the normalized target latent space.
+        src_latents, latent_shape = self.run_vae_encoder_v2v(video_paths)
+        self.input_info.latent_shape = latent_shape  # Important: set latent_shape in input_info
+
+        # bernini wan_diffusion.py:416 _make_sids — context source ids 1..n, or
+        # linspace(1, max_trained=5, n) when n > 5. Target keeps id 0 (built in
+        # pre_infer). These ids drive the source-id RoPE (transformer_wan.py:274).
+        n = len(src_latents)
+        max_trained = int(self.config.get("max_trained_src_id", 5))
+        if self.config.get("interpolate_src_id", True) and n > max_trained:
+            src_ids = torch.linspace(1.0, float(max_trained), n).tolist()
+        else:
+            src_ids = [float(i) for i in range(1, n + 1)]
+
+        # v2v system-prompt prefix (video-editing task_type, bernini_template.py:113).
+        # Upstream applies the task system prompt to BOTH the cond and uncond text
+        # encodings (the template prepends it regardless of the user prompt), so we
+        # prefix the positive AND negative prompt for the CFG dual-forward.
+        base_prompt = self.input_info.prompt or ""
+        if not base_prompt.startswith(self._V2V_SYSTEM_PROMPT):
+            self.input_info.prompt = f"{self._V2V_SYSTEM_PROMPT} {base_prompt}".strip()
+        base_neg = self.input_info.negative_prompt or ""
+        if not base_neg.startswith(self._V2V_SYSTEM_PROMPT):
+            self.input_info.negative_prompt = f"{self._V2V_SYSTEM_PROMPT} {base_neg}".strip()
+
+        text_encoder_output = self.run_text_encoder(self.input_info)
+        torch_device_module.empty_cache()
+        gc.collect()
+
+        # Sanity log (single-GPU debuggability, M1 requirement).
+        for i, z in enumerate(src_latents):
+            logger.info(f"[v2v] src_latent[{i}] shape={tuple(z.shape)} mean={z.float().mean().item():.4f} std={z.float().std().item():.4f} src_id={src_ids[i]}")
+        logger.info(f"[v2v] latent_shape={latent_shape}, num_context_sources={n}")
+
+        return {
+            "text_encoder_output": text_encoder_output,
+            "image_encoder_output": None,
+            # v2v context: source latents + their source-ids for the pre_infer
+            # sequence-dim token concat + source-id RoPE (bernini wan_diffusion.py:479).
+            "v2v_context": {
+                "src_latents": src_latents,  # list of [C=16, T_lat, H_lat, W_lat]
+                "src_ids": src_ids,          # list[float], one per source (context ids 1..n)
+            },
+        }
 
     @ProfilingContext4DebugL2("Run Text Encoder")
     def _run_input_encoder_local_animate(self):
