@@ -1,0 +1,11 @@
+# Bernini-R 扫测提示词(每行一条,# 与空行忽略)。覆盖:运镜/人物/大动态/复杂场景/动物/流体/微距/质感
+A slow cinematic dolly-in toward a lighthouse on a stormy cliff at dusk, crashing waves, dramatic clouds, 35mm film
+A young woman in a red wool coat walking through a snowy Tokyo street at night, neon signs, shallow depth of field, bokeh
+A galloping wild horse kicking up dust across a desert canyon at golden hour, dynamic motion, cinematic
+A bustling night market in Bangkok, steam rising from food stalls, crowds, colorful paper lanterns, handheld
+A red fox trotting through an autumn birch forest, sunbeams through the trees, soft morning light, shallow depth of field
+Ocean waves crashing on black volcanic rocks, slow-motion spray, overcast moody light, wide shot
+Macro shot of a honeybee landing on a sunflower, pollen detail, gentle breeze, warm morning light
+Close-up of molten glass being blown by an artisan, glowing orange, sparks, dark workshop, dramatic lighting
+A drone shot rising over terraced rice fields in the fog at sunrise, layered mountains, serene
+A golden retriever puppy running across a green meadow toward the camera, joyful, sunny day, 50mm
