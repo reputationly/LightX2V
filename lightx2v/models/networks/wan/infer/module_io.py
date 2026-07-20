@@ -25,3 +25,7 @@ class WanPreInferModuleOutput:
     # extra
     adapter_args: Dict[str, Any] = field(default_factory=dict)
     conditional_dict: Dict[str, Any] = field(default_factory=dict)
+    # bernini v2v: full-sequence boolean mask (True=target tokens, False=context).
+    # Sliced AFTER the blocks (and after ulysses gather) so downstream sees only
+    # target tokens. None for every non-v2v task. See wan_diffusion.py:504.
+    v2v_target_mask: Optional[torch.Tensor] = None

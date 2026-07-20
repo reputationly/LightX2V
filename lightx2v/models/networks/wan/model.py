@@ -255,6 +255,16 @@ class WanModel(BaseTransformerModel):
         if self.config["seq_parallel"]:
             x = self._seq_parallel_post_process(x)
 
+        # bernini v2v: the blocks (and, under ulysses, the gather above) operate on
+        # the FULL [context..., target] sequence. Slice out the target tokens on the
+        # reconstructed full sequence BEFORE unpatchify — mirrors upstream
+        # `pred[:, msk, :]` after `gather_outputs` (transformer_wan.py:585 / :504).
+        if getattr(pre_infer_out, "v2v_target_mask", None) is not None:
+            mask = pre_infer_out.v2v_target_mask
+            # x may be padded to a multiple of world_size by _seq_parallel_pre_process;
+            # the mask indexes the unpadded full sequence, so trim then select.
+            x = x[: mask.shape[0]][mask]
+
         noise_pred = self.post_infer.infer(x, pre_infer_out)[0]
 
         if self.clean_cuda_cache:
@@ -325,7 +335,15 @@ class WanModel(BaseTransformerModel):
                 noise_pred_cond = self._infer_cond_uncond(inputs, infer_condition=True)
                 noise_pred_uncond = self._infer_cond_uncond(inputs, infer_condition=False)
 
-            noise_pred_guided = noise_pred_uncond + self.scheduler.sample_guide_scale * (noise_pred_cond - noise_pred_uncond)
+            # bernini v2v guidance (wan_diffusion.py:522): both forwards carry the
+            # video context (built unconditionally in pre_infer._infer_v2v); only the
+            # TEXT is CFG'd. noise_pred_cond = ε_VTI (cond text), noise_pred_uncond =
+            # ε_uncond (uncond text). ε̂ = ε_uncond + ω_txt·(ε_VTI - ε_uncond).
+            if self.config["task"] == "v2v":
+                omega_txt = self.config.get("omega_txt", self.config.get("guide_scale_v2v", 5.0))
+                noise_pred_guided = noise_pred_uncond + omega_txt * (noise_pred_cond - noise_pred_uncond)
+            else:
+                noise_pred_guided = noise_pred_uncond + self.scheduler.sample_guide_scale * (noise_pred_cond - noise_pred_uncond)
             self.scheduler.noise_pred_cond = noise_pred_cond
             self.scheduler.noise_pred_uncond = noise_pred_uncond
             self.scheduler.noise_pred_guided = noise_pred_guided

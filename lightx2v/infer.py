@@ -161,6 +161,7 @@ def main():
             "i2i",
             "flf2v",
             "vace",
+            "v2v",
             "animate",
             "s2v",
             "rs2v",

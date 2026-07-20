@@ -366,7 +366,8 @@ class WanRunner(DisaggMixin, DefaultRunner):
         if self.config.get("vae_weight_dtype") is not None:
             vae_config["weight_dtype"] = self._resolve_vae_dtype(self.config["vae_weight_dtype"])
 
-        if self.config["task"] not in ["i2v", "flf2v", "animate", "vace", "s2v", "rs2v"]:
+        # bernini: v2v needs the VAE encoder to encode the full source clip.
+        if self.config["task"] not in ["i2v", "flf2v", "animate", "vace", "s2v", "rs2v", "v2v"]:
             return None
         else:
             return self.vae_cls(**vae_config)
@@ -911,6 +912,96 @@ class WanRunner(DisaggMixin, DefaultRunner):
             "image_encoder_output": image_encoder_output,
         }
 
+    # ================================================================
+    # Bernini-R v2v (in-context video editing) — see
+    # /Users/reputationly/Desktop/code/api/Bernini for the upstream mechanism.
+    # ================================================================
+    def _read_v2v_source_video(self, video_path, target_h, target_w, num_frames):
+        """Read a source clip → [1, 3, T, H, W] in [-1, 1], resized to (target_h, target_w).
+
+        Mirrors i2v/vace pre-VAE pixel conventions (sub_(0.5).div_(0.5)); the same
+        space Bernini `_vae_encode` (pipeline.py:170) feeds `vae.encode`.
+        `num_frames` is the target clip length (4n+1). If the source is shorter it
+        is repeated/clamped; if longer it is uniformly sampled to num_frames.
+        """
+        # torchvision first (already a dep); decord fallback for ARM wheels.
+        try:
+            from torchvision.io import read_video
+
+            frames, _, _ = read_video(video_path, pts_unit="sec", output_format="THWC")  # [T, H, W, 3] uint8
+            frames = frames.to(torch.float32)
+        except Exception:
+            from decord import VideoReader, cpu
+
+            vr = VideoReader(video_path, ctx=cpu(0))
+            frames = torch.from_numpy(vr[:].asnumpy()).to(torch.float32)  # [T, H, W, 3]
+
+        t_src = frames.shape[0]
+        if t_src == 0:
+            raise ValueError(f"v2v source video has no frames: {video_path}")
+        # Uniform frame index selection to the target clip length (4n+1).
+        idx = torch.linspace(0, t_src - 1, num_frames).round().long().clamp_(0, t_src - 1)
+        frames = frames[idx]  # [num_frames, H, W, 3]
+
+        # [T, H, W, 3] -> [T, 3, H, W], to [-1, 1]; per-frame bicubic resize to target.
+        video = frames.permute(0, 3, 1, 2).contiguous().div_(255.0).sub_(0.5).div_(0.5).to(AI_DEVICE)  # [T, 3, H, W]
+        video = torch.nn.functional.interpolate(video, size=(target_h, target_w), mode="bicubic", align_corners=False)
+        # [T, 3, H, W] -> [1, 3, T, H, W] (VAE encode wants [B, C, T, H, W])
+        video = video.permute(1, 0, 2, 3).contiguous().unsqueeze(0)
+        return video
+
+    @ProfilingContext4DebugL1(
+        "Run VAE Encoder (v2v source)",
+        recorder_mode=GET_RECORDER_MODE(),
+        metrics_func=monitor_cli.lightx2v_run_vae_encoder_image_duration,
+        metrics_labels=["WanRunner"],
+    )
+    def run_vae_encoder_v2v(self, video_paths):
+        """VAE-encode each full source clip into NORMALIZED latents.
+
+        LightX2V `WanVAE.encode` already applies `scale=[mean, inv_std]`
+        (vae.py:701 `(mu - mean) * inv_std`), i.e. it returns `(z - mean)/std`
+        — the SAME normalized space Bernini `_vae_encode` (pipeline.py:170) uses
+        and the SAME space the scheduler's noisy target latent lives in (the VAE
+        decoder denormalizes with `z/inv_std + mean`). So NO extra normalization
+        is required here. Returns (src_latents_list, latent_shape) where each
+        latent is [C=16, T_lat, H_lat, W_lat].
+        """
+        # Honor per-request resolution overrides, same convention as the t2v path
+        # (get_latent_shape_with_target_hw): input_info.target_shape=[H, W] wins
+        # over the static config target_height/width. The source clip is resized
+        # to this target, so latent_shape (derived from the encoded source below)
+        # follows the override automatically. num_frames intentionally reads the
+        # config like t2v does (per-request frame count arrives via config update).
+        target_shape = getattr(self.input_info, "target_shape", None)
+        if target_shape and len(target_shape) == 2:
+            target_h, target_w = int(target_shape[0]), int(target_shape[1])
+        else:
+            target_h = int(self.config["target_height"])
+            target_w = int(self.config["target_width"])
+        num_frames = int(self.config["target_video_length"])
+
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            self.vae_encoder = self.load_vae_encoder()
+
+        src_latents = []
+        for vp in video_paths:
+            video = self._read_v2v_source_video(vp, target_h, target_w, num_frames)  # [1,3,T,H,W]
+            # bernini pipeline.py:172 latents = vae.encode(x).mode(); here encode already
+            # returns the normalized mean (mu-mean)/std, squeezed to [C, T_lat, H_lat, W_lat].
+            z = self.vae_encoder.encode(video.to(GET_DTYPE()))
+            src_latents.append(z.to(GET_DTYPE()))
+
+        if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
+            del self.vae_encoder
+            torch_device_module.empty_cache()
+            gc.collect()
+
+        # The target latent shares H_lat/W_lat/T_lat with the (single) source clip.
+        c, t_lat, h_lat, w_lat = src_latents[0].shape
+        latent_shape = [self.config.get("num_channels_latents", 16), t_lat, h_lat, w_lat]
+        return src_latents, latent_shape
+
     def get_latent_shape_with_lat_hw(self, latent_h, latent_w):
         latent_shape = [
             self.config.get("num_channels_latents", 16),
@@ -1181,7 +1272,10 @@ class Wan22DenseRunner(WanRunner):
         }
 
     def load_vae_encoder(self):
-        if self.config["task"] not in ["i2v", "flf2v", "animate", "vace", "s2v", "rs2v", "i2va"]:
+        # Keep in sync with the WanRunner base allow-list (:201) — v2v encodes the
+        # full source clip, so the encoder must load here too, otherwise
+        # `model_cls=wan2.2 --task v2v` dies with AttributeError on a None encoder.
+        if self.config["task"] not in ["i2v", "flf2v", "animate", "vace", "s2v", "rs2v", "i2va", "v2v"]:
             return None
         vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
         return self.vae_cls(**self._build_wan22_vae_config(vae_offload))
