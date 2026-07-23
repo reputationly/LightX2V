@@ -32,3 +32,5 @@ save_results/*
 lightx2v_train/output_train/*
 lightx2v_train/output_infer/*
 .gitnexus
+# IDE-exported patch dumps (e.g. IntelliJ "导出补丁"), kept local only
+*.patch

@@ -107,7 +107,7 @@ def main():
     )
 
     parser.add_argument(
-        "--task", type=str, choices=["t2v", "i2v", "t2i", "i2i", "flf2v", "vace", "v2v", "animate", "s2v", "rs2v", "t2av", "i2av", "i2va", "v2av", "ltx2_s2v", "sr", "recon", "i23d"], default="t2v"
+        "--task", type=str, choices=["t2v", "i2v", "t2i", "i2i", "flf2v", "vace", "v2v", "animate", "s2v", "rs2v", "t2av", "i2av", "i2va", "v2av", "v2a", "ltx2_s2v", "sr", "recon", "i23d"], default="t2v"
     )
     parser.add_argument("--support_tasks", type=str, nargs="+", default=[], help="Set supported tasks for the model")
     parser.add_argument("--model_path", type=str, required=True)

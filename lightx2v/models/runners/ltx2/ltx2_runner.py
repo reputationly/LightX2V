@@ -20,7 +20,7 @@ from lightx2v.utils.ltx2_media_io import decode_audio_from_file, load_image_cond
 from lightx2v.utils.ltx2_media_io import encode_video as save_video
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
-from lightx2v.utils.utils import mux_audio_from_video
+from lightx2v.utils.utils import mux_audio_from_video, mux_generated_audio_onto_video
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
@@ -105,6 +105,8 @@ class LTX2Runner(DefaultRunner):
             self.run_input_encoder = self._run_input_encoder_local_ltx2_s2v
         elif self.config["task"] == "v2av":
             self.run_input_encoder = self._run_input_encoder_local_v2av
+        elif self.config["task"] == "v2a":
+            self.run_input_encoder = self._run_input_encoder_local_v2a
 
     def init_scheduler(self):
         self.scheduler = LTX2Scheduler(self.config)
@@ -203,7 +205,7 @@ class LTX2Runner(DefaultRunner):
             checkpoint_path=ckpt_path,
             device=vae_device,
             dtype=GET_DTYPE(),
-            load_encoder=self.config["task"] in ("i2av", "ltx2_s2v", "v2av") or self.config.get("use_upsampler", False),
+            load_encoder=self.config["task"] in ("i2av", "ltx2_s2v", "v2av", "v2a") or self.config.get("use_upsampler", False),
             use_tiling=self.config.get("use_tiling_vae", False),
             cpu_offload=vae_offload,
         )
@@ -303,6 +305,8 @@ class LTX2Runner(DefaultRunner):
         """Avoid leaking reference-video latents into non-v2av runs on a reused runner,
         and avoid re-appending reference tokens in stage-2 upsampling."""
         self._ref_video_latent = None
+        self._v2a_source_video = None
+        self._v2a_mux_tempo = 1.0
 
     def _get_ref_downscale_factor(self) -> float:
         """Read IC-LoRA reference-video downscale factor.
@@ -336,6 +340,33 @@ class LTX2Runner(DefaultRunner):
         except Exception as e:  # noqa: BLE001 - probing must never break inference.
             logger.warning(f"  ⚠ Could not probe pose-video resolution from {path!r}: {e}")
         return None
+
+    @staticmethod
+    def _probe_video_fps_duration(path: str) -> tuple[float | None, float | None]:
+        """
+        Return (average_fps, duration_seconds) of the first video stream in ``path``;
+        either element is None when it cannot be determined.
+        """
+        if not path or not os.path.exists(path):
+            return None, None
+        fps = None
+        duration = None
+        try:
+            import av  # noqa: PLC0415 - lazy import; PyAV is already required.
+
+            with av.open(path) as container:
+                if container.duration:
+                    duration = float(container.duration) / av.time_base
+                for stream in container.streams:
+                    if stream.type == "video":
+                        if stream.average_rate and float(stream.average_rate) > 0:
+                            fps = float(stream.average_rate)
+                        if duration is None and stream.duration and stream.time_base:
+                            duration = float(stream.duration * stream.time_base)
+                        break
+        except Exception as e:  # noqa: BLE001 - probing must never break inference.
+            logger.warning(f"  ⚠ Could not probe video fps/duration from {path!r}: {e}")
+        return fps, duration
 
     def _override_target_hw_from_ref_video(self) -> None:
         """v2av: set ``input_info.target_shape`` from probed ``video_path`` (control mp4).
@@ -482,6 +513,160 @@ class LTX2Runner(DefaultRunner):
 
         self._ref_video_latent = (ref_latent, ref_strength, ref_downscale_factor)
         logger.info(f"  ✓ Reference IC-LoRA latent ready (strength={ref_strength}, ref_downscale_factor={ref_downscale_factor})")
+
+        torch_device_module.empty_cache()
+        gc.collect()
+        return {
+            "text_encoder_output": text_encoder_output,
+        }
+
+    @ProfilingContext4DebugL2("Run Encoders")
+    def _run_input_encoder_local_v2a(self):
+        """
+        LTX-2.3 pure video-to-audio (dubbing): freeze the ENTIRE input video latent
+        (denoise_mask = 0 for every frame) and denoise ONLY the audio. The saved video
+        reuses the ORIGINAL file's pixels via stream-copy mux, so the picture is
+        pixel-identical; only a generated audio track is added.
+
+        Mirror image of ``_run_input_encoder_local_ltx2_s2v`` (which freezes audio and
+        denoises video). No IC-LoRA reference / re-render is used.
+        """
+        self._clear_ltx2_reference_audio_state()
+        self._clear_ltx2_reference_video_state()
+        self._normalize_i2av_input_fields()
+        # Derive encode resolution from the source video (snapped to VAE grid). Output
+        # pixels come from the original file untouched, so this only sizes the
+        # conditioning latent.
+        self._override_target_hw_from_ref_video()
+        if not self.input_info.target_shape:
+            self.input_info.target_shape = [
+                self.config["target_height"],
+                self.config["target_width"],
+            ]
+
+        src_path = (getattr(self.input_info, "video_path", None) or "").strip()
+        if not src_path:
+            raise ValueError("v2a requires a non-empty video_path (the source video to dub).")
+        # Fail fast: the pixel-identical guarantee relies on stream-copying the source
+        # FILE; it cannot be expressed as a decoded tensor (which would be a lossy
+        # VAE re-render, possibly with padded frames).
+        if getattr(self.input_info, "return_result_tensor", False):
+            raise ValueError("v2a is file-based: set save_result_path; return_result_tensor is unsupported (pixel-identical output requires stream-copying the source file).")
+        # File output is the ONLY sink for v2a — without a save path the whole
+        # encode/denoise run would complete and then silently produce nothing.
+        if not (getattr(self.input_info, "save_result_path", None) or "").strip():
+            raise ValueError("v2a requires a non-empty save_result_path (file output is the only supported sink).")
+        # Full-resolution conditioning (no ref downscale): audio must attend to the
+        # real picture, and we want frame count aligned with the source.
+        target_h = self.input_info.target_shape[0]
+        target_w = self.input_info.target_shape[1]
+        enc_h = max(int(target_h) - (int(target_h) % 2), 2)
+        enc_w = max(int(target_w) - (int(target_w) % 2), 2)
+
+        # v2a dubs the WHOLE clip by default. ``target_video_length`` cannot serve as a
+        # cap here: argparse always injects its default (81), indistinguishable from
+        # user intent, and any partial cap leaves the stream-copied tail silent. The
+        # only explicit cap is --reference_video_frame_cap.
+        ref_extra = getattr(self.input_info, "reference_video_frame_cap", None)
+        # frame_cap <= 0 never hits the decrement-break in decode_video_from_file → reads all frames.
+        read_cap = int(ref_extra) if ref_extra and int(ref_extra) > 0 else 0
+
+        src_fps, src_duration = self._probe_video_fps_duration(src_path)
+
+        logger.info(f"  🎞️  Loading source video for dubbing: {src_path} resize=({enc_w}x{enc_h}) read_cap={read_cap if read_cap > 0 else 'FULL CLIP'}")
+
+        pixels = load_video_conditioning(
+            video_path=src_path,
+            height=enc_h,
+            width=enc_w,
+            frame_cap=read_cap,
+            dtype=GET_DTYPE(),
+            device=AI_DEVICE,
+        )
+        if pixels is None:
+            raise ValueError(f"v2a: failed to decode source video from {src_path!r}.")
+
+        src_T = pixels.shape[2]
+        if src_T > 361:
+            logger.warning(
+                f"  ⚠ v2a: {src_T} frames (~{src_T / (src_fps or float(self.config['fps'])):.1f}s) will be VAE-encoded and jointly attended in one pass — "
+                f"long clips can exhaust GPU memory; if this OOMs, dub a shorter span via --reference_video_frame_cap."
+            )
+        if src_T < 1:
+            raise ValueError(f"v2a: source video {src_path!r} produced no usable frames.")
+        # Round UP to the VAE's 1+8k pixel-length grid by repeating the last frame:
+        # flooring would leave the copied tail undubbed (silent). The extra audio
+        # generated beyond the real clip is trimmed at mux time, where the copied
+        # video stream is the -shortest one.
+        snapped_T = ((src_T - 1 + 7) // 8) * 8 + 1
+        if snapped_T != src_T:
+            pad_T = snapped_T - src_T
+            logger.info(f"  ↪ Source video has {src_T} decoded frame(s); padding to {snapped_T} (repeat last frame ×{pad_T}) for LTX-2.3 VAE (pixel length must be 1 + 8k).")
+            pixels = torch.cat([pixels, pixels[:, :, -1:].expand(-1, -1, pad_T, -1, -1)], dim=2)
+
+        # Config is a LockableDict and is locked after init_modules; only mutate input_info.
+        self.input_info.target_video_length = snapped_T
+        self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
+
+        # Timeline alignment: BOTH modalities stay on the model's config-fps timeline
+        # (the scheduler positions video tokens as frame/config_fps), so they are
+        # exactly aligned in model space. For a non-config-fps source the generated
+        # audio is tempo-scaled at mux time (atempo = src_fps/config_fps) instead:
+        # an audio event for frame f sits at model time f/config_fps and lands at
+        # real time f/src_fps after scaling — exact sync for any fps, no drift.
+        cfg_fps = float(self.config["fps"])
+        self._v2a_mux_tempo = 1.0
+        if src_fps is not None and abs(src_fps - cfg_fps) > 0.01:
+            self._v2a_mux_tempo = src_fps / cfg_fps
+            logger.warning(
+                f"  ⚠ v2a: source fps {src_fps:.3f} != model fps {cfg_fps:g}; generated audio will be tempo-scaled ×{self._v2a_mux_tempo:.4f} "
+                f"at mux time for exact sync. The model still 'sees' the clip at {cfg_fps:g}fps (motion appears "
+                f"{'slower' if src_fps > cfg_fps else 'faster'} than real) — ~{cfg_fps:g}fps sources give the best results."
+            )
+
+        # Honest-tail check: the muxed output copies the FULL source video, so any span
+        # we did not dub (explicit frame cap) plays silent. The 1+8k grid no longer
+        # trims: it pads up, so uncapped runs always cover the whole clip.
+        dubbed_seconds = float(snapped_T) / (src_fps or cfg_fps)
+        if src_duration is not None and src_duration - dubbed_seconds > 0.5:
+            logger.warning(
+                f"  ⚠ v2a: dubbing covers only the first {dubbed_seconds:.2f}s but the copied video lasts {src_duration:.2f}s — "
+                f"the remaining {src_duration - dubbed_seconds:.2f}s tail stays SILENT. Remove/raise --reference_video_frame_cap to dub the whole clip."
+            )
+
+        b, c, t, h, w = pixels.shape
+        logger.info(f"  ⏳ VAE-encoding source video to freeze the picture: pixels BCHW=({b},{c},{t},{h},{w}), cpu_offload={getattr(self.video_vae, 'cpu_offload', False)}")
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            video_latent = self.video_vae.encode(pixels)
+        if video_latent.dim() == 5:
+            video_latent = video_latent.squeeze(0)
+        logger.info(f"  ✓ Source VAE encode finished in {time.perf_counter() - t0:.1f}s → latent {tuple(video_latent.shape)}")
+
+        # Align the encoded latent with the target latent grid, then freeze every frame.
+        C, F, Hl, Wl = self.input_info.video_latent_shape
+        if tuple(video_latent.shape[-2:]) != (Hl, Wl) or video_latent.shape[0] != C:
+            raise ValueError(f"v2a: encoded video latent {tuple(video_latent.shape)} incompatible with target latent shape {(C, F, Hl, Wl)}.")
+        f_enc = video_latent.shape[1]
+        if f_enc < F:
+            pad = video_latent[:, -1:, :, :].expand(C, F - f_enc, Hl, Wl)
+            video_latent = torch.cat([video_latent, pad], dim=1)
+        elif f_enc > F:
+            video_latent = video_latent[:, :F, :, :]
+
+        self.initial_video_latent = video_latent.to(dtype=GET_DTYPE(), device=AI_DEVICE)
+        # denoise_mask 0 → keep clean (frozen) for every video token across all steps.
+        self.video_denoise_mask = torch.zeros(1, F, Hl, Wl, dtype=torch.float32, device=AI_DEVICE)
+        self._i2av_guiding_keyframe_meta = None
+
+        # Audio denoises fully (mask defaults to ones in the scheduler).
+        self.initial_audio_latent = None
+        self.audio_denoise_mask = None
+
+        # Remember the source so the saved mp4 reuses its pixels via stream-copy.
+        self._v2a_source_video = src_path
+
+        text_encoder_output = self.run_text_encoder(self.input_info)
 
         torch_device_module.empty_cache()
         gc.collect()
@@ -937,10 +1122,21 @@ class LTX2Runner(DefaultRunner):
         elif self.input_info.save_result_path is not None:
             if not dist.is_initialized() or dist.get_rank() == 0:
                 logger.info(f"🎬 Start to save video 🎬")
+                out_path = self.input_info.save_result_path
+
+                # v2a (pure dubbing): keep the ORIGINAL pixels byte-for-byte by
+                # stream-copying the source video and adding only the generated audio.
+                src_video = getattr(self, "_v2a_source_video", None)
+                if self.config.get("task") == "v2a" and src_video:
+                    muxed = mux_generated_audio_onto_video(src_video, self.gen_audio_final, out_path, tempo=getattr(self, "_v2a_mux_tempo", 1.0))
+                    if muxed:
+                        logger.info(f"✅ v2a: dubbed audio muxed onto original video (pixels unchanged): {out_path} ✅")
+                        return {"video": None}
+                    logger.warning("v2a: pixel-perfect mux failed; falling back to VAE-decoded video output.")
+
                 save_audio = self.gen_audio_final
                 if self.config.get("task") == "ltx2_s2v" and getattr(self, "_ltx2_s2v_mux_audio", None) is not None:
                     save_audio = self._ltx2_s2v_mux_audio
-                out_path = self.input_info.save_result_path
                 save_video(
                     video=self.gen_video_final,
                     fps=self.config.get("fps", 24),

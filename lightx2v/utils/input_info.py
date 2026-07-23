@@ -473,6 +473,9 @@ task_dict = {
     "i2av": I2AVInputInfo,
     "i2va": I2VAInputInfo,
     "v2av": V2AVInputInfo,
+    # v2a (LTX-2.3 pure dubbing) uses a subset of v2av's fields (video_path/prompt/...),
+    # so the same InputInfo class is reused.
+    "v2a": V2AVInputInfo,
     "ltx2_s2v": LTX2S2VInputInfo,
     "worldplay_i2v": WorldPlayI2VInputInfo,
     "worldplay_t2v": WorldPlayT2VInputInfo,
