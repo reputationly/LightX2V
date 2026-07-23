@@ -279,14 +279,11 @@ class WanPreInfer:
         (transformer_wan.py:289). Tokens + cos_sin concat along the sequence dim
         BEFORE any seq-parallel split (transformer_wan.py:458).
         """
-        assert self.config.get("rope_type", "flashinfer") != "flashinfer", (
-            "v2v requires rope_type='torch' (complex cos_sin); flashinfer real/imag "
-            "layout for source-id RoPE is not implemented yet."
-        )
+        assert self.config.get("rope_type", "flashinfer") != "flashinfer", "v2v requires rope_type='torch' (complex cos_sin); flashinfer real/imag layout for source-id RoPE is not implemented yet."
 
         v2v = inputs["v2v_context"]
         src_latents = v2v["src_latents"]  # list of [C=16, T_lat, H_lat, W_lat]
-        src_ids = v2v["src_ids"]          # list[float], context ids 1..n
+        src_ids = v2v["src_ids"]  # list[float], context ids 1..n
 
         noisy = self.scheduler.latents  # [C, T_lat, H_lat, W_lat] (normalized target)
         t = self.scheduler.timestep_input

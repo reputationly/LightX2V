@@ -161,14 +161,10 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint:
         named = [v for v in variants if str(v.get("name", "")) == profile_name]
         if len(named) != 1:
             names = [v.get("name", "?") for v in variants]
-            raise RuntimeError(
-                f"--profile '{profile_name}' does not match exactly one variant of model_cls '{model_cls}' in {profiles_file}. Known variants: {names}"
-            )
+            raise RuntimeError(f"--profile '{profile_name}' does not match exactly one variant of model_cls '{model_cls}' in {profiles_file}. Known variants: {names}")
         variant = named[0]
         if int(variant.get("gpus", 0)) != gpu_count:
-            raise RuntimeError(
-                f"--profile '{profile_name}' needs {variant.get('gpus', '?')} GPU(s) but the container has {gpu_count}"
-            )
+            raise RuntimeError(f"--profile '{profile_name}' needs {variant.get('gpus', '?')} GPU(s) but the container has {gpu_count}")
         candidates = named
     else:
         candidates = [v for v in variants if int(v.get("gpus", 0)) == gpu_count]
