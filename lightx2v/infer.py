@@ -172,6 +172,7 @@ def main():
             "ref2av",
             "i2va",
             "v2av",
+            "v2a",
             "ltx2_s2v",
             "sr",
             "recon",

@@ -435,6 +435,130 @@ def mux_audio_from_video(
     return output_path
 
 
+def _atempo_filters(tempo: float) -> list:
+    """Build an ffmpeg ``atempo`` filter chain for an arbitrary speed factor.
+
+    A single atempo instance only accepts 0.5..2.0, so out-of-range factors are
+    decomposed into a chain. Returns [] for a no-op (tempo ~1.0 or invalid).
+    """
+    try:
+        t = float(tempo)
+    except (TypeError, ValueError):
+        return []
+    if not (t > 0) or abs(t - 1.0) < 1e-4:
+        return []
+    filters = []
+    while t > 2.0:
+        filters.append("atempo=2.0")
+        t /= 2.0
+    while t < 0.5:
+        filters.append("atempo=0.5")
+        t *= 2.0
+    filters.append(f"atempo={t:.6f}")
+    return filters
+
+
+def mux_generated_audio_onto_video(
+    source_video_path: str,
+    audio,
+    output_path: str,
+    tempo: float = 1.0,
+) -> Optional[str]:
+    """Mux a generated audio waveform onto ``source_video_path`` WITHOUT re-encoding the video.
+
+    Used by the LTX-2 ``v2a`` (pure dubbing) task: the picture must stay pixel-identical,
+    so the original video stream is stream-copied (`-c:v copy`) and only the generated
+    audio track is added. The waveform is fed to ffmpeg as raw f32le PCM via stdin, so no
+    wav/soundfile backend is required.
+
+    Args:
+        source_video_path: The original video whose pixels are kept byte-for-byte.
+        audio: An object exposing ``.waveform`` (Tensor, [C,S] or [1,C,S] or [S]) and ``.sampling_rate``.
+        output_path: Destination mp4 path.
+        tempo: Audio speed factor (``atempo``, pitch-preserving). The v2a runner passes
+            ``src_fps / model_fps`` so audio generated on the model's fps timeline lands
+            exactly on the source clip's real timeline.
+
+    Returns:
+        The output path on success, or None on failure.
+    """
+    if not os.path.exists(source_video_path):
+        logger.warning(f"v2a: source video not found, cannot mux audio: {source_video_path}")
+        return None
+    if audio is None or getattr(audio, "waveform", None) is None:
+        logger.warning("v2a: no generated audio to mux.")
+        return None
+
+    w = audio.waveform.detach().to("cpu", dtype=torch.float32)
+    if w.dim() == 3:  # [1, C, S]
+        w = w.squeeze(0)
+    if w.dim() == 1:  # [S] → [1, S]
+        w = w.unsqueeze(0)
+    if w.dim() != 2:
+        logger.warning(f"v2a: unexpected waveform shape {tuple(audio.waveform.shape)}; cannot mux.")
+        return None
+    channels = int(w.shape[0])
+    sample_rate = int(getattr(audio, "sampling_rate", 0) or 0)
+    if channels < 1 or sample_rate < 1:
+        logger.warning(f"v2a: invalid audio (channels={channels}, sample_rate={sample_rate}); cannot mux.")
+        return None
+
+    # ffmpeg f32le expects interleaved samples: [C, S] -> [S, C] -> flat.
+    pcm = w.clamp_(-1.0, 1.0).transpose(0, 1).contiguous().reshape(-1).numpy().astype(np.float32).tobytes()
+
+    ffmpeg_exe = ffmpeg.get_ffmpeg_exe()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    tmp_path = f"{output_path}.tmp.mp4"
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    cmd = [
+        ffmpeg_exe,
+        "-y",
+        "-i",
+        source_video_path,
+        "-f",
+        "f32le",
+        "-ar",
+        str(sample_rate),
+        "-ac",
+        str(channels),
+        "-i",
+        "pipe:0",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        # Filter chain: optional atempo (sync for non-model-fps sources), then apad.
+        # apad pads the generated audio with silence indefinitely, so the finite
+        # (fully copied) video stream is always the "-shortest" one: the picture
+        # is NEVER truncated. Audio shorter than the video gets a silent tail;
+        # audio longer than the video is trimmed to the video's duration.
+        "-af",
+        ",".join(_atempo_filters(tempo) + ["apad"]),
+        "-shortest",
+        "-f",
+        "mp4",
+        tmp_path,
+    ]
+    result = subprocess.run(cmd, input=pcm, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="ignore") if result.stderr else "Unknown error"
+        logger.warning(f"v2a: audio mux failed, output not written. Error: {stderr}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        return None
+
+    os.replace(tmp_path, output_path)
+    return output_path
+
+
 def remove_substrings_from_keys(original_dict, substr):
     new_dict = {}
     for key, value in original_dict.items():

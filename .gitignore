@@ -35,3 +35,5 @@ lightx2v_ros/build
 lightx2v_ros/install
 lightx2v_ros/log
 .gitnexus
+# IDE-exported patch dumps (e.g. IntelliJ "导出补丁"), kept local only
+*.patch
