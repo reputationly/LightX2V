@@ -75,7 +75,8 @@ class BaseTaskRequest(DisaggOverrideRequest):
 class VideoTaskRequest(BaseTaskRequest):
     num_fragments: int = Field(1, description="Number of fragments")
     target_video_length: int = Field(81, description="Target video length")
-    video_path: str = Field("", description="Input video path (for SR/V2V-like tasks)")
+    video_path: str = Field("", description="Input video path (for SR/V2V-like tasks; v2a source video to dub)")
+    reference_video_frame_cap: Optional[int] = Field(None, description="v2a: dub only the first N frames (tail stays silent); omit to dub the whole clip")
     src_video: str = Field("", description="Control/source video path (VACE V2V/MV2V)")
     src_mask: str = Field("", description="Mask video path, white=repaint (VACE MV2V; gray-fill the masked area in src_video for true inpaint)")
     src_ref_images: str = Field("", description="Reference image path(s), comma-separated (VACE R2V)")

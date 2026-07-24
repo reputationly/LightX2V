@@ -479,8 +479,11 @@ def mux_generated_audio_onto_video(
         The output path on success, or None on failure.
     """
     if not os.path.exists(source_video_path):
-        logger.warning(f"v2a: source video not found, cannot mux audio: {source_video_path}")
-        return None
+        # Hard error, not a fallback: the v2a pixel-identity contract can ONLY be
+        # honored by stream-copying a local source file. A missing path (e.g. a URL
+        # that was never materialized by the gateway) must fail loudly instead of
+        # silently degrading to a lossy VAE re-render.
+        raise FileNotFoundError(f"v2a: source video is not a local file, cannot honor the pixel-identical contract: {source_video_path!r}")
     if audio is None or getattr(audio, "waveform", None) is None:
         logger.warning("v2a: no generated audio to mux.")
         return None

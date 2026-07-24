@@ -116,6 +116,13 @@ def _infer_model_cls(model_path: str, override: str) -> str:
         return "wan2.2_moe"
     if "qwen" in name:
         return "qwen_image"
+    if "ltx" in name:
+        # LTX-2.3 dubbing tier (profiles.yaml key "ltx2"). Path basenames like
+        # "LTX-2.3" would otherwise fall through to the raw basename and fail
+        # profile lookup ("No profile for model_cls 'ltx-2.3'"). Matching the
+        # family token is correct HERE (family -> model_cls is one-to-one);
+        # task-form inference stays token-based elsewhere (v2a/dub only).
+        return "ltx2"
     return name
 
 

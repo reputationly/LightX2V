@@ -1129,10 +1129,12 @@ class LTX2Runner(DefaultRunner):
                 src_video = getattr(self, "_v2a_source_video", None)
                 if self.config.get("task") == "v2a" and src_video:
                     muxed = mux_generated_audio_onto_video(src_video, self.gen_audio_final, out_path, tempo=getattr(self, "_v2a_mux_tempo", 1.0))
-                    if muxed:
-                        logger.info(f"✅ v2a: dubbed audio muxed onto original video (pixels unchanged): {out_path} ✅")
-                        return {"video": None}
-                    logger.warning("v2a: pixel-perfect mux failed; falling back to VAE-decoded video output.")
+                    if not muxed:
+                        # No fallback: a VAE-decoded save would silently violate the
+                        # pixel-identical contract that defines this task.
+                        raise RuntimeError("v2a: stream-copy mux failed (see warnings above); refusing to fall back to lossy VAE-decoded output.")
+                    logger.info(f"✅ v2a: dubbed audio muxed onto original video (pixels unchanged): {out_path} ✅")
+                    return {"video": None}
 
                 save_audio = self.gen_audio_final
                 if self.config.get("task") == "ltx2_s2v" and getattr(self, "_ltx2_s2v_mux_audio", None) is not None:
