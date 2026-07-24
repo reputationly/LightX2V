@@ -180,3 +180,20 @@ wan2.2_moe_vace:
       gpus: 1
       task: vace
       config_json: /opt/LightX2V/configs/wan22/a100/wan22_moe_vace_a100_int8_lora4step_720p_rife.json
+
+# LTX-2.3 v2a pure dubbing (task=v2a): freeze the source-video latents, denoise
+# audio ONLY, then stream-copy the ORIGINAL pixels at mux (-c:v copy) — output
+# is the input video with an AI audio track, picture byte-identical.
+# Single card bf16: the 22B DiT OOMs on 40G A100 under both ulysses and TP
+# (measured); v2a skips the upsampler and never denoises video, so VRAM sits
+# below the generation tasks — exact peak/latency pending the M0 smoke run
+# (also feeds gpustack's lightx2v_model_latency_seconds entry and pricing).
+# Input red lines are enforced UPSTREAM (gateway VideoModelConfig): suggested
+# launch caps ≤720p in, ≤15s (engine warns >361 frames). Non-24fps sources are
+# tempo-aligned at mux (atempo) — sync is exact, but ~24fps material is best.
+ltx2:
+  variants:
+    - name: ltx2-v2a/bf16-1card
+      gpus: 1
+      task: v2a
+      config_json: /opt/LightX2V/configs/ltx2/ltx2_3_v2a.json
