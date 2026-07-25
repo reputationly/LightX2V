@@ -151,7 +151,11 @@ infinitetalk:
 # (longer inputs auto-segment; the PyAV segment-pts bug is fixed in this
 # release). 480p→2× ≈ 80s, 720p→2× ≈ 200s. sr_ratio is a request-level field
 # (default 2.0), output clamped by the config's target size (runner:114).
-# fps passes through — SR never interpolates.
+# VFI: request target_fps > source fps triggers per-segment RIFE on the SR
+# output (boundary-stitched; target_fps <= source is a strict no-op, never
+# drops frames). Requires the config's video_frame_interpolation block and
+# the RIFE weights mounted at /nfs-data/models/rife-model/flownet.pkl —
+# startup fails fast if the block is present but weights are missing.
 # Resources: ~22.7G VRAM peak, ~42G host per instance — pairs with VACE on one
 # node (2×VACE + 2×SeedVR2; watch MemAvailable, that node runs near the line).
 # Input cap (≤720p in) is enforced upstream (gateway/new-api), not here.

@@ -564,23 +564,27 @@ class DefaultRunner(BaseRunner):
     def process_images_after_vae_decoder(self):
         self.gen_video_final = wan_vae_to_comfy(self.gen_video_final)
 
+        # 插帧与保存帧率必须共用同一判定：target_fps 高于源帧率才真的插帧、
+        # 才按 target_fps 编码。否则（如 SR 源 24fps + 请求默认 target_fps=16）
+        # wrapper 原样返回全部帧，若保存端仍切 target_fps 会产出慢动作视频。
+        source_fps = self.config.get("fps", 16)
+        vfi_target_fps = None
         if "video_frame_interpolation" in self.config:
             assert self.vfi_model is not None and self.config["video_frame_interpolation"].get("target_fps", None) is not None
             target_fps = self.config["video_frame_interpolation"]["target_fps"]
-            logger.info(f"Interpolating frames from {self.config.get('fps', 16)} to {target_fps}")
-            self.gen_video_final = self.vfi_model.interpolate_frames(
-                self.gen_video_final,
-                source_fps=self.config.get("fps", 16),
-                target_fps=target_fps,
-            )
+            if target_fps > source_fps:
+                vfi_target_fps = target_fps
+                logger.info(f"Interpolating frames from {source_fps} to {target_fps}")
+                self.gen_video_final = self.vfi_model.interpolate_frames(
+                    self.gen_video_final,
+                    source_fps=source_fps,
+                    target_fps=target_fps,
+                )
 
         if self.input_info.return_result_tensor:
             return {"video": self.gen_video_final}
         elif self.input_info.save_result_path is not None:
-            if "video_frame_interpolation" in self.config and self.config["video_frame_interpolation"].get("target_fps"):
-                fps = self.config["video_frame_interpolation"]["target_fps"]
-            else:
-                fps = self.config.get("fps", 16)
+            fps = vfi_target_fps if vfi_target_fps else source_fps
 
             if not dist.is_initialized() or dist.get_rank() == 0:
                 out_path = self.input_info.save_result_path

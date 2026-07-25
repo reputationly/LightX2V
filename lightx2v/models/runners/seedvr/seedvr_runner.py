@@ -620,6 +620,22 @@ class SeedVRRunner(DefaultRunner):
         raw_segments = [] if not file_output else None
         segment_paths = []
         tmp_dir = None
+        # SR 插帧（RIFE）：config 配了 video_frame_interpolation 且请求 target_fps
+        # 高于源帧率才启用（不降帧）。分段文件路径逐段插帧，避免整段拼接的显存峰值。
+        # 跨段用「全局目标帧栅格」保证节奏连续：每段带上一段末帧（prepend）作插值
+        # 锚点，并传入本段的全局源帧偏移 + 全局目标帧区间，使非整数倍率下段边界也
+        # 不重启相位、不与源音频错位。
+        save_fps = self.config.get("fps", 16)
+        vfi_target = None
+        if self.vfi_model is not None:
+            vfi_cfg = self.config.get("video_frame_interpolation") or {}
+            target = vfi_cfg.get("target_fps")
+            if target and target > save_fps:
+                vfi_target = target
+                logger.info(f"[SeedVRRunner] SR VFI enabled: {save_fps} -> {vfi_target} fps (per-segment, global-grid stitched)")
+        vfi_prev_tail = None
+        vfi_src_offset = 0.0  # 当前段 images[0] 的全局源帧索引
+        vfi_next_g = 0  # 下一个待发的全局目标帧索引（跨段累进，不重启）
         try:
             if file_output:
                 output_dir = os.path.dirname(original_save_path) or "."
@@ -639,7 +655,39 @@ class SeedVRRunner(DefaultRunner):
 
                 if file_output:
                     segment_path = os.path.join(tmp_dir, f"segment_{idx:05d}.mp4")
-                    self._save_sr_segment_video(raw, segment_path, fps=self.config.get("fps", 16))
+                    if vfi_target:
+                        comfy = wan_vae_to_comfy(raw).float().clamp(0.0, 1.0)
+                        del raw
+                        raw = None
+                        # images[0] 为上一段末帧（首段为本段首帧），供 RIFE 补齐段
+                        # 边界间的中间帧。全局目标栅格从 vfi_next_g 累进，边界帧只由
+                        # 上一段发出一次，本段从其后继续——无重发、无遗漏、无相位重启。
+                        tail = comfy[-1:].clone()
+                        if vfi_prev_tail is None:
+                            frames = comfy
+                        else:
+                            frames = torch.cat([vfi_prev_tail, comfy], dim=0)
+                        del comfy
+                        n_local = frames.shape[0]
+                        # 本段负责的最后一个全局目标帧（其全局源位落在本段范围内）
+                        g_end = int((vfi_src_offset + n_local - 1) * vfi_target / save_fps + 1e-6)
+                        out = self.vfi_model.interpolate_frames(
+                            frames,
+                            source_fps=save_fps,
+                            target_fps=vfi_target,
+                            source_frame_offset=vfi_src_offset,
+                            target_idx_start=vfi_next_g,
+                            target_idx_end=g_end,
+                        )
+                        del frames
+                        vfi_next_g = g_end + 1
+                        # 下一段 images[0] = 本段末帧，其全局源索引 = 本段末帧全局索引
+                        vfi_src_offset = vfi_src_offset + (n_local - 1)
+                        vfi_prev_tail = tail
+                        save_to_video(out, segment_path, fps=vfi_target, method="ffmpeg")
+                        del out
+                    else:
+                        self._save_sr_segment_video(raw, segment_path, fps=save_fps)
                     segment_paths.append(segment_path)
                     del raw
                     self.gen_video = None
