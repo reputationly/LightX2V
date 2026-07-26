@@ -164,12 +164,19 @@ elif self.config["task"] == "v2a":
 ### 4.4 `lightx2v/infer.py`(~L110)
 `--task` 的 `choices` 加入 `"v2a"`。`--video_path` / `--prompt` / `--save_result_path` 已存在,无需新增参数。
 
-### 4.5 新配置 `configs/ltx2/ltx2_3_v2a.json`
-以 `configs/ltx2/ltx2_3.json`(基础联合 AV 模型 `ltx-2.3-22b-dev`,含 `mm_guider` 音频 `cfg_scale=7.0`)为底:
-- **不挂** union-control IC-LoRA(不驱动画面)。
-- `"use_upsampler": false`(画面来自原视频、冻结不变;上采样会改视频帧数破坏音视频对齐)。
-- 保留 `mm_guider` / `enable_cfg`,音频侧强引导。
+### 4.5 新配置 `configs/ltx2/ltx2_3_v2a.json`(已按 smoke 验证结果定稿)
+
+**关键更正(2026-07-26 smoke)**:裸基座的 V2A 音频**跟画面/提示词无关**——官方 V2A 靠专门的 **Foley LoRA**(`Lightricks/LTX-2.3-22b-LoRA-Foley-V2A`,魔搭 un-gated)条件化音频。**必须挂 foley LoRA,不是可选。** 挂上后音效才与画面动作同步。生产选型定为**蒸馏 8 步**(速度优先,dev 30 步音质更优但慢 ~12×):
+
+- **基座**:`ltx-2.3-22b-distilled-1.1`(8 步蒸馏,`enable_cfg:false` + `distilled_sigma_values`)。
+- **必挂 foley LoRA**:`lora_configs=[{path: .../ltx-2.3-22b-lora-foley-v2a-1.0.safetensors, strength: 1.0}]`(strength 1 音效最足;2/3 更压音乐但更弱)。
+- **gemma 上 GPU**:`gemma_cpu_offload:false` —— 文本编码 387s→0.68s,决定性提速。
+- **显存**:`cpu_offload:true` / `offload_granularity:block` / `vae_cpu_offload:true`(22B bf16 单卡 40G 靠 block offload,峰值 ~35GB)。
+- `use_upsampler:false`(画面来自原视频冻结,上采样会改帧数破坏对齐)。
+- **配置分层(照仓库约定)**:顶层 `configs/ltx2/ltx2_3_v2a.json` 用**相对路径**(可移植模板,同 `ltx2_3.json`);集群生产用 `configs/ltx2/a100/ltx2_3_v2a.json` 的**绝对 `/nfs-models/...` 路径**(gpustack 实例不挂 `/data`,launcher profile 指向 a100 版)。
 - 分辨率/帧数占位即可,运行时由输入视频覆盖。
+- **音乐 out of scope**:foley 只做音效,负面词压 `music/melody/song`;"弹指定曲目"做不到。
+- **提示词**:foley 范式描述画面动作 + 结尾 `No speech is present. No music is present.`;可空(空则音效偏弱)。
 
 ### 4.6 新运行脚本 `scripts/ltx2/run_ltx2_3_v2a.sh`
 镜像 `scripts/ltx2/run_ltx2_3_s2v.sh` 风格(无硬编码路径:`lightx2v_path`/`model_path`/`VIDEO_PATH` 变量 + `source base.sh`):
@@ -190,7 +197,7 @@ elif self.config["task"] == "v2a":
 | 1 | **画面像素零损失** | 架构保证(`-c:v copy` 复制原流,不经 VAE 重解码) | 无需模型验证,`ffprobe` 核对即可 |
 | 2 | **音频质量 / 与画面同步**(唯一经验性风险) | 架构 in-distribution(s2v 冻结音频的镜像),但音质/对位需人耳确认 | 一次 smoke 跑;若不足,可像 v2av 挂 foley/audio LoRA 增强 |
 | 3 | **音视频帧长对齐** | 已由"从输入视频推 `target_video_length` 再算两者 shape"保证(沿用 v2av/s2v) | 奇偶帧/极短片段各跑一次确认 |
-| 4 | **上游是否有专用 V2A/foley 权重** | 首版用基础 AV 模型;若官方有专用 LoRA 更优 | 实现前确认 LTX-2.3 release 是否含 foley/audio LoRA |
+| 4 | **专用 V2A/foley 权重** | ✅ 已确认:官方 `LTX-2.3-22b-LoRA-Foley-V2A`(魔搭 un-gated)**必需**——裸基座音频不成立(smoke 实测跟画面/提示词无关) | 已下 NFS 并挂入 `ltx2_3_v2a.json`;下载脚本 `scripts/ltx2/download_ltx2_foley_v2a_lora.sh` |
 
 ### 5.2 端到端验证
 1. 备一段短测试视频(3~5s / 24fps,帧数满足 `1+8k`)。

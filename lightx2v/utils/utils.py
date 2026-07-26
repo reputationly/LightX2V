@@ -459,6 +459,7 @@ def mux_generated_audio_onto_video(
     audio,
     output_path: str,
     tempo: float = 1.0,
+    duration: Optional[float] = None,
 ) -> Optional[str]:
     """Mux a generated audio waveform onto ``source_video_path`` WITHOUT re-encoding the video.
 
@@ -474,6 +475,11 @@ def mux_generated_audio_onto_video(
         tempo: Audio speed factor (``atempo``, pitch-preserving). The v2a runner passes
             ``src_fps / model_fps`` so audio generated on the model's fps timeline lands
             exactly on the source clip's real timeline.
+        duration: Source video duration in seconds. When known, the output is bounded to
+            exactly this length with ``-t``: the audio is silence-padded (``apad``) up to it
+            and the stream-copied video plays in full — neither truncated nor hung. When
+            ``None`` (probe failed), falls back to ``atempo``-only + ``-shortest`` (no
+            ``apad``, which would hang under ``-c:v copy``), risking a sub-frame tail trim.
 
     Returns:
         The output path on success, or None on failure.
@@ -511,6 +517,20 @@ def mux_generated_audio_onto_video(
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
+    # How the audio track is bounded to the video length differs by whether we know
+    # the source duration:
+    #   - duration known  → atempo (fps sync) + apad (pad silence) + ``-t duration``.
+    #     ``-t`` hard-caps the output at the video's real length: the padded audio can
+    #     never run away and the ``-c:v copy`` video plays in full — no truncation, no
+    #     hang. This is the correct path for v2a (the runner always probes duration).
+    #   - duration unknown → atempo-only + ``-shortest`` (NO apad). apad here would hang:
+    #     ffmpeg cannot resolve ``-shortest`` against an infinite pad under ``-c:v copy``.
+    #     A sub-frame tail trim is possible, accepted as the degraded fallback.
+    if duration is not None and float(duration) > 0:
+        audio_bound = ["-af", ",".join(_atempo_filters(tempo) + ["apad"]), "-t", f"{float(duration):.6f}"]
+    else:
+        audio_bound = ["-af", ",".join(_atempo_filters(tempo) or ["anull"]), "-shortest"]
+
     cmd = [
         ffmpeg_exe,
         "-y",
@@ -534,14 +554,7 @@ def mux_generated_audio_onto_video(
         "aac",
         "-b:a",
         "192k",
-        # Filter chain: optional atempo (sync for non-model-fps sources), then apad.
-        # apad pads the generated audio with silence indefinitely, so the finite
-        # (fully copied) video stream is always the "-shortest" one: the picture
-        # is NEVER truncated. Audio shorter than the video gets a silent tail;
-        # audio longer than the video is trimmed to the video's duration.
-        "-af",
-        ",".join(_atempo_filters(tempo) + ["apad"]),
-        "-shortest",
+        *audio_bound,
         "-f",
         "mp4",
         tmp_path,

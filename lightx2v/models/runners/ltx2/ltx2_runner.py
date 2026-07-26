@@ -307,6 +307,7 @@ class LTX2Runner(DefaultRunner):
         self._ref_video_latent = None
         self._v2a_source_video = None
         self._v2a_mux_tempo = 1.0
+        self._v2a_src_duration = None
 
     def _get_ref_downscale_factor(self) -> float:
         """Read IC-LoRA reference-video downscale factor.
@@ -355,15 +356,20 @@ class LTX2Runner(DefaultRunner):
             import av  # noqa: PLC0415 - lazy import; PyAV is already required.
 
             with av.open(path) as container:
-                if container.duration:
-                    duration = float(container.duration) / av.time_base
                 for stream in container.streams:
                     if stream.type == "video":
                         if stream.average_rate and float(stream.average_rate) > 0:
                             fps = float(stream.average_rate)
-                        if duration is None and stream.duration and stream.time_base:
+                        # Prefer the VIDEO stream's own duration: it defines the length of
+                        # the stream-copied picture. Container duration can exceed it when
+                        # the source has a longer audio track / edit list, which would make
+                        # the v2a mux -t cap over-pad silence past the last frame. Fall back
+                        # to container duration below only when the stream omits its own.
+                        if stream.duration and stream.time_base:
                             duration = float(stream.duration * stream.time_base)
                         break
+                if duration is None and container.duration:
+                    duration = float(container.duration) / av.time_base
         except Exception as e:  # noqa: BLE001 - probing must never break inference.
             logger.warning(f"  ⚠ Could not probe video fps/duration from {path!r}: {e}")
         return fps, duration
@@ -664,7 +670,10 @@ class LTX2Runner(DefaultRunner):
         self.audio_denoise_mask = None
 
         # Remember the source so the saved mp4 reuses its pixels via stream-copy.
+        # ``src_duration`` bounds the mux output (``-t``) so the copied video is never
+        # truncated and the padded audio never runs away (see mux_generated_audio_onto_video).
         self._v2a_source_video = src_path
+        self._v2a_src_duration = src_duration
 
         text_encoder_output = self.run_text_encoder(self.input_info)
 
@@ -1128,7 +1137,13 @@ class LTX2Runner(DefaultRunner):
                 # stream-copying the source video and adding only the generated audio.
                 src_video = getattr(self, "_v2a_source_video", None)
                 if self.config.get("task") == "v2a" and src_video:
-                    muxed = mux_generated_audio_onto_video(src_video, self.gen_audio_final, out_path, tempo=getattr(self, "_v2a_mux_tempo", 1.0))
+                    muxed = mux_generated_audio_onto_video(
+                        src_video,
+                        self.gen_audio_final,
+                        out_path,
+                        tempo=getattr(self, "_v2a_mux_tempo", 1.0),
+                        duration=getattr(self, "_v2a_src_duration", None),
+                    )
                     if not muxed:
                         # No fallback: a VAE-decoded save would silently violate the
                         # pixel-identical contract that defines this task.

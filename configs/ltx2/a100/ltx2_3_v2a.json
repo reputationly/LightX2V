@@ -19,11 +19,11 @@
   "audio_fps": 24000,
   "audio_mel_bins": 16,
   "double_precision_rope": true,
-  "dit_original_ckpt": "Lightricks/LTX-2.3/ltx-2.3-22b-distilled-1.1.safetensors",
-  "gemma_original_ckpt": "google/gemma-3-12b-it-qat-q4_0-unquantized",
+  "dit_original_ckpt": "/nfs-models/wuhanjisuan894/models/Lightricks/LTX-2.3/ltx-2.3-22b-distilled-1.1.safetensors",
+  "gemma_original_ckpt": "/nfs-models/wuhanjisuan894/models/google/gemma-3-12b-it-qat-q4_0-unquantized",
   "lora_configs": [
     {
-      "path": "loras/foley-v2a/ltx-2.3-22b-lora-foley-v2a-1.0.safetensors",
+      "path": "/nfs-models/wuhanjisuan894/models/loras/foley-v2a/ltx-2.3-22b-lora-foley-v2a-1.0.safetensors",
       "strength": 1.0
     }
   ],

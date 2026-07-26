@@ -200,4 +200,4 @@ ltx2:
     - name: ltx2-v2a/bf16-1card
       gpus: 1
       task: v2a
-      config_json: /opt/LightX2V/configs/ltx2/ltx2_3_v2a.json
+      config_json: /opt/LightX2V/configs/ltx2/a100/ltx2_3_v2a.json
