@@ -558,6 +558,26 @@ class LTX2Runner(DefaultRunner):
                 self.config["target_width"],
             ]
 
+        # v2a conditioning downscale (memory guard for long / high-res clips).
+        # The audio only needs the frozen video as a conditioning signal, and the OUTPUT
+        # pixels are stream-copied (-c:v copy) from the untouched source — so we may
+        # VAE-encode the conditioning at a lower resolution to bound the single-pass
+        # encode/denoise activation. v2a encodes the WHOLE clip in one forward, so a long
+        # or 720p clip's activation can push a gemma-resident card past 40GB; capping the
+        # conditioning's long side keeps it bounded with ZERO output-quality loss.
+        # Controlled by config "v2a_cond_max_side" (max spatial side in px; None/<=0 = off).
+        cond_cap = self.config.get("v2a_cond_max_side")
+        if cond_cap and int(cond_cap) > 0:
+            th, tw = int(self.input_info.target_shape[0]), int(self.input_info.target_shape[1])
+            long_side = max(th, tw)
+            if long_side > int(cond_cap):
+                scale = int(cond_cap) / long_side
+                snap = 32  # VAE spatial stride
+                th2 = max(snap, int(round(th * scale / snap)) * snap)
+                tw2 = max(snap, int(round(tw * scale / snap)) * snap)
+                logger.info(f"  ↪ v2a: conditioning downscaled {tw}x{th} → {tw2}x{th2} (cap {cond_cap}px); output pixels unchanged (-c:v copy).")
+                self.input_info.target_shape = [th2, tw2]
+
         src_path = (getattr(self.input_info, "video_path", None) or "").strip()
         if not src_path:
             raise ValueError("v2a requires a non-empty video_path (the source video to dub).")
