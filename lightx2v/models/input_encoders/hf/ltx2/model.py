@@ -147,18 +147,36 @@ class LTX2TextEncoder:
             List of tuples, each containing (v_context, a_context) tensors for each prompt.
         """
         gemma_on_cpu = os.environ.get("LTX_GEMMA_ON_CPU", "") == "1"
-        if self.cpu_offload and not gemma_on_cpu:
-            self.text_encoder = self.text_encoder.to(AI_DEVICE)
-        result = []
-        for prompt in prompts:
-            v_context, a_context, _ = self.text_encoder(prompt)
-            if gemma_on_cpu:
-                v_context = v_context.to(AI_DEVICE)
-                a_context = a_context.to(AI_DEVICE)
-            result.append((v_context, a_context))
-        if self.cpu_offload and not gemma_on_cpu:
-            self.text_encoder = self.text_encoder.to("cpu")
-        return result
+        # cpu_offload keeps the ~24GB Gemma backbone resident on CPU and moves it to
+        # GPU only for the (sub-second) text encode, then back — so the 8-step denoise
+        # loop has the whole card free. This is what makes v2a fit 40GB in a persistent
+        # server (gemma permanently on GPU leaves no headroom and OOMs). See
+        # docs/LTX2.3-纯配音V2A-设计文档.md.
+        moved_to_gpu = self.cpu_offload and not gemma_on_cpu
+        try:
+            # The .to(GPU) is inside the guard on purpose: moving the ~24GB backbone is
+            # itself the largest allocation and can OOM mid-transfer, leaving some params
+            # already on GPU. Entering the try before it ensures the finally still runs.
+            if moved_to_gpu:
+                self.text_encoder = self.text_encoder.to(AI_DEVICE)
+            result = []
+            for prompt in prompts:
+                v_context, a_context, _ = self.text_encoder(prompt)
+                if gemma_on_cpu:
+                    v_context = v_context.to(AI_DEVICE)
+                    a_context = a_context.to(AI_DEVICE)
+                result.append((v_context, a_context))
+            return result
+        finally:
+            # Restore in a finally so a failed/OOM'd move-or-encode never leaves the
+            # ~24GB Gemma backbone (fully or partially) stranded on GPU. The persistent
+            # worker's failure cleanup clears scheduler/cache but not the text encoder,
+            # so without this the worker would stay poisoned and OOM every next request.
+            # .to("cpu") is device-agnostic, so it also pulls back a partial GPU move.
+            if moved_to_gpu:
+                self.text_encoder = self.text_encoder.to("cpu")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     def infer(
         self,

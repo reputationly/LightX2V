@@ -118,6 +118,14 @@ class LTX2Runner(DefaultRunner):
         self.video_vae, self.audio_vae = self.load_vae()
         if self.config.get("use_upsampler", False):
             self.upsampler = self.load_upsampler()
+        # Release the caching-allocator memory reserved during load (transient
+        # .to(GPU) doubling of the text encoder, block-offload buffer init, etc.).
+        # In a persistent server this reserved-but-unused block otherwise inflates
+        # idle VRAM by several GB and eats the headroom the first inference needs —
+        # end_run() only reclaims it AFTER a successful run, so a first-request OOM
+        # never gets there. Reclaiming here keeps idle at the true resident size.
+        torch_device_module.empty_cache()
+        gc.collect()
 
     def load_transformer(self, use_distilled_lora=False):
         ltx2_model_kwargs = {

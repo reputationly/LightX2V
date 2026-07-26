@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import time
 from pathlib import Path
@@ -110,6 +111,21 @@ class TorchrunInferenceWorker:
             error_msg = str(e)
             error_type = type(e).__name__
             logger.exception(f"Rank {self.rank} inference failed: {error_msg}")
+            # A failed task (e.g. CUDA OOM) leaves scheduler latents, text-encoder
+            # outputs and reserved allocator memory on the GPU because run_main's
+            # end_run() is skipped on exception. In a persistent worker that
+            # "poisons" the process — every subsequent task then OOMs. Run the same
+            # teardown end_run() does so the GPU returns to idle after any failure.
+            try:
+                self.runner.end_run()
+            except Exception as cleanup_err:
+                logger.warning(f"Rank {self.rank} post-failure end_run cleanup raised: {cleanup_err}")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
 
         if self.world_size > 1:
             self.dist_manager.barrier()
