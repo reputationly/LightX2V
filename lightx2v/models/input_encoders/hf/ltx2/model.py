@@ -147,18 +147,21 @@ class LTX2TextEncoder:
             List of tuples, each containing (v_context, a_context) tensors for each prompt.
         """
         gemma_on_cpu = os.environ.get("LTX_GEMMA_ON_CPU", "") == "1"
-        # cpu_offload keeps the ~24GB Gemma backbone resident on CPU and moves it to
-        # GPU only for the (sub-second) text encode, then back — so the 8-step denoise
-        # loop has the whole card free. This is what makes v2a fit 40GB in a persistent
-        # server (gemma permanently on GPU leaves no headroom and OOMs). See
-        # docs/LTX2.3-纯配音V2A-设计文档.md.
-        moved_to_gpu = self.cpu_offload and not gemma_on_cpu
+        # cpu_offload keeps the 28.6GB (15.36B-param bf16) Gemma backbone resident on CPU
+        # and streams it to the GPU one submodule at a time for the (sub-second) text
+        # encode — see GemmaTextEncoder._run_text_model_layerwise_on_gpu. This is what
+        # makes v2a fit a 40GB card in a persistent server: the whole backbone on GPU
+        # peaks 38.85GB in gemma's forward alone and leaves no room for the DiT denoise,
+        # so it OOMs; streaming keeps only the module in flight resident, measured 3.96GB
+        # encode peak and 0.02GB retained once it returns. Transfers go through page-locked
+        # homes (pinned lazily on first stream) so each round trip is ~15-20 GB/s, not
+        # pageable ~2 GB/s. See docs/LTX2.3-纯配音V2A-设计文档.md.
+        layerwise = self.cpu_offload and not gemma_on_cpu
+        # Drive the encoder's per-submodule streaming from cpu_offload (env fallback keeps
+        # the offline precompute path working). Off when LTX_GEMMA_ON_CPU forces a full
+        # CPU run whose contexts are moved to GPU below.
+        self.text_encoder.pinned_layerwise = layerwise
         try:
-            # The .to(GPU) is inside the guard on purpose: moving the ~24GB backbone is
-            # itself the largest allocation and can OOM mid-transfer, leaving some params
-            # already on GPU. Entering the try before it ensures the finally still runs.
-            if moved_to_gpu:
-                self.text_encoder = self.text_encoder.to(AI_DEVICE)
             result = []
             for prompt in prompts:
                 v_context, a_context, _ = self.text_encoder(prompt)
@@ -168,15 +171,12 @@ class LTX2TextEncoder:
                 result.append((v_context, a_context))
             return result
         finally:
-            # Restore in a finally so a failed/OOM'd move-or-encode never leaves the
-            # ~24GB Gemma backbone (fully or partially) stranded on GPU. The persistent
-            # worker's failure cleanup clears scheduler/cache but not the text encoder,
-            # so without this the worker would stay poisoned and OOM every next request.
-            # .to("cpu") is device-agnostic, so it also pulls back a partial GPU move.
-            if moved_to_gpu:
-                self.text_encoder = self.text_encoder.to("cpu")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            # A failed/OOM'd encode can strand the module it was mid-stream on (at most one
+            # ~1GB layer) on GPU. The persistent worker's failure cleanup clears the
+            # scheduler/cache but not the text encoder, so reclaim any stranded weights here
+            # to keep the worker from accumulating GPU memory across requests.
+            if layerwise:
+                self.text_encoder.restore_offloaded()
 
     def infer(
         self,
@@ -223,6 +223,10 @@ class LTX2TextEncoder:
             logger.warning("Text encoder does not have expected structure. Skipping LoRA application.")
             return False
 
+        # LoRA rebinds feature_extractor .weight tensors. Under pinned-layerwise streaming
+        # the page-lock lives on each tensor's own .data (not a side table), so the rebound
+        # post-LoRA weights simply arrive unpinned and _stream_to_gpu re-pins them on first
+        # use — no home invalidation needed here.
         encoder_model = self.text_encoder
 
         if not hasattr(encoder_model, "feature_extractor"):
