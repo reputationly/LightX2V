@@ -10,6 +10,10 @@ MASTER_PORT=${MASTER_PORT:-29533}
 NPROC_PER_NODE=${NPROC_PER_NODE:-4}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+# Without this the server defaults its cache to <package>/server_cache, i.e. it writes
+# inside the code tree -- rank 0 dies with EROFS if the tree is mounted read-only.
+export LIGHTX2V_CACHE_DIR=${LIGHTX2V_CACHE_DIR:-/var/lib/lightx2v/server_cache}
+mkdir -p "${LIGHTX2V_CACHE_DIR}"
 
 eval "$(
 python3 - "${ASSET_MANIFEST}" <<'PY'
