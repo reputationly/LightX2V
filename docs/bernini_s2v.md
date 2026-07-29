@@ -57,12 +57,28 @@ immediate successor. The correction is opt-in, applies only to the first clip of
 a `drop_first_motion` run (the only place the seam exists), and is enabled in the
 Bernini A100 production config.
 
-## Output length
+## Output length — capped at one clip
 
-`num_repeat` is null in the production config, so the output follows the audio.
-Setting it to an integer caps the number of 80-frame clips and silently shortens
-the result — the audio mux uses `-shortest`. The runner logs a warning naming
-both durations when that happens.
+`num_repeat` is pinned to 1, so a request produces one 80-frame clip (~5 s at 16
+fps) regardless of how long the audio is.
+
+This is a limitation, not a preference: **the multi-clip path is broken for
+Bernini.** Setting `num_repeat` to null on 2026-07-29 produced a 3-clip run in
+which clip 1 was correct and clips 2 and 3 decoded to smeared, unusable frames
+(see the smoke run below). Only single-clip runs have ever been validated for
+this model — every experiment in the Bernini handover notes used `num_repeat: 1`.
+
+Clip 1 is the only clip with `drop_motion_frames` set, so it is also the only
+clip with no framepack motion tokens. The failure therefore appears when motion
+tokens and Bernini context tokens are in the sequence together. Their relative
+ordering is exactly what the handover notes flag as unverified: only "append
+context after the video tokens" was ever implemented, and the official Bernini
+entry points assign `source_id` and sequence order differently. That is a
+hypothesis, not a diagnosis — the multi-clip path needs its own investigation.
+
+Because the cap truncates audio silently (the mux uses `-shortest`), the runner
+logs a warning naming both the covered and the required duration whenever a
+configured `num_repeat` is shorter than the audio.
 
 ## Start the 4xA100 service
 
@@ -89,9 +105,7 @@ The repository-built image was verified on four A100 40 GB GPUs with the
 production config above. The run completed at 832x448, 16 fps, with audio, and
 peaked at 39,679 MiB per GPU.
 
-That run was a **single clip** (`num_repeat` was 1 at the time). Multi-clip runs
-are the same code path but have not been measured; see the expert residency cost
-above.
+That run was a **single clip**.
 
 NFS assets:
 
@@ -111,3 +125,28 @@ Verified output and extracted first frames:
 The stabilized first two decoded frames measured YAVG 57.17 and 57.17. The
 previous bright transition frame measured YAVG 62.03, so the boundary spike is
 removed without changing the remaining generated sequence or audio timing.
+
+## Smoke run 2026-07-29 (multi-clip)
+
+Four A100 40 GB, this repository's `lightx2v` tree mounted over the base image,
+`num_repeat` temporarily null, 15.05 s audio, seed 42. Recorded because it is the
+run that established the multi-clip limitation above.
+
+| | |
+|---|---|
+| Clips | 3 (121 s, 130 s, 130 s end-to-end) |
+| Expert loads | 24 across 4 ranks = 2 per clip per rank, as designed |
+| Peak memory | **40,437 MiB of 40,960 MiB** — ~500 MiB headroom, ~700 MiB above the single-clip run |
+| Output | 832x448, 16 fps, 237 frames (14.81 s) with a 14.65 s audio track |
+| First two frames | YAVG 57.1697 / 57.1676 — stabilization confirmed end-to-end |
+| Clip 1 | correct: identity, glasses, shirt, boom mic, glass, lava lamp, lit shelf all follow the reference |
+| Clips 2-3 | **smeared and unusable** |
+
+```text
+/nfs-data/bernini_s2v_out/smoke_20260729/
+```
+
+The memory number matters independently of the multi-clip defect: motion tokens
+add ~7% to the sequence (32,760 vs 30,576 tokens) and that is enough to take a
+40 GB card to within ~500 MiB of its limit. Any future multi-clip fix has to be
+checked against that ceiling, not just against correctness.
