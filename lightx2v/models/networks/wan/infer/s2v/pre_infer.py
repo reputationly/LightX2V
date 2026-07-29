@@ -18,6 +18,9 @@ class WanS2VPreInfer(WanPreInfer):
         self.text_len = config["text_len"]
         self.add_last_motion = config.get("add_last_motion", True)
         self.zero_timestep = config.get("zero_timestep", True)
+        self.use_context_latents = config.get("s2v_context_latents", False)
+        self.use_ref_token = config.get("s2v_ref_token", True)
+        self.rope_theta = config.get("rope_theta", 10000.0)
         # Wan model.py builds RoPE table in float64; base WanPreInfer uses float32.
         head_size = config["dim"] // config["num_heads"]
         self.freqs = torch.cat(
@@ -49,6 +52,15 @@ class WanS2VPreInfer(WanPreInfer):
             torch.pow(10000, -torch.arange(half, device=position.device, dtype=torch.float64).div(half)),
         )
         return torch.cat([torch.cos(sinusoid), torch.sin(sinusoid)], dim=1).float()
+
+    def _source_id_rot(self, source_id, freqs):
+        """Return the Bernini per-source rotary phase for a context stream."""
+        complex_dim = freqs.shape[-1]
+        dim = 2 * complex_dim
+        scale = torch.arange(0, dim, 2, dtype=torch.float64, device=freqs.device) / dim
+        theta = torch.tensor(self.rope_theta, dtype=torch.float64, device=freqs.device)
+        angle = float(source_id) / torch.pow(theta, scale)
+        return torch.polar(torch.ones_like(angle), angle).view(1, 1, 1, complex_dim)
 
     def _compute_time_embed(self, weights, t):
         with torch.amp.autocast("cuda", dtype=torch.float32):
@@ -110,28 +122,53 @@ class WanS2VPreInfer(WanPreInfer):
         original_grid_sizes = deepcopy(grid_sizes)
         grid_sizes_list = [[torch.zeros_like(grid_sizes), grid_sizes, grid_sizes]]
 
-        ref_input = ref_latents if ref_latents.dim() == 5 else ref_latents.unsqueeze(0)
-        ref = weights.patch_embedding.apply(ref_input)
-        batch_size = ref.size(0)
-        height, width = ref.shape[3], ref.shape[4]
-        ref_grid_sizes = [
-            [
-                torch.tensor([30, 0, 0], device=x.device).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([31, height, width], device=x.device).unsqueeze(0).repeat(batch_size, 1),
-                torch.tensor([1, height, width], device=x.device).unsqueeze(0).repeat(batch_size, 1),
+        # Output/audio and timestep modulation have different boundaries for
+        # Bernini. Context tokens are not decoded or audio-injected, but they do
+        # use the current diffusion timestep (unlike native S2V ref/motion).
+        target_seq_len = seq_lens[0].item()
+        ctx_spans = []
+        if self.use_context_latents:
+            for source_id, latent in enumerate(s2v.get("context_latents") or [], start=1):
+                ctx_input = latent if latent.dim() == 5 else latent.unsqueeze(0)
+                ctx = weights.patch_embedding.apply(ctx_input)
+                ctx_grid = torch.tensor([list(ctx.shape[2:])], dtype=torch.long, device=x.device)
+                ctx = ctx.flatten(2).transpose(1, 2)
+                grid_sizes_list.append([torch.zeros_like(ctx_grid), ctx_grid, ctx_grid])
+                ctx_start = x.size(1)
+                x = torch.cat([x, ctx], dim=1)
+                seq_lens = seq_lens + torch.tensor([ctx.size(1)], dtype=torch.long, device=x.device)
+                ctx_spans.append((ctx_start, x.size(1), source_id))
+
+        timestep_seq_len = x.size(1)
+
+        if self.use_ref_token:
+            ref_input = ref_latents if ref_latents.dim() == 5 else ref_latents.unsqueeze(0)
+            ref = weights.patch_embedding.apply(ref_input)
+            batch_size = ref.size(0)
+            height, width = ref.shape[3], ref.shape[4]
+            ref_grid_sizes = [
+                [
+                    torch.tensor([30, 0, 0], device=x.device).unsqueeze(0).repeat(batch_size, 1),
+                    torch.tensor([31, height, width], device=x.device).unsqueeze(0).repeat(batch_size, 1),
+                    torch.tensor([1, height, width], device=x.device).unsqueeze(0).repeat(batch_size, 1),
+                ]
             ]
-        ]
-        ref = ref.flatten(2).transpose(1, 2)
-        original_seq_len = seq_lens[0].item()
-        seq_lens = seq_lens + torch.tensor([ref.size(1)], dtype=torch.long, device=x.device)
-        grid_sizes_list = grid_sizes_list + ref_grid_sizes
-        x = torch.cat([x, ref], dim=1)
+            ref = ref.flatten(2).transpose(1, 2)
+            seq_lens = seq_lens + torch.tensor([ref.size(1)], dtype=torch.long, device=x.device)
+            grid_sizes_list += ref_grid_sizes
+            x = torch.cat([x, ref], dim=1)
 
         mask_input = [torch.zeros([1, x.shape[1]], dtype=torch.long, device=AI_DEVICE)]
-        mask_input[0][:, original_seq_len:] = 1
+        mask_input[0][:, target_seq_len:] = 1
 
         b, s, n, d = x.size(0), x.size(1), self.config["num_heads"], self.dim // self.config["num_heads"]
         pre_compute_freqs = rope_precompute(x.detach().view(b, s, n, d), grid_sizes_list, self.freqs, start=None)
+        for ctx_start, ctx_end, source_id in ctx_spans:
+            # Out-of-place on purpose: rope_precompute returns a view_as_complex over
+            # x.to(float64). That only decouples from x because x is bf16/fp32 and .to()
+            # copies -- a float64 x would alias the hidden states and an in-place multiply
+            # would corrupt them.
+            pre_compute_freqs[:, ctx_start:ctx_end] = pre_compute_freqs[:, ctx_start:ctx_end] * self._source_id_rot(source_id, pre_compute_freqs)
         x_list = [x]
         pre_compute_freqs = [pre_compute_freqs]
 
@@ -153,7 +190,10 @@ class WanS2VPreInfer(WanPreInfer):
         x = torch.cat(x_list, dim=0)
         pre_compute_freqs = torch.cat(pre_compute_freqs, dim=0)
         mask_input = torch.cat(mask_input, dim=0)
-        x = x + weights.trainable_cond_mask.apply(mask_input).to(x.dtype)
+        cond_mask = weights.trainable_cond_mask.apply(mask_input).to(x.dtype)
+        for ctx_start, ctx_end, _ in ctx_spans:
+            cond_mask[:, ctx_start:ctx_end] = 0
+        x = x + cond_mask
 
         if self.zero_timestep:
             t = torch.cat([t, torch.zeros([1], dtype=t.dtype, device=t.device)])
@@ -164,7 +204,7 @@ class WanS2VPreInfer(WanPreInfer):
             zero_e0 = embed0[-1:]
             embed0 = embed0[:-1]
             embed0 = torch.cat([embed0.unsqueeze(2), zero_e0.unsqueeze(2).repeat(embed0.size(0), 1, 1, 1)], dim=2)
-            embed0 = [embed0, original_seq_len]
+            embed0 = [embed0, timestep_seq_len]
         else:
             embed0 = embed0.unsqueeze(2).repeat(1, 1, 2, 1)
             embed0 = [embed0, 0]
@@ -186,8 +226,17 @@ class WanS2VPreInfer(WanPreInfer):
             grid_sizes=GridOutput(tensor=original_grid_sizes, tuple=tuple(original_grid_sizes[0].tolist())),
             freqs=pre_compute_freqs,
             seq_lens=seq_lens,
-            original_seq_len=original_seq_len,
+            original_seq_len=timestep_seq_len,
             merged_audio_emb=merged_audio_emb,
             audio_emb_global=audio_emb_global,
-            s2v_extra={"grid_sizes": grid_sizes_list, "context_lens": None},
+            s2v_extra={
+                "grid_sizes": grid_sizes_list,
+                "context_lens": None,
+                # "global_original_seq_len" is the output/audio boundary and is now always
+                # set here -- consumers (transformer_infer.infer, apply_audio_inject) read it
+                # with original_seq_len as fallback, so that fallback is no longer reached.
+                # Anything that changes original_seq_len must set this too or the two drift.
+                "global_original_seq_len": target_seq_len,
+                "target_seq_len": target_seq_len,
+            },
         )

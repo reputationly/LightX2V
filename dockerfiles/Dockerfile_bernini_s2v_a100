@@ -1,0 +1,15 @@
+ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-20260625-0256-2cde4721
+FROM ${BASE_IMAGE}
+
+WORKDIR /opt/LightX2V
+
+# Keep the Python runtime internally consistent. The A100 base image can lag
+# behind the repository, so copying only the Bernini-touched modules may mix
+# incompatible LightX2V revisions.
+COPY lightx2v lightx2v
+COPY configs/wan22/a100/bernini_s2v_moe_4gpu.json configs/wan22/a100/bernini_s2v_moe_4gpu.json
+COPY configs/wan22/bernini_s2v_assets_nfs.json configs/wan22/bernini_s2v_assets_nfs.json
+COPY scripts/server/start_bernini_s2v_a100.sh scripts/server/start_bernini_s2v_a100.sh
+COPY docs/bernini_s2v.md docs/bernini_s2v.md
+
+RUN chmod +x scripts/server/start_bernini_s2v_a100.sh

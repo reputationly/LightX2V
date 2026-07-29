@@ -14,7 +14,7 @@ from torchvision import transforms
 from lightx2v.models.input_encoders.hf.wan.s2v.audio_encoder import AudioEncoder
 from lightx2v.models.networks.wan.s2v_model import WanS2VModel
 from lightx2v.models.networks.wan.s2v_utils import get_size_less_than_area
-from lightx2v.models.runners.wan.wan_runner import WanRunner
+from lightx2v.models.runners.wan.wan_runner import MultiModelStruct, WanRunner
 from lightx2v.models.schedulers.wan.s2v.s2v_scheduler import WanS2VScheduler
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import GET_DTYPE
@@ -199,6 +199,15 @@ class WanS2VRunner(WanRunner):
             num_repeat = audio_num_repeat
         else:
             num_repeat = int(cfg_repeat)
+            if num_repeat < audio_num_repeat:
+                # The muxed track is cut with -shortest, so a capped num_repeat silently
+                # returns a video shorter than the audio the caller sent. Say so.
+                clip_seconds = self.config["infer_frames"] / self.config["target_fps"]
+                logger.warning(
+                    f"num_repeat={num_repeat} caps this request at {num_repeat * clip_seconds:.1f}s; "
+                    f"the audio needs {audio_num_repeat} clips ({audio_num_repeat * clip_seconds:.1f}s) "
+                    f"and will be truncated. Set num_repeat to null to follow the audio."
+                )
 
         model_pic = crop_op(resize_op(Image.fromarray(ref_image)))
 
@@ -251,6 +260,27 @@ class WanS2VRunner(WanRunner):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         return images
+
+    def stabilize_first_frame(self, video):
+        """Replace the VAE boundary frame with its immediate successor.
+
+        Causal Wan VAE decoding can leave a one-frame bright/ghosted transition
+        where the prepended reference latent meets the generated latent stream.
+        This opt-in correction changes only 1/fps seconds and keeps the full
+        output duration and audio timeline intact.
+
+        The seam only exists on the first clip of a drop_first_motion run, where
+        the ref latent is what gets prepended before decoding. Without
+        drop_first_motion the first clip decodes [motion_latents, latents] and
+        frame 0 is an ordinary frame, so leave it alone.
+        """
+        if not self.config.get("s2v_stabilize_first_frame", False) or video.shape[2] < 2:
+            return video
+        if not self.config["drop_first_motion"]:
+            return video
+        video = video.clone()
+        video[:, :, 0] = video[:, :, 1]
+        return video
 
     def run_dit_clip(self, dit_inputs):
         infer_steps = self.scheduler.infer_steps
@@ -340,6 +370,8 @@ class WanS2VRunner(WanRunner):
                             "add_last_motion": 2,
                         },
                     }
+                    if self.config.get("s2v_context_latents", False):
+                        dit_inputs["s2v"]["context_latents"] = [ref_latents]
 
                     with ProfilingContext4DebugL2("Run DiT"):
                         latents = self.run_dit_clip(dit_inputs)
@@ -354,6 +386,8 @@ class WanS2VRunner(WanRunner):
                     image = image[:, :, -infer_frames:]
                     if drop_first_motion and r == 0:
                         image = image[:, :, 3:]
+                    if r == 0:
+                        image = self.stabilize_first_frame(image)
 
                     overlap = min(motion_frames, image.shape[2])
                     image = image.to(AI_DEVICE)
@@ -422,3 +456,100 @@ class WanS2VRunner(WanRunner):
         if GET_RECORDER_MODE():
             monitor_cli.lightx2v_worker_request_success.inc()
         return result
+
+
+class S2VMultiModelStruct(MultiModelStruct):
+    """Lazy single-resident high/low expert router for Wan2.2 S2V."""
+
+    def __init__(self, config, boundary, num_train_timesteps, paths, init_device):
+        super().__init__([None, None], config, boundary, num_train_timesteps)
+        self.paths = paths
+        self.init_device = init_device
+
+    @property
+    def device(self):
+        model = self.model[self.cur_model_index] if self.cur_model_index >= 0 else None
+        return model.device if model is not None else self.init_device
+
+    def _build(self, index):
+        tag = "HIGH" if index == 0 else "LOW"
+        logger.info(f"[s2v-moe] loading {tag}-noise expert from {self.paths[index]}")
+        model = WanS2VModel(self.paths[index], self.config, self.init_device)
+        model.set_scheduler(self.scheduler)
+        return model
+
+    def _free(self, index):
+        if self.model[index] is not None:
+            logger.info(f"[s2v-moe] releasing {'HIGH' if index == 0 else 'LOW'}-noise expert")
+            self.model[index] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    def get_current_model_index(self):
+        # Deliberately does NOT reproduce the parent's per-expert
+        # `scheduler.sample_guide_scale = config["sample_guide_scale"][index]`:
+        # WanS2VScheduler reads that key as a scalar (float(...)), so a per-expert
+        # list would fail at scheduler construction. WanS2VMoeRunner rejects a list
+        # up front; both experts therefore share one guidance scale.
+        index = 0 if self.scheduler.timesteps[self.scheduler.step_index] >= self.boundary_timestep else 1
+        self.cur_model_index = index
+        return index
+
+    def infer(self, inputs):
+        index = self.get_current_model_index()
+        if self.model[index] is None:
+            # Single-resident: release the other expert before building this one, so peak
+            # footprint stays at one expert. Cost is one full expert load from disk at each
+            # high->low crossing, i.e. two loads per clip. See docs/bernini_s2v.md.
+            self._free(1 - index)
+            self.model[index] = self._build(index)
+        self.model[index].infer(inputs)
+
+    # Residency is handled by build/free above, so the parent's model-level moves are
+    # never needed here -- and would hit None for the non-resident expert. Keep them
+    # harmless rather than letting a stray caller raise AttributeError.
+    def offload_cpu(self, model_index):
+        if self.model[model_index] is not None:
+            self.model[model_index].to_cpu()
+
+    def to_cuda(self, model_index):
+        if self.model[model_index] is not None:
+            self.model[model_index].to_cuda()
+
+
+@RUNNER_REGISTER("wan2.2_s2v_moe")
+class WanS2VMoeRunner(WanS2VRunner):
+    """Bernini-R-S2V dual-expert runner with explicit asset validation."""
+
+    def __init__(self, config):
+        # Before super(): DefaultRunner.__init__ builds WanS2VScheduler, which does
+        # float(config["sample_guide_scale"]) and would raise an opaque TypeError first.
+        if isinstance(config.get("sample_guide_scale"), (list, tuple)):
+            raise ValueError("wan2.2_s2v_moe shares one guidance scale across both experts; sample_guide_scale must be a scalar, not a per-expert list.")
+        # S2VMultiModelStruct overrides get_current_model_index and so never runs the
+        # parent's model-level to_cuda/offload_cpu dance. Under cpu_offload the experts
+        # are built on cpu (DefaultRunner.set_init_device) and would silently stay there.
+        # Block granularity is fine -- it offloads inside the resident expert.
+        if config.get("cpu_offload", False) and config.get("offload_granularity", "block") == "model":
+            raise ValueError("wan2.2_s2v_moe manages expert residency itself; use offload_granularity 'block', not 'model'.")
+        super().__init__(config)
+        self.high_noise_model_path = config.get("high_noise_original_ckpt") or os.path.join(config["model_path"], "high_noise_model")
+        self.low_noise_model_path = config.get("low_noise_original_ckpt") or os.path.join(config["model_path"], "low_noise_model")
+        self._validate_expert(self.high_noise_model_path, "high")
+        self._validate_expert(self.low_noise_model_path, "low")
+
+    @staticmethod
+    def _validate_expert(path, label):
+        required = ["config.json", "diffusion_pytorch_model.safetensors.index.json", "non_block.safetensors"]
+        required.extend(f"block_{index}.safetensors" for index in range(40))
+        missing = [name for name in required if not os.path.exists(os.path.join(path, name))]
+        if missing:
+            preview = ", ".join(missing[:5])
+            raise FileNotFoundError(f"{label}-noise S2V expert is incomplete at {path}: {preview}")
+
+    def load_transformer(self):
+        boundary = self.config.get("boundary", 0.875)
+        num_train_timesteps = self.config.get("num_train_timesteps", 1000)
+        paths = {0: self.high_noise_model_path, 1: self.low_noise_model_path}
+        logger.info(f"[s2v-moe] high={paths[0]} low={paths[1]} boundary={boundary}")
+        return S2VMultiModelStruct(self.config, boundary, num_train_timesteps, paths, self.init_device)
