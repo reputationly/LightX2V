@@ -1,0 +1,26 @@
+{
+    "raw_model": "/nfs-data/models/Bernini-R-S2V",
+    "high_noise_model": "/nfs-data/models/Bernini-R-S2V-lx2v-high",
+    "low_noise_model": "/nfs-data/models/Bernini-R-S2V-lx2v-low",
+    "shared_s2v_model": "/nfs-data/models/Wan2.2-S2V-14B",
+    "output_root": "/nfs-data/bernini_s2v_out",
+    "required_shared_assets": [
+        "Wan2.1_VAE.pth",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "google/umt5-xxl",
+        "wav2vec2-large-xlsr-53-english/config.json",
+        "wav2vec2-large-xlsr-53-english/preprocessor_config.json"
+    ],
+    "runtime_linked_assets": [
+        "Wan2.1_VAE.pth",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "google",
+        "wav2vec2-large-xlsr-53-english"
+    ],
+    "runtime_probes": [
+        "Wan2.1_VAE.pth",
+        "models_t5_umt5-xxl-enc-bf16.pth",
+        "google/umt5-xxl",
+        "wav2vec2-large-xlsr-53-english/preprocessor_config.json"
+    ]
+}
