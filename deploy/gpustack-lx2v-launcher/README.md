@@ -44,14 +44,16 @@ the `gpustack-lx2v-launcher` block added to `Dockerfile_aarch64_app`).
 - **z_image** — ready: `profiles.yaml` points at
   `configs/z_image/z_image_a100_sage.json` (infer_steps=9, sage_attn2,
   enable_cfg=false, rope=torch — A100-safe).
-- **wan2.2_moe (4-card int8)** — `profiles.yaml` has a **TODO placeholder**: the
-  A100 int8 4-card ulysses config is not yet in `configs/`. Create it and update
-  the `config_json` path before deploying wan. The parallel mesh **must** live in
-  that config JSON's `"parallel"` block (e.g.
-  `{"seq_p_size": 4, "cfg_p_size": 1, "seq_p_attn_type": "ulysses"}`) — the engine
-  reads `config["parallel"]`, and top-level CLI args do NOT configure
-  parallelism. The launcher only runs `torchrun --nproc_per_node=N` and validates
-  the GPU count; it does not (and cannot) inject the mesh via CLI.
+- **wan2.2_moe (4-card int8)** — T2V uses
+  `configs/deploy/wan22_t2v_int8_4card_a100.json`.
+- **wan2.2_moe_distill (4-card int8)** — I2V and FLF2V are separate variants
+  selected by `--task i2v` / `--task flf2v`. FLF2V uses
+  `configs/deploy/wan22_flf2v_int8_4card_a100.json`, fixing the accepted
+  four-step `sample_shift=16` baseline at native 16fps (no RIFE).
+
+Every multi-GPU config carries its real `"parallel"` mesh in JSON. The launcher
+only runs `torchrun --nproc_per_node=N` and validates the GPU count; it does not
+and cannot inject the mesh via top-level CLI arguments.
 
 ## Smoke test (standalone, no GPUStack)
 
