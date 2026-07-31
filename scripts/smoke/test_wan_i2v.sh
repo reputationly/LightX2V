@@ -21,6 +21,10 @@ INT8="$NFS8/Wan2.2-I2V-720p-int8"
 IMAGE="${IMAGE:-/opt/LightX2V/assets/inputs/imgs/girl.png}"
 PROMPT="${PROMPT:-A young woman gently turns her head and smiles, hair softly moving in the breeze, warm natural light, cinematic, shallow depth of field}"
 SEED="${SEED:-42}"; FRAMES="${FRAMES:-81}"
+INFER_STEPS="${INFER_STEPS:-4}"
+SAMPLE_SHIFT="${SAMPLE_SHIFT:-5.0}"
+BOUNDARY_STEP_INDEX="${BOUNDARY_STEP_INDEX:-2}"
+DENOISING_STEPS="${DENOISING_STEPS:-1000,750,500,250}"
 TASK="${TASK:-i2v}"                # i2v=单图; flf2v=首尾帧(需配 LAST_FRAME 尾帧图)
 LAST_FRAME="${LAST_FRAME:-}"       # flf2v 尾帧图路径(i2v 留空)
 NEG_PROMPT="${NEG_PROMPT:-}"
@@ -38,17 +42,23 @@ mkdir -p "$CFGDIR" "$RUNDIR"
 # ---- 生成三套配置(基于你们能跑通的 int8-torchao 配方 + 官方 i2v 结构)----
 gen_cfg(){  # $1=变体 -> 回显配置路径
   local v=$1 out="$CFGDIR/wan_i2v_720p_${v}.json"
-  python3 - "$v" "$out" "$DISTILL" "$INT8" <<'PY'
+  python3 - "$v" "$out" "$DISTILL" "$INT8" "$INFER_STEPS" "$SAMPLE_SHIFT" "$BOUNDARY_STEP_INDEX" "$DENOISING_STEPS" <<'PY'
 import json,sys
 v,out,distill,int8=sys.argv[1:5]
+infer_steps=int(sys.argv[5])
+sample_shift=float(sys.argv[6])
+boundary_step_index=int(sys.argv[7])
+denoising_steps=[int(value) for value in sys.argv[8].split(",") if value]
+if len(denoising_steps) != infer_steps:
+    raise ValueError(f"infer_steps={infer_steps}, but got {len(denoising_steps)} denoising steps")
 c={
- "infer_steps":4,"target_video_length":81,"text_len":512,
+ "infer_steps":infer_steps,"target_video_length":81,"text_len":512,
  "target_height":720,"target_width":1280,   # 720p面积; 仅当请求体传 resize_mode=null(RES=720)时才走这条 max_area 路径算出832×1104, 否则server默认adaptive=480p
  "self_attn_1_type":"sage_attn2","cross_attn_1_type":"sage_attn2","cross_attn_2_type":"sage_attn2",
- "sample_guide_scale":[3.5,3.5],"sample_shift":5.0,"enable_cfg":False,
+ "sample_guide_scale":[3.5,3.5],"sample_shift":sample_shift,"enable_cfg":False,
  "cpu_offload":False,"t5_cpu_offload":True,"vae_cpu_offload":False,
- "use_image_encoder":False,"boundary_step_index":2,
- "denoising_step_list":[1000,750,500,250],"rope_type":"torch",
+ "use_image_encoder":False,"boundary_step_index":boundary_step_index,
+ "denoising_step_list":denoising_steps,"rope_type":"torch",
 }
 if v.startswith("bf16"):
     # bf16 装不下40G -> offload; Wan MoE 必须用 "model" 粒度(一次换一个28.5G专家); "block" 会黑屏
@@ -74,7 +84,7 @@ run(){  # $1=变体 $2=卡数
   echo; echo "######### Wan2.2-I2V 720p [$v] (np=$np) #########"
   if ! NAME="wan-$TASK-$v" MODEL_CLS=wan2.2_moe_distill TASK="$TASK" MODEL_PATH="$BASE" CFG="$cfg" \
     PROMPT="$PROMPT" NEG_PROMPT="$NEG_PROMPT" IMAGE="$IMAGE" LAST_FRAME="$LAST_FRAME" OUT="$RUNDIR/${v}_s${SEED}.mp4" \
-    NP="$np" FRAMES="$FRAMES" SEED="$SEED" STEPS=4 RESIZE_MODE="${RESIZE_MODE:-}" \
+    NP="$np" FRAMES="$FRAMES" SEED="$SEED" STEPS="$INFER_STEPS" RESIZE_MODE="${RESIZE_MODE:-}" \
     bash "$HARNESS"; then
     echo "!! 用例 [$v] 失败"; FAILED="$FAILED $v"
   fi

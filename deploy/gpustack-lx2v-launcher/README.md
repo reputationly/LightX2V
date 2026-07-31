@@ -50,23 +50,6 @@ the `gpustack-lx2v-launcher` block added to `Dockerfile_aarch64_app`).
   selected by `--task i2v` / `--task flf2v`. FLF2V uses
   `configs/deploy/wan22_flf2v_int8_4card_a100.json`, fixing the accepted
   four-step `sample_shift=16` baseline at native 16fps (no RIFE).
-- **seedvr2 (1-card / 4-card)** — same segmentation either way; the 4-card
-  variant (`configs/seedvr/a100/seedvr2_3b_segp4.json`, `seg_p_size: 4`) deals
-  segments round-robin across ranks for bit-identical output (PSNR inf vs
-  1-card). Speedup tracks input length, not GPU count: `segments /
-  ceil(segments / 4)`, so clips of ≤121 frames gain nothing (they run pinned to
-  rank 0). Deploy it with `gpu_selector.gpus_per_replica: 4`; `model_cls` and
-  `task` are both inferred from the model directory name, so no backend
-  parameters are needed. Two things the profile cannot enforce: the request's
-  input video path has to be reachable *inside* the instance container (worker
-  `EXTRA_MOUNTS`), and only one replica may run per box — four working ranks
-  hold ~145G of host RAM and a second concurrent request would double it.
-  The boundary frames cross ranks over gloo, not NCCL, so that a rank dying
-  mid-segment fails the request instead of hanging its neighbours past the
-  watchdog and taking the instance with them. Set `sr_tail_transport: "file"`
-  in the config to route them through the scratch dir instead — the sender then
-  never waits at all, at the cost of a ~200 MiB write and read per segment
-  boundary on whatever backs the output directory.
 
 Every multi-GPU config carries its real `"parallel"` mesh in JSON. The launcher
 only runs `torchrun --nproc_per_node=N` and validates the GPU count; it does not

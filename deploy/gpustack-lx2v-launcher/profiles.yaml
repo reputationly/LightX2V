@@ -72,9 +72,9 @@ wan2.2_moe:
 # (without them the launcher infers t2v from the path and fails loudly).
 # FLF2V uses the same weights but a separate task/profile so sample_shift=16
 # stays a startup-time production setting rather than a per-request override.
-# Like T2V/I2V, it generates at native 16fps and applies RIFE post-processing
-# to output 32fps by default. Clients can explicitly request target_fps=16 to
-# keep the native frames without interpolation.
+# Its first production profile intentionally outputs native 16fps: the accepted
+# visual baseline was calibrated without RIFE, so interpolation must be reviewed
+# separately instead of silently changing the result during rollout.
 wan2.2_moe_distill:
   variants:
     - name: wan2.2-i2v/int8-4card
@@ -178,35 +178,6 @@ seedvr2:
       gpus: 1
       task: sr
       config_json: /opt/LightX2V/configs/seedvr/a100/seedvr2_3b_seg121.json
-    # 4-card segment data parallelism: the same segmentation as the 1-card
-    # variant, with the segments dealt round-robin across ranks and only the
-    # 8-frame cross-fade boundary sent rank-to-rank. Output is BIT-IDENTICAL to
-    # 1-card (PSNR inf, measured) because each segment's noise is keyed on
-    # (seed, global segment index) rather than drawn from the global RNG.
-    # Speedup is segments/ceil(segments/4), so it is a function of INPUT LENGTH:
-    # ≤121 frames = 1 segment = no gain (the request is pinned to rank 0);
-    # 122-234 = 2; 235-347 = 3; 348-460 = 4.
-    # Measured on 4×A100-40G against THIS config, warm server, 24 requests from
-    # 832x480 and 1344x768 sources (both land on 1920x1104 -- SR resizes to the
-    # target first, so the source resolution costs nothing): 124f 96s /
-    # 243f 121-126s / 362f 137-143s, peak 31.9G VRAM per card out of 40.9G.
-    # That 78% is the binding constraint and it is set by sr_segment_length
-    # alone -- not by clip length, source resolution, or how many segments a
-    # rank owns, which are all released between segments (seg 48 measured 20.2G
-    # peak, +48% wall). A higher target resolution needs seg length lowered.
-    # Host RAM runs ~145G of 251G with four ranks working, so requests MUST stay
-    # serialized: server/task_manager.py's single _processing_lock is the only
-    # thing enforcing that. Never place a second replica on the same box.
-    # No video_frame_interpolation block on purpose: RIFE's global target-frame
-    # grid is a real sequential dependency across segments, so enabling it makes
-    # the runner fall back to rank 0 and throw away all four cards. It is inert
-    # in the 1-card config too (target_fps 16 is never > source fps).
-    - name: seedvr2-3b/seg121-4card
-      gpus: 4
-      task: sr
-      config_json: /opt/LightX2V/configs/seedvr/a100/seedvr2_3b_segp4.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seg_p_size: 4
 
 # Wan2.2 VACE video editing, atomic tier (task=vace): single-card offload,
 # int8-triton, 4-step Lightning LoRA (13× speedup, P8/P9), native 720p + RIFE
