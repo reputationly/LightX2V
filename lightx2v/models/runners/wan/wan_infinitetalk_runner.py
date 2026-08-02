@@ -1,3 +1,4 @@
+import ctypes
 import gc
 import math
 import os
@@ -7,6 +8,7 @@ import tempfile
 import imageio_ffmpeg as ffmpeg
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -108,6 +110,12 @@ class InfiniteTalkRunner(WanRunner):
         self.video_audio_path = None
         self.cond_video_temp_path = None
         self.cond_video_duration = None
+        self.rank0_input_encoding_enabled = self._compute_rank0_input_encoding()
+        if self.rank0_input_encoding_enabled:
+            world_size = dist.get_world_size()
+            local_world_size = int(os.getenv("LOCAL_WORLD_SIZE", world_size))
+            if local_world_size != world_size:
+                raise RuntimeError("INFINITETALK_RANK0_ENCODERS currently requires single-node torchrun because non-zero ranks read rank0-local transcoded reference-video paths.")
 
     def init_scheduler(self):
         self.scheduler = InfiniteTalkScheduler(self.config)
@@ -122,12 +130,40 @@ class InfiniteTalkRunner(WanRunner):
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
         self.model = self.load_transformer()
+        # Text/audio preprocessing is identical on every sequence-parallel rank.
+        # Keep one copy of these CPU-heavy encoders and broadcast their outputs.
+        # T5 loading itself contains rank-0 weight broadcasts, so every rank must
+        # participate in the same collective order. Non-zero ranks can release the
+        # completed module immediately because request-time encoding runs on rank 0.
         self.text_encoders = self.load_text_encoder()
+        if self.rank0_input_encoding_enabled and not is_main_process():
+            self.text_encoders = None
+            gc.collect()
         self.image_encoder = self.load_image_encoder()
         self.vae_encoder, self.vae_decoder = self.load_vae()
-        self.audio_encoder = self.load_audio_encoder()
+        self.audio_encoder = self.load_audio_encoder() if not self.rank0_input_encoding_enabled or is_main_process() else None
         self.vfi_model = None
         self.vsr_model = None
+
+    def _compute_rank0_input_encoding(self):
+        # Lazy/unload mode may reload T5 through distributed weight collectives at
+        # request time, so it must retain the legacy all-rank encoder path.
+        return (
+            dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+            and os.getenv("INFINITETALK_RANK0_ENCODERS", "0") == "1"
+            and not self.config.get("lazy_load", False)
+            and not self.config.get("unload_modules", False)
+        )
+
+    def _input_broadcast_group(self):
+        group = self.input_broadcast_group
+        if group is None:
+            raise RuntimeError("Rank-0 InfiniteTalk encoding requires the server Gloo input broadcast group.")
+        if dist.get_backend(group) != "gloo":
+            raise RuntimeError(f"InfiniteTalk input broadcast group must use Gloo, got {dist.get_backend(group)}")
+        return group
 
     def load_transformer(self):
         return WanInfiniteTalkModel(self.config["model_path"], self.config, self.init_device)
@@ -493,8 +529,88 @@ class InfiniteTalkRunner(WanRunner):
         masks = F.interpolate(masks.unsqueeze(0), size=(latent_h, latent_w), mode="nearest").squeeze(0)
         return (masks > 0).float().to(AI_DEVICE)
 
+    def _broadcast_encoder_tensor(self, tensor):
+        """Broadcast one encoder tensor over long-timeout Gloo, preserving device type."""
+        rank = dist.get_rank()
+        group = self._input_broadcast_group()
+        metadata = [(tuple(tensor.shape), tensor.dtype, tensor.device.type)] if rank == 0 else [None]
+        dist.broadcast_object_list(metadata, src=0, group=group)
+        shape, dtype, device_type = metadata[0]
+
+        if rank == 0:
+            # Gloo broadcasts CPU tensors. Device copies preserve dtype/bits and
+            # keep the platform-wide default NCCL timeout untouched.
+            staging = tensor.detach().contiguous().cpu()
+        else:
+            staging = torch.empty(shape, dtype=dtype, device="cpu")
+        dist.broadcast(staging, src=0, group=group)
+
+        if device_type == "cpu":
+            return staging
+        result = staging.to(AI_DEVICE)
+        del staging
+        return result
+
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_s2v(self):
+        if not self.rank0_input_encoding_enabled:
+            return self._run_input_encoder_local_s2v_impl()
+
+        rank = dist.get_rank()
+        group = self._input_broadcast_group()
+        inputs = None
+        payload = [None]
+        if rank == 0:
+            try:
+                inputs = self._run_input_encoder_local_s2v_impl()
+                payload[0] = {
+                    "ok": True,
+                    "input_data": self.input_data,
+                    "cond_file_path": self.cond_file_path,
+                    "cond_video_duration": self.cond_video_duration,
+                    "src_h": self.src_h,
+                    "src_w": self.src_w,
+                    "target_h": self.target_h,
+                    "target_w": self.target_w,
+                    "prompt": self.input_info.prompt,
+                    "human_num": inputs["human_num"],
+                    "seed": inputs["seed"],
+                    "audio_count": len(inputs["full_audio_embs"]),
+                    "has_context_null": inputs["text_encoder_output"]["context_null"] is not None,
+                }
+            except Exception as exc:
+                payload[0] = {"ok": False, "error_type": type(exc).__name__, "error": str(exc)}
+
+        dist.broadcast_object_list(payload, src=0, group=group)
+        metadata = payload[0]
+        if not metadata["ok"]:
+            raise RuntimeError(f"Rank 0 InfiniteTalk encoder failed ({metadata['error_type']}): {metadata['error']}")
+
+        if rank != 0:
+            self.input_data = metadata["input_data"]
+            self.cond_file_path = metadata["cond_file_path"]
+            self.cond_video_temp_path = None
+            self.video_audio_path = None
+            self.cond_video_duration = metadata["cond_video_duration"]
+            self.src_h = metadata["src_h"]
+            self.src_w = metadata["src_w"]
+            self.target_h = metadata["target_h"]
+            self.target_w = metadata["target_w"]
+            self.input_info.prompt = metadata["prompt"]
+
+        context = self._broadcast_encoder_tensor(inputs["text_encoder_output"]["context"] if rank == 0 else None)
+        context_null = None
+        if metadata["has_context_null"]:
+            context_null = self._broadcast_encoder_tensor(inputs["text_encoder_output"]["context_null"] if rank == 0 else None)
+        full_audio_embs = [self._broadcast_encoder_tensor(inputs["full_audio_embs"][idx] if rank == 0 else None) for idx in range(metadata["audio_count"])]
+        return {
+            "text_encoder_output": {"context": context, "context_null": context_null},
+            "full_audio_embs": full_audio_embs,
+            "human_num": metadata["human_num"],
+            "seed": metadata["seed"],
+        }
+
+    def _run_input_encoder_local_s2v_impl(self):
         input_data = self._load_input_data()
         if self.input_info.prompt:
             input_data["prompt"] = self.input_info.prompt
@@ -691,10 +807,15 @@ class InfiniteTalkRunner(WanRunner):
     )
     def end_run_segment(self, segment_idx, latents):
         videos = self.run_vae_decoder(latents).cpu()
-        if self.is_first_segment:
-            self.gen_video_list.append(videos)
-        else:
-            self.gen_video_list.append(videos[:, :, self.current_motion_frames_num :])
+        # Every rank needs the decoded tail to condition the next segment, but only
+        # rank 0 saves or returns the completed video. Keeping every decoded segment
+        # on all ranks multiplies long-video host memory by the sequence-parallel
+        # world size and makes every rank perform the final concat/postprocess.
+        if is_main_process():
+            if self.is_first_segment:
+                self.gen_video_list.append(videos)
+            else:
+                self.gen_video_list.append(videos[:, :, self.current_motion_frames_num :])
 
         if segment_idx < self.video_segment_num - 1:
             self.cond_frame = videos[:, :, -self.motion_frame :].to(torch.float32).to(AI_DEVICE)
@@ -715,6 +836,9 @@ class InfiniteTalkRunner(WanRunner):
                 self.init_run_segment(segment_idx)
                 latents = self.run_segment(segment_idx)
                 self.end_run_segment(segment_idx, latents)
+
+        if not is_main_process():
+            return {"video": None}
 
         self.gen_video = torch.cat(self.gen_video_list, dim=2)[:, :, : self.expected_frames].to(torch.float32)
         return self.process_images_after_vae_decoder()
@@ -765,10 +889,38 @@ class InfiniteTalkRunner(WanRunner):
     def end_run(self):
         self._remove_video_audio_path()
         self._remove_cond_video_temp_path()
-        if hasattr(self, "inputs"):
-            del self.inputs
+
+        # The runner is persistent in server mode. Request-sized tensors left on
+        # self otherwise survive until the next request (decoded segments alone can
+        # be tens of GiB for long videos), even though the file response no longer
+        # needs them. A returned tensor remains alive through the result dictionary.
+        for attr in (
+            "inputs",
+            "input_data",
+            "full_audio_embs",
+            "cond_image",
+            "cond_frame",
+            "dit_inputs",
+            "gen_video_list",
+            "gen_video",
+            "gen_video_final",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        if self.scheduler is not None:
+            self.scheduler.clear()
+        self.input_info = None
         torch.cuda.empty_cache()
         gc.collect()
+        if os.getenv("INFINITETALK_MALLOC_TRIM", "0") == "1":
+            try:
+                # PyTorch's freed CPU tensors can remain in glibc arenas after a
+                # long request. Return those pages to the host once all request
+                # references have been removed. This is Linux/glibc-specific and
+                # therefore kept behind an explicit deployment switch.
+                ctypes.CDLL(None).malloc_trim(0)
+            except (AttributeError, OSError) as exc:
+                logger.warning(f"InfiniteTalk malloc_trim unavailable: {exc}")
 
     @ProfilingContext4DebugL1(
         "RUN pipeline",

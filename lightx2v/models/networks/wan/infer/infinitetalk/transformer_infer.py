@@ -1,8 +1,11 @@
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
+from lightx2v.models.networks.wan.infer.infinitetalk.audio_shard import local_audio_shard_indices
 from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
 from lightx2v.utils.envs import GET_DTYPE
 
@@ -53,6 +56,7 @@ class WanInfiniteTalkTransformerInfer(WanOffloadTransformerInfer):
         self.audio_attn_cu_seqlens_kv = None
         self.class_interval = config.get("infinitetalk_class_interval", 4)
         self.class_range = config.get("infinitetalk_class_range", 24)
+        self.use_local_audio_attn = os.getenv("INFINITETALK_LOCAL_AUDIO_ATTN", "0") == "1"
         self.rope_h1 = (0, self.class_interval)
         self.rope_h2 = (self.class_range - self.class_interval, self.class_range)
         self.rope_bak = int(self.class_range // 2)
@@ -101,7 +105,10 @@ class WanInfiniteTalkTransformerInfer(WanOffloadTransformerInfer):
             gate_msa,
         )
         x.add_(attn_out)
-        if self.config["seq_parallel"]:
+        use_local_audio_attn = self.config["seq_parallel"] and self.use_local_audio_attn and pre_infer_out.adapter_args.get("human_num", 1) == 1
+        if use_local_audio_attn:
+            audio_out = self.infer_local_audio_cross_attn(block.compute_phases[2], x, pre_infer_out)
+        elif self.config["seq_parallel"]:
             local_len = x.shape[0]
             token_count = self._seq_parallel_token_count(pre_infer_out)
             full_x = self._seq_parallel_gather_tokens(x)[:token_count]
@@ -111,6 +118,61 @@ class WanInfiniteTalkTransformerInfer(WanOffloadTransformerInfer):
             audio_out = self.infer_audio_cross_attn(block.compute_phases[2], x, pre_infer_out, x_ref_attn_map)
         y = self.infer_ffn(block.compute_phases[3], x, audio_out, c_shift_msa, c_scale_msa, c_gate_msa)
         return self.post_process(x, y, c_gate_msa, pre_infer_out)
+
+    def infer_local_audio_cross_attn(self, phase, x, pre_infer_out):
+        """Run frame-local audio attention on this sequence-parallel token shard.
+
+        Audio attention never mixes visual tokens from different video frames. The
+        old path nevertheless all-gathered all visual tokens and repeated the full
+        attention on every rank. Repack this rank's contiguous token shard into its
+        corresponding frames, pad only the two possible boundary frames, and discard
+        the padded query outputs after attention.
+        """
+        audio_embedding = pre_infer_out.adapter_args["audio_embedding"].to(device=x.device, dtype=GET_DTYPE())
+        grid_t, grid_h, grid_w = pre_infer_out.grid_sizes.tuple
+        spatial_tokens = grid_h * grid_w
+        token_count = int(grid_t * spatial_tokens)
+
+        local_len = x.shape[0]
+        rank = dist.get_rank(self.seq_p_group)
+        valid_len, frame_start, frame_end, frame_slots, spatial_offsets = local_audio_shard_indices(
+            token_count,
+            spatial_tokens,
+            local_len,
+            rank,
+            device=x.device,
+        )
+        if valid_len == 0:
+            return torch.zeros_like(x)
+
+        local_frames = frame_end - frame_start
+
+        x_norm = phase.norm_x.apply(x[:valid_len])
+        q = phase.q_linear.apply(x_norm).view(valid_len, self.num_heads, self.head_dim)
+        q_frames = q.new_zeros((local_frames, spatial_tokens, self.num_heads, self.head_dim))
+        q_frames[frame_slots, spatial_offsets] = q
+
+        local_audio = audio_embedding[frame_start:frame_end]
+        audio_tokens = local_audio.shape[1]
+        kv = phase.kv_linear.apply(local_audio.reshape(local_frames * audio_tokens, -1)).view(local_frames, audio_tokens, 2, self.num_heads, self.head_dim)
+        encoder_k, encoder_v = kv.unbind(dim=2)
+        cu_seqlens_q = torch.arange(0, (local_frames + 1) * spatial_tokens, spatial_tokens, dtype=torch.int32)
+        cu_seqlens_kv = torch.arange(0, (local_frames + 1) * audio_tokens, audio_tokens, dtype=torch.int32)
+        attn_out = phase.audio_attn.apply(
+            q=q_frames,
+            k=encoder_k,
+            v=encoder_v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_kv=cu_seqlens_kv,
+            max_seqlen_q=spatial_tokens,
+            max_seqlen_kv=audio_tokens,
+        )
+        attn_frames = attn_out.reshape(local_frames, spatial_tokens, -1)
+        local_attn_out = attn_frames[frame_slots, spatial_offsets]
+        projected = phase.proj.apply(local_attn_out)
+        output = torch.zeros_like(x)
+        output[:valid_len] = projected
+        return output
 
     def infer_self_attn(self, phase, x, shift_msa, scale_msa, pre_infer_out):
         cos_sin = self.cos_sin

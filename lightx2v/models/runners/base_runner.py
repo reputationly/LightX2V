@@ -17,6 +17,11 @@ class BaseRunner(ABC):
         self.config = config
         self.vae_encoder_need_img_original = False
         self.input_info = None
+        self.input_broadcast_group = None
+
+    def set_input_broadcast_group(self, group):
+        """Attach the server-owned CPU process group used for encoder outputs."""
+        self.input_broadcast_group = group
 
     def apply_disagg_request_overrides(self, config_modify):
         """Mirror flat disagg request fields into ``disagg_config`` in disagg mode only."""

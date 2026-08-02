@@ -24,5 +24,10 @@
     "seq_p_size": 4,
     "seq_p_attn_type": "ulysses"
   },
-  "fps": 16
+  "fps": 16,
+  "video_frame_interpolation": {
+    "algo": "rife",
+    "target_fps": 32,
+    "model_path": "/nfs-models/wuhanjisuan894/models/rife-model/flownet.pkl"
+  }
 }

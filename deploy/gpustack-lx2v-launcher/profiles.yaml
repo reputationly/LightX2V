@@ -72,9 +72,9 @@ wan2.2_moe:
 # (without them the launcher infers t2v from the path and fails loudly).
 # FLF2V uses the same weights but a separate task/profile so sample_shift=16
 # stays a startup-time production setting rather than a per-request override.
-# Its first production profile intentionally outputs native 16fps: the accepted
-# visual baseline was calibrated without RIFE, so interpolation must be reviewed
-# separately instead of silently changing the result during rollout.
+# Like T2V/I2V, it generates at native 16fps and applies RIFE post-processing
+# to output 32fps by default. Clients can explicitly request target_fps=16 to
+# keep the native frames without interpolation.
 wan2.2_moe_distill:
   variants:
     - name: wan2.2-i2v/int8-4card

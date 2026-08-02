@@ -56,6 +56,7 @@ class TorchrunInferenceWorker:
                 logger.info(f"Config:\n {config}")
 
             self.runner = init_runner(config)
+            self.runner.set_input_broadcast_group(self.dist_manager.task_pg)
             logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed")
 
             self.input_info = init_empty_input_info(args.task)
