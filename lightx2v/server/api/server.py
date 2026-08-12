@@ -132,7 +132,12 @@ class ApiServer:
 
             result = await generation_service.generate_with_stop_event(message, task_info.stop_event)
 
-            if result:
+            if task_info.stop_event.is_set():
+                # The denoise loop never observes stop_event, so a cancelled task
+                # runs to the end and still hands back a usable result. Drop it —
+                # cancel_task() already put the task in its terminal state.
+                logger.info(f"Task {task_id} finished after cancellation, discarding result")
+            elif result:
                 task_manager.complete_task(
                     task_id,
                     save_result_path=result.save_result_path or None,
@@ -141,12 +146,8 @@ class ApiServer:
                 )
                 logger.info(f"Task {task_id} completed successfully")
             else:
-                if task_info.stop_event.is_set():
-                    task_manager.fail_task(task_id, "Task cancelled during processing")
-                    logger.info(f"Task {task_id} cancelled during processing")
-                else:
-                    task_manager.fail_task(task_id, "Generation failed")
-                    logger.error(f"Task {task_id} generation failed")
+                task_manager.fail_task(task_id, "Generation failed")
+                logger.error(f"Task {task_id} generation failed")
 
         except Exception as e:
             logger.exception(f"Task {task_id} processing failed: {str(e)}")

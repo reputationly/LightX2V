@@ -171,13 +171,19 @@ class BaseGenerationService(ABC):
             task_data["seed"] = message.seed
             task_data["resize_mode"] = message.resize_mode
 
-            result = await self.inference_service.submit_task_async(task_data)
+            result = await self.inference_service.submit_task_async(task_data, stop_event=stop_event)
 
             if result is None:
                 if stop_event.is_set():
                     logger.info(f"Task {message.task_id} cancelled during processing")
                     return None
                 raise RuntimeError("Task processing failed")
+
+            if result.get("status") == "cancelled":
+                # check_stop() aborted the denoise loop; not an error, and the
+                # task is already in its terminal CANCELLED state.
+                logger.info(f"Task {message.task_id} cancelled during inference")
+                return None
 
             if result.get("status") == "success":
                 actual_save_path = self.file_service.get_output_path(message.save_result_path)
