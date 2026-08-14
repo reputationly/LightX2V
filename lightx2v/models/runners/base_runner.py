@@ -299,7 +299,14 @@ class BaseRunner(ABC):
         two per-step collectives into one.
 
         Every rank must reach this together — a rank aborting unilaterally would
-        hang the others on the next collective.
+        hang the others on the next collective. That premise fails under data
+        parallelism, where the ranks run different amounts of work: set
+        ``_rank_local_collectives`` for the duration and each rank decides on
+        its own flags instead, agreeing once at a rendezvous the owner arranges.
+        SeedVR segment parallelism does exactly that (see
+        ``SeedVRRunner._sr_seg_rendezvous``) — without it a request whose
+        segment count is not a multiple of the world size deadlocks here, since
+        the ranks holding no segment never reach the all-reduce.
         """
         rank, world_size = 0, 1
         if dist.is_initialized():
@@ -312,7 +319,7 @@ class BaseRunner(ABC):
         if hasattr(self, "pause_signal") and self.pause_signal:
             paused = 1
 
-        if world_size > 1:
+        if world_size > 1 and not getattr(self, "_rank_local_collectives", False):
             signals = torch.tensor([stopped, paused], dtype=torch.int32, device=AI_DEVICE)
             dist.all_reduce(signals, op=dist.ReduceOp.MAX)
             stopped, paused = int(signals[0].item()), int(signals[1].item())

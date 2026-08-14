@@ -5,16 +5,15 @@
   "infer_steps": 1,
   "fps": 16,
   "use_tiling_vae": true,
-  "vae_tile_size": 384,
+  "vae_tile_size": 512,
+  "vae_memory_limit_gb": 0,
   "cpu_offload": true,
   "offload_granularity": "model",
   "resize_mode": "adaptive",
   "color_fix": "gpu",
   "sr_segment_length": 121,
   "sr_overlap": 8,
-  "video_frame_interpolation": {
-    "algo": "rife",
-    "target_fps": 16,
-    "model_path": "/nfs-data/models/rife-model/flownet.pkl"
+  "parallel": {
+    "seg_p_size": 4
   }
 }

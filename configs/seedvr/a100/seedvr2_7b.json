@@ -12,5 +12,5 @@
   "resize_mode": "adaptive",
   "color_fix": "gpu",
   "sr_segment_length": 81,
-  "sr_overlap": 1
+  "sr_overlap": 8
 }

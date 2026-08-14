@@ -198,10 +198,24 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint:
     # the GPU count. These fields are ADVISORY — the engine reads the
     # real mesh from config["parallel"] in the config JSON (top-level CLI
     # args do not configure parallelism), so they must mirror it.
-    has_parallel = any(k in variant for k in ("cfg_p_size", "seq_p_size", "tensor_p_size"))
+    has_parallel = any(k in variant for k in ("cfg_p_size", "seq_p_size", "tensor_p_size", "seg_p_size"))
     prod = int(variant.get("cfg_p_size", 1)) * int(variant.get("seq_p_size", 1))
-    tp = int(variant.get("tensor_p_size", 0))
-    expected = tp if tp else prod
+    # A mesh field set to 1 means "not this axis", not "this axis, of size 1",
+    # so it must not win the choice below. Spelling the defaults out is the
+    # house style here -- the seq_p_size variants all carry `cfg_p_size: 1` --
+    # so a seg variant written as `seg_p_size: 4, tensor_p_size: 1` is exactly
+    # what someone would write, and reading TP as authoritative there would
+    # reject it for a "parallel product 1" it never claimed.
+    tp = int(variant.get("tensor_p_size", 1))
+    # seg_p_size (SeedVR segment data parallelism) is exclusive with the others:
+    # each rank owns whole segments and runs the model alone, so it sizes the
+    # mesh by itself rather than multiplying into the cfg/seq product.
+    sp = int(variant.get("seg_p_size", 1))
+    if sp > 1 and (tp > 1 or prod > 1):
+        # set_parallel_config asserts the same thing at boot; catching it here
+        # names the profile instead of dying inside torchrun 20 minutes later.
+        raise RuntimeError(f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: seg_p_size ({sp}) is exclusive with the tensor/seq/cfg meshes (tensor_p_size={tp}, cfg_p_size*seq_p_size={prod})")
+    expected = sp if sp > 1 else (tp if tp > 1 else prod)
     if has_parallel and expected != gpu_count:
         raise RuntimeError(f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: parallel product {expected} != gpu_count {gpu_count}")
     return variant

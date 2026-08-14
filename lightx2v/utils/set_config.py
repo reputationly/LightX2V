@@ -234,8 +234,28 @@ def set_config(args):
 def set_parallel_config(config):
     if config["parallel"]:
         tensor_p_size = config["parallel"].get("tensor_p_size", 1)
+        seg_p_size = config["parallel"].get("seg_p_size", 1)
 
-        if tensor_p_size > 1:
+        if seg_p_size > 1:
+            # Segment parallel (SeedVR SR): whole segments are the parallel axis,
+            # so the model is replicated and no mesh-aware layer is involved --
+            # the runner talks to the process group directly. Mutually exclusive
+            # with the tensor/seq/cfg meshes below, and asserted rather than
+            # assumed: this branch never reads cfg_p_size/seq_p_size, so a
+            # config cloned from a hybrid profile would boot happily on pure
+            # segment parallel while its JSON still advertised a 2D mesh --
+            # a deployed topology silently unlike the checked-in one.
+            cfg_p_size = config["parallel"].get("cfg_p_size", 1)
+            seq_p_size = config["parallel"].get("seq_p_size", 1)
+            assert tensor_p_size == 1 and cfg_p_size == 1 and seq_p_size == 1, (
+                f"seg_p_size ({seg_p_size}) is exclusive with the tensor/seq/cfg meshes, but got tensor_p_size={tensor_p_size}, cfg_p_size={cfg_p_size}, seq_p_size={seq_p_size}"
+            )
+            assert seg_p_size == dist.get_world_size(), f"seg_p_size ({seg_p_size}) must be equal to world_size ({dist.get_world_size()})"
+            config["tensor_parallel"] = False
+            config["seq_parallel"] = False
+            config["cfg_parallel"] = False
+            config["seg_parallel"] = True
+        elif tensor_p_size > 1:
             # Tensor parallel only: 1D mesh
             assert tensor_p_size == dist.get_world_size(), f"tensor_p_size ({tensor_p_size}) must be equal to world_size ({dist.get_world_size()})"
             config["device_mesh"] = init_device_mesh(AI_DEVICE, (tensor_p_size,), mesh_dim_names=("tensor_p",))
