@@ -718,20 +718,50 @@ class SeedVRRunner(DefaultRunner):
             video = video[:total_len]
         return video
 
-    def _run_sr_single_segment(self):
-        cached_input_info = self.input_info
-        self.init_run()
-        if self.config.get("compile", False) and hasattr(self.model, "comple"):
-            self.model.select_graph_for_compile(self.input_info)
+    def _run_sr_single_segment(self, seg_idx=0, seg_total=1):
+        """扩散一段。``seg_idx`` / ``seg_total`` 只用来把进度映射到整段任务。
 
-        segment_idx = 0
-        self.init_run_segment(segment_idx)
-        latents = self.run_segment(segment_idx)
-        self.gen_video = self.run_vae_decoder(latents)
-        self.end_run_segment(segment_idx)
-        raw_video = self.gen_video_final
-        self.end_run()
-        self.input_info = cached_input_info
+        每段都以 ``segment_idx=0`` 调 ``run_segment`` 是有意的：``end_run_segment``
+        按「是不是最后一段」决定释放 ``self.inputs``，而 SR 的每一段都在循环里重建
+        它（见 ``_run_sr_segments``），逐段释放才对。
+
+        代价是 ``run_segment`` 里那句进度上报按 ``segment_idx / video_segment_num``
+        折算，恒等于 100%——``init_run`` 每段又把 ``video_segment_num`` 重置回 1。
+        实测（9 段任务）：前 40 秒 0%，第一段做完直接跳满，再卡到结束。这里把回调
+        包一层，按「已完成段数 + 段内进度」重算百分比。
+
+        ``seg_idx`` / ``seg_total`` 是**本 rank 自己的**段序号与段数，不是全局的 ——
+        理由见 ``_run_sr_segments`` 里算 ``local_total`` 处的注释（只有 rank 0 上报，
+        用全局段号会让进度停在末尾附近）。
+        """
+        cached_input_info = self.input_info
+        cached_cb = self.progress_callback
+
+        if cached_cb is not None and seg_total > 1:
+
+            def _scaled(current, cap):
+                frac = (current / cap) if cap else 0.0
+                cached_cb(((seg_idx + frac) / seg_total) * 100.0, 100.0)
+
+            self.progress_callback = _scaled
+
+        try:
+            self.init_run()
+            if self.config.get("compile", False) and hasattr(self.model, "comple"):
+                self.model.select_graph_for_compile(self.input_info)
+
+            segment_idx = 0
+            self.init_run_segment(segment_idx)
+            latents = self.run_segment(segment_idx)
+            self.gen_video = self.run_vae_decoder(latents)
+            self.end_run_segment(segment_idx)
+            raw_video = self.gen_video_final
+            self.end_run()
+        finally:
+            # 恢复必须在 finally 里：包装过的回调若泄漏到下一段，段号就永远停在
+            # 这一段上；input_info 同理（原本在函数末尾恢复，异常路径会漏）。
+            self.progress_callback = cached_cb
+            self.input_info = cached_input_info
         return raw_video
 
     def _save_sr_segment_video(self, raw_video, output_path, fps):
@@ -1202,6 +1232,15 @@ class SeedVRRunner(DefaultRunner):
             # 后再发出。边界宽度按 segments 元组现算，不用 overlap 常量——
             # _build_sr_segments 可能因夹紧而给出更窄的边界。
             pending_tail = None
+            # 进度按**本 rank 自己的段序列**折算，不是全局段号：只有 rank 0 能上报
+            # （worker._attach_progress_callback 把其余 rank 的回调置空），而段的归属
+            # 是 idx % world —— 用全局段号的话，最后一段只要不归 rank 0（4 卡时 3/4
+            # 的概率），进度就永远停在末尾附近直到任务突然结束。段并行是均衡分配 +
+            # tail 交换同步的，本 rank 的局部进度是全局进度的良好估计，而且一定走得到
+            # 100%。rank 0 提前跑完不会显示「满了却没结束」：这里报的是 denoise 阶段，
+            # 门面还要按 PHASE_WEIGHTS 折进全局，后面还有 decode / save 继续推进。
+            local_total = sum(1 for i in range(len(segments)) if seg_world <= 1 or self._sr_segment_owner(i, seg_world) == seg_rank)
+            local_done = 0
             for idx, (start_idx, end_idx) in enumerate(segments):
                 if seg_world > 1 and self._sr_segment_owner(idx, seg_world) != seg_rank:
                     continue
@@ -1210,7 +1249,8 @@ class SeedVRRunner(DefaultRunner):
                 self._sr_segment = (start_idx, end_idx)
                 self._sr_segment_index = idx
                 self.inputs = self.run_input_encoder()
-                raw = self._run_sr_single_segment()
+                raw = self._run_sr_single_segment(local_done, local_total)
+                local_done += 1
                 if seg_world > 1 and idx > 0:
                     # Posted after this rank's own diffusion so the two sides
                     # meet: the previous segment's owner was computing in
