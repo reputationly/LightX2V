@@ -34,3 +34,6 @@ lightx2v_train/output_infer/*
 .gitnexus
 # IDE-exported patch dumps (e.g. IntelliJ "导出补丁"), kept local only
 *.patch
+
+# 本地跑出来的视频/图片产物，只在机器上留一份
+outputs/
