@@ -914,6 +914,26 @@ class SeedVRRunner(DefaultRunner):
         if target_height <= 0 or target_width <= 0:
             return sample
 
+        # The config's target is a *tier* ("1080p" = 1920x1080), written landscape.
+        # It says how big, not which way round -- NaResize preserves the source
+        # aspect ratio, so a portrait clip arrives here portrait. Taken literally
+        # the landscape target can never satisfy the both-dimensions-exceed test
+        # below (a portrait frame is narrower than 1920), so it fell through to
+        # the interpolate at the end and got squashed into landscape: a 768x1344
+        # source came out 1920x1080 with the picture stretched flat.
+        #
+        # So pair the two numbers as long/short edge and hand them out by the
+        # source's own orientation. Landscape is unchanged (1080x1920), portrait
+        # becomes its mirror, and a square source -- which no swap can rescue,
+        # since either way one edge falls short -- collapses to the short edge.
+        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+        if self.ori_h > self.ori_w:
+            target_height, target_width = long_side, short_side
+        elif self.ori_w > self.ori_h:
+            target_height, target_width = short_side, long_side
+        else:
+            target_height = target_width = short_side
+
         height, width = sample.shape[-2:]
         if (height, width) == (target_height, target_width):
             return sample
@@ -924,10 +944,22 @@ class SeedVRRunner(DefaultRunner):
             logger.info(f"[SeedVRRunner] center crop SR output from {width}x{height} to {target_width}x{target_height}")
             return sample[..., top : top + target_height, left : left + target_width]
 
-        logger.info(f"[SeedVRRunner] resize SR output from {width}x{height} to {target_width}x{target_height}")
+        # Neither edge reaches the target -- a source wider than the target ratio
+        # (21:9, or any custom "W:H" the console lets operators add) comes out of
+        # NaResize short in height, because that step fits the frame to the
+        # target *area*. Resizing straight to (target_h, target_w) here is what
+        # squashed those clips; scale until the short edge is satisfied instead
+        # and let the long edge overshoot. Not cropping it back is deliberate:
+        # trimming a 21:9 frame to 1920 wide throws away a quarter of the
+        # picture, which is a worse trade than a long edge that isn't the
+        # nominal number. Even edges keep x264 happy.
+        scale = max(target_height / height, target_width / width)
+        new_height = int(round(height * scale)) & ~1
+        new_width = int(round(width * scale)) & ~1
+        logger.info(f"[SeedVRRunner] rescale SR output from {width}x{height} to {new_width}x{new_height}, keeping source aspect (target {target_width}x{target_height} does not fit)")
         dtype = sample.dtype
         device = sample.device
-        return F.interpolate(sample.float(), size=(target_height, target_width), mode="bilinear", align_corners=False).to(device=device, dtype=dtype)
+        return F.interpolate(sample.float(), size=(new_height, new_width), mode="bilinear", align_corners=False).to(device=device, dtype=dtype)
 
     def run_vae_decoder(self, latents):
         samples = self.vae_decoder.vae_decode(latents)
