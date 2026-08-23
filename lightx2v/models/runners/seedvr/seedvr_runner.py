@@ -107,6 +107,37 @@ class SeedVRRunner(DefaultRunner):
         self.pos_emb_path = os.path.join(model_path_base, "pos_emb.pt")
         self.neg_emb_path = os.path.join(model_path_base, "neg_emb.pt")
 
+    def _oriented_target(self):
+        """The config target, handed out by the source's own orientation.
+
+        The config states a *tier* ("1080p" = 1920x1080) and writes it landscape;
+        that is a notation, not a demand for landscape output. NaResize preserves
+        the source aspect ratio, so a portrait clip is still portrait downstream.
+        Pair the two numbers as long/short edge instead: landscape keeps them as
+        written, portrait mirrors them, square collapses to the short edge (no
+        swap can rescue square -- either way one edge falls short).
+
+        Both :meth:`_build_video_transform` and :meth:`_restore_target_size` must
+        read this same value. Computing it twice is what broke square sources:
+        the transform sized NaResize off the *config* target's area
+        (sqrt(1080*1920) = 1440) while the restore cropped to the *oriented*
+        target (1080x1080), so a 768x768 clip was scaled up to 1440x1440 and then
+        centre-cropped to 1080x1080 -- 180px off every edge, 44% of the frame
+        gone, which reads as the picture having been zoomed in. Landscape hid it
+        only because the two areas happen to agree there (1920x1104 -> 1920x1080
+        loses 2%).
+        """
+        target_height = int(self.config.get("target_height", 720) or 720)
+        target_width = int(self.config.get("target_width", 1280) or 1280)
+        if target_height <= 0 or target_width <= 0:
+            return target_height, target_width
+        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+        if self.ori_h > self.ori_w:
+            return long_side, short_side
+        if self.ori_w > self.ori_h:
+            return short_side, long_side
+        return short_side, short_side
+
     def _build_video_transform(self, img):
         from torchvision.transforms import Normalize
 
@@ -114,8 +145,9 @@ class SeedVRRunner(DefaultRunner):
         from lightx2v.models.video_encoders.hf.seedvr.data.image.transforms.na_resize import NaResize
         from lightx2v.models.video_encoders.hf.seedvr.data.video.transforms.rearrange import Rearrange
 
-        target_height = self.config.get("target_height", 720)
-        target_width = self.config.get("target_width", 1280)
+        # Size the upscale off the *oriented* target so the restore step below has
+        # nothing left to crop beyond the 16-alignment padding.
+        target_height, target_width = self._oriented_target()
         resolution = min((self.ori_h * self.ori_w) ** 0.5 * self.input_info.sr_ratio, (target_height * target_width) ** 0.5)
 
         # Run the transform on the accelerator, not on ``init_device``.
@@ -909,30 +941,11 @@ class SeedVRRunner(DefaultRunner):
     def _restore_target_size(self, sample):
         if self.config.get("resize_mode") == "adaptive":
             return sample
-        target_height = int(self.config.get("target_height", sample.shape[-2]) or sample.shape[-2])
-        target_width = int(self.config.get("target_width", sample.shape[-1]) or sample.shape[-1])
+        # Same oriented target the upscale was sized against -- see
+        # :meth:`_oriented_target` for why it must not be recomputed here.
+        target_height, target_width = self._oriented_target()
         if target_height <= 0 or target_width <= 0:
             return sample
-
-        # The config's target is a *tier* ("1080p" = 1920x1080), written landscape.
-        # It says how big, not which way round -- NaResize preserves the source
-        # aspect ratio, so a portrait clip arrives here portrait. Taken literally
-        # the landscape target can never satisfy the both-dimensions-exceed test
-        # below (a portrait frame is narrower than 1920), so it fell through to
-        # the interpolate at the end and got squashed into landscape: a 768x1344
-        # source came out 1920x1080 with the picture stretched flat.
-        #
-        # So pair the two numbers as long/short edge and hand them out by the
-        # source's own orientation. Landscape is unchanged (1080x1920), portrait
-        # becomes its mirror, and a square source -- which no swap can rescue,
-        # since either way one edge falls short -- collapses to the short edge.
-        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
-        if self.ori_h > self.ori_w:
-            target_height, target_width = long_side, short_side
-        elif self.ori_w > self.ori_h:
-            target_height, target_width = short_side, long_side
-        else:
-            target_height = target_width = short_side
 
         height, width = sample.shape[-2:]
         if (height, width) == (target_height, target_width):
