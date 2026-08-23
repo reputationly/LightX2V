@@ -118,6 +118,21 @@ class SeedVRRunner(DefaultRunner):
         target_width = self.config.get("target_width", 1280)
         resolution = min((self.ori_h * self.ori_w) ** 0.5 * self.input_info.sr_ratio, (target_height * target_width) ** 0.5)
 
+        # Run the transform on the accelerator, not on ``init_device``.
+        # ``set_init_device`` sends the *data* to CPU whenever cpu_offload is on
+        # (that switch is meant for model weights), which put this whole chain --
+        # a bicubic upscale plus an edge pad over every frame -- on one CPU core.
+        # Measured on 4xA100/aarch64, 96 frames 1344x768 -> 1920x1104: 43.7s on
+        # CPU versus 0.04s here, and the CPU figure swings by 20x run to run
+        # because it is competing for memory bandwidth with the other ranks.
+        #
+        # Uploading first also moves *less* data: the source resolution is 2.5x
+        # smaller than the upscaled result, so the host-to-device copy shrinks.
+        # The output stays on the device on purpose -- ``vae_encode`` would move
+        # it there anyway, and ``run_vae_decoder``'s color_fix="gpu" reads
+        # ``self._input`` straight off it instead of re-uploading per segment.
+        img = img.to(AI_DEVICE, non_blocking=True)
+
         img = NaResize(
             resolution=resolution,
             mode="area",

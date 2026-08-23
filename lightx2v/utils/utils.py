@@ -248,9 +248,14 @@ def save_to_video(
         # frames = (images * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
         frames = (images * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
 
-        # Convert RGB to BGR for OpenCV/FFmpeg
-        frames = frames[..., ::-1].copy()
-
+        # Frames are handed to ffmpeg as rgb24, which is the layout they already
+        # have. The previous `frames[..., ::-1].copy()` existed only to feed a
+        # bgr24 pipe: reversing the last axis makes the array negative-strided,
+        # so numpy has to materialise it element by element. On the 4xA100
+        # aarch64 boxes that single line cost 23-166s per segment (it varies
+        # wildly under memory-bandwidth contention between ranks) -- one capture
+        # caught a rank sitting in it for 8m47s. Asking ffmpeg for the layout we
+        # already hold removes the copy entirely instead of moving it elsewhere.
         N, height, width, _ = frames.shape
 
         # Ensure even dimensions for x264
@@ -270,7 +275,7 @@ def save_to_video(
                 "-s",
                 f"{int(width)}x{int(height)}",
                 "-pix_fmt",
-                "bgr24",
+                "rgb24",
                 "-r",
                 f"{fps}",
                 "-loglevel",
@@ -295,7 +300,7 @@ def save_to_video(
                 "-s",
                 f"{int(width)}x{int(height)}",
                 "-pix_fmt",
-                "bgr24",
+                "rgb24",
                 "-r",
                 f"{fps}",
                 "-loglevel",
