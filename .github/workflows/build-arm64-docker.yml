@@ -8,15 +8,16 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        # 2026-08-24 起默认切到 cu130 + Python 3.12 的 base(见
+        # 2026-08-24 起默认切到 cu130 + Python 3.12 base(见
         # dockerfiles/Dockerfile_aarch64_cu130 与 gpustack 仓
         # docs/cu130-py312-upgrade-2026-08-24.md)。
-        # 这里直接指 ACR:Docker Hub 上暂时还没有 cu130 base。代价是 runner 从 ACR
-        # 拉 23.6GB 比较慢(实测 17min vs 平时 3.5min);想恢复速度就先跑
-        # "Sync base image (ACR -> Docker Hub)" 流水线,再把这里改回 arronlee/ 前缀。
-        # 旧 cu128 base 仍可用,传 arronlee/lightx2v:arm64-cu128-a100-base 即可回滚。
-        description: "base 镜像(默认 cu130+py3.12,在 ACR;回滚传 arronlee/lightx2v:arm64-cu128-a100-base)"
-        default: "crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu130-a100-base"
+        # 该 base 已用 "Sync base image (ACR -> Docker Hub)" 同步到 Docker Hub,
+        # 所以这里用 arronlee/ 前缀——国外 runner 拉 Docker Hub 快得多
+        # (实测直接拉 ACR 要 17min,拉 Docker Hub 约 3.5min)。
+        # ⚠ 以后新出的 base 要先跑那条同步流水线,否则这里会拉到不存在的 tag。
+        # 回滚到 cu128:传 arronlee/lightx2v:arm64-cu128-a100-base
+        description: "base 镜像(默认 cu130+py3.12;回滚传 arronlee/lightx2v:arm64-cu128-a100-base)"
+        default: "arronlee/lightx2v:arm64-cu130-a100-base"
 
 permissions:
   contents: write
@@ -75,7 +76,7 @@ jobs:
           provenance: false
           sbom: false
           build-args: |
-            BASE_IMAGE=${{ github.event.inputs.base_image || 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu130-a100-base' }}
+            BASE_IMAGE=${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu130-a100-base' }}
           tags: |
             ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.version_tag }}
             ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
@@ -89,7 +90,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION_TAG: ${{ steps.image_tags.outputs.version_tag }}
           LATEST_TAG: ${{ steps.image_tags.outputs.latest_tag }}
-          BASE_IMAGE: ${{ github.event.inputs.base_image || 'crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu130-a100-base' }}
+          BASE_IMAGE: ${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu130-a100-base' }}
         shell: bash
         run: |
           cat > release-notes.md <<EOF
