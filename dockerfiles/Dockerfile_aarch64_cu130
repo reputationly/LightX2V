@@ -1,0 +1,331 @@
+# ============================================================
+# LightX2V ARM64 (aarch64) + CUDA 13.0 + Python 3.12 镜像 — A100 40G (sm_80) 专用
+# 由 Dockerfile_aarch64_cu128 逐行对应升级而来,便于 diff 审阅。
+# ------------------------------------------------------------
+# 与宿主机/现有镜像的对齐(实测基线,2026-08-24):
+#   宿主机     Ubuntu 22.04.3  glibc 2.35  内核 5.15.0-187  驱动 580.65.06 (CUDA 13.0)
+#   本镜像     Ubuntu 22.04    glibc 2.35  CUDA 13.0.3      Python 3.12
+#   vllm-omni  Ubuntu 22.04.5  glibc 2.35  CUDA 13.0        Python 3.12   ← 同款做法
+#   旧 cu128   Ubuntu 22.04.5  glibc 2.35  CUDA 12.8        Python 3.10
+#   → OS/glibc 与宿主机和全部现存镜像一致;只抬 CUDA 12.8→13.0、Python 3.10→3.12。
+#
+# 相对 cu128 版的改动(4 处实质变化):
+#   1. base:  nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+#          → nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04   (同为 ubuntu22.04,有 arm64)
+#   2. Python 3.10 → 3.12,用 deadsnakes PPA(与 vllm 官方镜像完全相同的做法,
+#      arm64 有 jammy 包:python3.12 3.12.13-1+jammy1)。为什么必须升:
+#        - ACE-Step-1.5 pyproject 声明 requires-python ">=3.11,<3.13",
+#          现有 acestep 镜像跑在本 base 的 3.10 上属于偏离上游;
+#        - Python 3.10 的安全支持 2026-10 结束;
+#        - av>=18 要求 >=3.11,留在 3.10 会被钉在旧版本;
+#        - 升完与 vllm-omni 镜像的 3.12 对齐。
+#      三仓交集(LightX2V >=3.10 / ACE-Step >=3.11,<3.13 / vllm-omni >=3.10,<3.14)
+#      唯一最优解就是 3.12。
+#
+#      ⚠ 本 base 不适用于 Bernini:Bernini/pyproject.toml 声明
+#      requires-python = ">=3.11,<3.12",只允许 3.11,拿这个 3.12 base 去构建
+#      会重蹈 Dockerfile.bernini 里 `--ignore-requires-python` 硬塞的老路
+#      (VeOmni 多卡 ulysses 风险#1)。Bernini 继续用现有 cu128 base。
+#   3. torch: --index-url .../whl/cu128 → .../whl/cu130
+#      (torch-2.11.0+cu130-cp312-manylinux_2_28_aarch64.whl 已确认存在)
+#   4. flash-attn: 2.7.4.post1 → 2.8.3(2.7.x 的 cutlass 不支持 CUDA 13)
+#   另:可选组件的 `|| echo skip` 静默兜底改为写构建报告(见文末 BUILD REPORT),
+#      避免 sgl-kernel/SpargeAttn/q8_kernels 编译失败被吞掉后照常出包。
+#
+# 不变:仍然只编 sm_80;不含 FA3(sm_90)、SageAttention3-blackwell(sm_120)、
+#      MagiAttention(sm_90)——A100 用不上,编了纯浪费时间。
+#
+# ⚠ 已知风险(实编才能确认):
+#   - decord 在 aarch64 无任何 wheel(PyPI 只有 x86/macOS/win),必须源码编,
+#     且上游 2021 年后停更 → 单独成层 + 记报告,不让它拖垮整层依赖安装。
+#     若失败,可借 Bernini 的 PyAV 垫片(scripts/smoke/native_shim/decord.py)。
+#   - flash-attn 2.8.3 / SageAttention / sgl-kernel 在 aarch64+cu13 下能否编过未验证。
+#
+# 构建(必须在 ARM64 + 有外网的机器上;GPU 节点无外网,CI runner 60min 超时编不完):
+#   --target base → bare CUDA+torch base,给 acestep 复用
+#   (默认)       → 完整 lightx2v 引擎镜像
+#   加 --pull 强制重新解析 manifest,避免命中错架构的旧缓存。
+#
+#   ⚠ 推 ACR 必须加 --provenance=false --sbom=false:
+#     阿里云 ACR 个人版不认 buildx 默认附带的证明清单(空描述符
+#     application/vnd.oci.empty.v1+json),否则所有层推完后在写 manifest 那步报
+#     "error from registry: unknown manifest class for application/vnd.oci.empty.v1+json"。
+#     (build-arm64-docker.yml 里对应的是 provenance: false / sbom: false)
+#   完整示例:
+#     docker build --platform linux/arm64 --provenance=false --sbom=false \
+#       -f dockerfiles/Dockerfile_aarch64_cu130 --target base \
+#       --build-arg MAX_JOBS=16 --build-arg FA_MAX_JOBS=4 \
+#       -t <ACR>/lightx2v:arm64-cu130-a100-base-test .
+# ============================================================
+
+FROM nvidia/cuda:13.0.3-cudnn-devel-ubuntu22.04 AS base
+
+WORKDIR /app
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+ENV PYTHONUNBUFFERED=1
+ENV LD_LIBRARY_PATH=/usr/local/lib/aarch64-linux-gnu:$LD_LIBRARY_PATH
+# 全局只编译 sm_80 (A100)
+ENV TORCH_CUDA_ARCH_LIST="8.0"
+# 编译并行度:每个 nvcc 进程约吃 2-4GB,按构建机可用内存设,别照抄。
+#   机房 ARM 机器(251G): 32-64
+#   Mac Docker Desktop  : 按分配给 Docker 的内存 / 4 估
+ARG MAX_JOBS=32
+ENV MAX_JOBS=${MAX_JOBS}
+# 构建报告:可选组件成败逐条记进来,出包后 `cat /opt/build-report.txt` 可查
+ENV BUILD_REPORT=/opt/build-report.txt
+
+# 系统依赖 + Python 3.12(deadsnakes,同 vllm 官方镜像做法)
+RUN mkdir -p /opt && touch "$BUILD_REPORT" && \
+    apt-get update && apt-get install -y software-properties-common ca-certificates gnupg && \
+    add-apt-repository -y ppa:deadsnakes/ppa && apt-get update && \
+    apt-get install -y \
+      python3.12 python3.12-dev python3.12-venv \
+      vim tmux zip unzip bzip2 wget git git-lfs build-essential libibverbs-dev \
+      curl iproute2 libsm6 libxext6 kmod ccache libnuma-dev libssl-dev \
+      libglib2.0-dev libjpeg-dev libpng-dev ffmpeg \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* && git lfs install
+
+# pip for 3.12(deadsnakes 不带 python3-pip;python3.12-venv 提供 ensurepip)
+RUN python3.12 -m ensurepip --upgrade || \
+    (curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && python3.12 /tmp/get-pip.py && rm -f /tmp/get-pip.py)
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -c "import sys; assert sys.version_info[:2]==(3,12), sys.version; print('python', sys.version.split()[0])"
+
+# PyTorch ARM64 + CUDA 13.0 (cp312)
+RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn requests -U && \
+    pip install --no-cache-dir torch==2.11.0 torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu130 && \
+    python -c "import torch; assert torch.version.cuda.startswith('13'), torch.version.cuda; \
+               print('torch', torch.__version__, 'cuda', torch.version.cuda)"
+
+# sglang sgl-kernel (FP8 GEMM, dit_quant_scheme=fp8-sgl 需要)
+# cu128 版这里是 `|| echo failed` 静默放行,现在把结果记进构建报告。
+RUN set +e; git clone https://github.com/sgl-project/sglang.git && cd sglang/sgl-kernel \
+    && make build && make clean; \
+    if python -c "import sgl_kernel" 2>/dev/null; then \
+      echo "sgl-kernel        : OK"   >> "$BUILD_REPORT"; \
+    else \
+      echo "sgl-kernel        : FAILED (fp8-sgl 不可用,回落 torchao)" >> "$BUILD_REPORT"; \
+    fi; exit 0
+
+# LightX2V 运行依赖(decord 单独拆出,见下)
+RUN pip install --no-cache-dir diffusers transformers tokenizers accelerate safetensors opencv-python numpy imageio \
+    imageio-ffmpeg einops loguru qtorch ftfy av matplotlib soundfile jsonschema modelscope \
+    prometheus_client gguf pydantic pyzmq librosa torchao
+
+# decord:aarch64 无 wheel 必须源码编,且上游停更、对 3.12 兼容性存疑。
+# 单独成层并记报告——编不过时其余依赖不受影响(视频读取可回落 av/opencv)。
+RUN set +e; pip install --no-cache-dir decord; \
+    if python -c "import decord" 2>/dev/null; then \
+      echo "decord            : OK"   >> "$BUILD_REPORT"; \
+    else \
+      echo "decord            : FAILED (视频读取需回落 av/opencv,验收时重点确认)" >> "$BUILD_REPORT"; \
+    fi; exit 0
+
+# flash-attention (sm_80 A100, 关闭 backward 加速编译)
+# 2.7.4.post1 的 cutlass 不支持 CUDA 13,升 2.8.3;PyPI 上 flash-attn 没有任何 wheel
+# (官方不发,ABI×CUDA×架构组合爆炸),第三方预编 wheel 只有 x86,aarch64 只能源码编。
+ENV FLASH_ATTN_CUDA_ARCHS="80"
+ENV FLASH_ATTENTION_DISABLE_BACKWARD="TRUE"
+# ⚠ flash-attn 的 nvcc 因模板实例化,单进程峰值可达 8-10GB —— 远高于其他扩展的 2-4GB。
+# 2026-08-24 实测:62G 内存 + MAX_JOBS=16 → ResourceExhausted (cannot allocate memory)。
+# 这里单独压低并行度,不动全局 MAX_JOBS(否则后面的层白白变慢)。
+# 取值:可用内存 / 10GB。62G→4;机房 251G 机器可给 16-24。
+ARG FA_MAX_JOBS=4
+RUN MAX_JOBS=${FA_MAX_JOBS} pip install --no-cache-dir flash-attn==2.8.3 --no-build-isolation && \
+    python -c "import flash_attn; print('flash_attn', flash_attn.__version__)"
+
+# SageAttention (sm_80 A100) — INT8 量化 attention,必须成功
+# 同样受 MAX_JOBS 支配,且这层是 && 链无兜底,OOM 会直接断掉整个构建 → 一并压低。
+RUN git clone https://github.com/thu-ml/SageAttention.git /opt/SageAttention && \
+    cd /opt/SageAttention && \
+    TORCH_CUDA_ARCH_LIST="8.0" MAX_JOBS=${FA_MAX_JOBS} EXT_PARALLEL=4 NVCC_APPEND_FLAGS="--threads 8" \
+    pip install --no-cache-dir --no-build-isolation -v -e . && \
+    python -c "from sageattention import sageattn; print('sageattention OK')"
+
+# SpargeAttn (sm_80 稀疏注意力) — 可选,记报告
+RUN set +e; git clone https://github.com/thu-ml/SpargeAttn.git --depth 1 \
+    && cd SpargeAttn && TORCH_CUDA_ARCH_LIST="8.0" pip install --no-cache-dir --no-build-isolation -v -e .; \
+    if python -c "import spas_sage_attn" 2>/dev/null; then \
+      echo "SpargeAttn        : OK"     >> "$BUILD_REPORT"; \
+    else \
+      echo "SpargeAttn        : FAILED" >> "$BUILD_REPORT"; \
+    fi; exit 0
+
+# q8_kernels (q8f INT8 可选路径, sm_80) — 可选,记报告
+RUN set +e; git clone https://github.com/KONAKONA666/q8_kernels.git --depth 1 \
+    && cd q8_kernels && git submodule init && git submodule update \
+    && TORCH_CUDA_ARCH_LIST="8.0" python setup.py install && rm -rf build; \
+    if python -c "import q8_kernels" 2>/dev/null; then \
+      echo "q8_kernels        : OK"     >> "$BUILD_REPORT"; \
+    else \
+      echo "q8_kernels        : FAILED" >> "$BUILD_REPORT"; \
+    fi; exit 0
+
+# ---------- decord 垫片(PyAV 实现)----------
+# 放在所有 CUDA 编译层之后:这层是纯文本写入,改它只重跑最后几层,
+# 不会触发 flash-attn/SageAttention 重编(那是 30 分钟起步)。
+#
+# 背景(2026-08-24 实测):
+#   - PyPI 的 decord 在 aarch64 上既无 wheel 也无 sdist,根本装不了。
+#   - 旧 cu128 镜像里 `import decord` 看似成功,实为 /opt/LightX2V/decord 这个
+#     **构建残留空目录**被当成 namespace package:属性数为 0,没有 VideoReader
+#     /cpu/bridge。危害是它让 `try: import decord / except: fallback` 的分支
+#     永远不走 fallback,拖到真正调用时才 AttributeError。
+#   - 本垫片提供 LightX2V 9 处 import 实际用到的 API 面,是净提升而非退步。
+#
+# 覆盖:VideoReader(get_avg_fps/__len__/get_batch/__getitem__/seek/next/
+#       get_frame_timestamp)、cpu()/gpu()、bridge.set_bridge("torch")。
+# 取舍:eager 全解码进内存(无 seek),与 LightX2V 自带的 _PyAVVideoReader
+#       (vace_processor.py)同款语义;长视频吃内存,扩帧压测时留意。
+RUN mkdir -p /opt/decord_shim && cat > /opt/decord_shim/decord.py <<'SHIM'
+"""decord 垫片:用 PyAV 实现 LightX2V 用到的最小 API 面(aarch64 无 decord wheel)。"""
+
+import av
+import numpy as np
+
+try:
+    import torch
+except Exception:  # torch 理论上一定在,防御性处理
+    torch = None
+
+_BRIDGE = "native"
+
+
+class _NDArray:
+    """native 桥接下的返回对象,提供 .asnumpy();torch 桥接下直接返回 tensor。"""
+
+    def __init__(self, arr):
+        self._arr = np.ascontiguousarray(arr)
+
+    def asnumpy(self):
+        return self._arr
+
+    def __array__(self):
+        return self._arr
+
+    def __len__(self):
+        return len(self._arr)
+
+    def __getitem__(self, i):
+        return self._arr[i]
+
+
+def _wrap(arr):
+    if _BRIDGE == "torch" and torch is not None:
+        return torch.from_numpy(np.ascontiguousarray(arr))
+    return _NDArray(arr)
+
+
+class VideoReader:
+    def __init__(self, video_path, num_threads=1, ctx=None, fault_tol=1, width=-1, height=-1, **kwargs):
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            rate = stream.average_rate
+            self._fps = float(rate) if rate else 16.0
+            self._frames = np.stack([f.to_ndarray(format="rgb24") for f in container.decode(video=0)])
+        self._idx = 0
+
+    def get_avg_fps(self):
+        return self._fps
+
+    def __len__(self):
+        return self._frames.shape[0]
+
+    def seek(self, pos):
+        self._idx = int(pos)
+        return None
+
+    def next(self):
+        frame = self._frames[self._idx]
+        self._idx += 1
+        return _wrap(frame)
+
+    def get_frame_timestamp(self, i):
+        return np.array([i / self._fps, (i + 1) / self._fps], dtype=np.float32)
+
+    def get_batch(self, frame_ids):
+        idx = np.clip(np.asarray(list(frame_ids), dtype=np.int64), 0, len(self) - 1)
+        return _wrap(self._frames[idx])
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return _wrap(self._frames[i])
+        return _wrap(self._frames[int(i)])
+
+
+class _Bridge:
+    @staticmethod
+    def set_bridge(name):
+        global _BRIDGE
+        _BRIDGE = name
+
+
+bridge = _Bridge()
+
+
+def cpu(index=0):
+    return None
+
+
+def gpu(index=0):
+    return None
+
+
+__version__ = "0.6.0+pyav-shim"
+SHIM
+# PYTHONPATH 前置,保证 import decord 命中垫片
+ENV PYTHONPATH=/opt/decord_shim:$PYTHONPATH
+RUN python -c "import decord; decord.bridge.set_bridge('torch'); from decord import VideoReader, cpu; print('decord shim OK', decord.__version__, '| VideoReader', bool(VideoReader), '| cpu', cpu(0) is None)" && \
+    echo "decord            : OK (PyAV shim, 非原生 decord)" >> "$BUILD_REPORT"
+
+# ---------- base 构建验收 ----------
+# 必须成功的组件硬断言(编不出来就不出包);可选组件打印报告。
+# cuda-compat 一并记录:留着它,混合驱动期(还有机器是 570)镜像仍能跑;
+# 驱动全升 580 后它不参与、零开销。缺了它才是隐患。
+RUN python - <<'PY'
+import sys, torch, flash_attn
+from sageattention import sageattn
+assert torch.version.cuda.startswith('13'), f"expect CUDA 13, got {torch.version.cuda}"
+assert sys.version_info[:2] == (3, 12), sys.version
+print('python     :', sys.version.split()[0])
+print('torch      :', torch.__version__, '| cuda', torch.version.cuda)
+print('flash_attn :', flash_attn.__version__)
+print('sageattn   : OK')
+PY
+RUN echo "python3.12/torch/flash_attn/sageattention : OK (hard-asserted)" >> "$BUILD_REPORT" && \
+    { dpkg -l 2>/dev/null | grep -q cuda-compat && echo "cuda-compat       : present ($(dpkg -l | awk '/cuda-compat/{print $3}'))" \
+      || echo "cuda-compat       : ABSENT (570 驱动机器将起不来,升级期务必确认)"; } >> "$BUILD_REPORT" && \
+    echo "===== BUILD REPORT =====" && cat "$BUILD_REPORT" && echo "========================"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
+
+# ============================================================
+# app stage — 叠 LightX2V 本体。
+# ============================================================
+FROM base AS app
+
+COPY . /opt/LightX2V
+RUN cd /opt/LightX2V && pip install --no-cache-dir -e . --no-deps
+
+# ⚠ 顺序要紧:decord 垫片必须排在 /opt/LightX2V 之前。
+# 旧 cu128 镜像正是因为 /opt/LightX2V 下有个构建残留的空 decord 目录,
+# 被当成 namespace package 劫持了 import(属性数 0,调用即崩)。
+# 这里写死两段路径,不要退化成 ENV PYTHONPATH=/opt/LightX2V(会覆盖 base 的设置)。
+ENV PYTHONPATH=/opt/decord_shim:/opt/LightX2V
+
+# 防御:若 build context 里混入了 decord 残留目录,直接删掉,避免重蹈覆辙
+# 注意:这里只验 decord 垫片,**不能** import lightx2v ——
+# lightx2v/__init__.py 会 import lightx2v_platform.set_ai_device,该模块在导入时
+# 就断言 CUDA 设备可用(RuntimeError: AI device for platform 'cuda' is not available)。
+# 构建机(尤其 Mac)没有 GPU,构建期 import lightx2v 必失败。lightx2v 本体只能运行时验。
+RUN rm -rf /opt/LightX2V/decord && \
+    python -c "import decord; print('app stage: decord ->', decord.__version__, '| shim file:', decord.__file__)"
+
+WORKDIR /workspace
+CMD ["/bin/bash"]
