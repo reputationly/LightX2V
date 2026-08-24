@@ -31,6 +31,14 @@ RUN printf '#!/bin/sh\nexec python /opt/LightX2V/deploy/gpustack-lx2v-launcher/g
  && chmod +x /usr/local/bin/gpustack-lx2v-launcher \
  && python -m py_compile /opt/LightX2V/deploy/gpustack-lx2v-launcher/gpustack_lx2v_launcher.py
 
-ENV PYTHONPATH=/opt/LightX2V
+# ⚠ 顺序要紧:decord 垫片必须排在 /opt/LightX2V 之前。
+#   - cu130 base(Dockerfile_aarch64_cu130)在 /opt/decord_shim 提供 PyAV 版 decord;
+#     aarch64 上 PyPI 的 decord 既无 wheel 也无 sdist,只能用垫片。
+#   - 旧 cu128 base 没有该目录,PYTHONPATH 里含不存在的路径无害,故两条 base 线通用。
+#   - 别退化成 ENV PYTHONPATH=/opt/LightX2V:会覆盖 base 的设置,使垫片失效。
+#   - /opt/LightX2V 下若有构建残留的空 decord 目录,会作为 namespace package 劫持
+#     import(属性数 0、调用即崩、还让 try/except fallback 失效),所以顺带删掉。
+RUN rm -rf /opt/LightX2V/decord
+ENV PYTHONPATH=/opt/decord_shim:/opt/LightX2V
 WORKDIR /workspace
 CMD ["/bin/bash"]
