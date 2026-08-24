@@ -812,7 +812,32 @@ class SeedVRRunner(DefaultRunner):
         return raw_video
 
     def _save_sr_segment_video(self, raw_video, output_path, fps):
-        video = wan_vae_to_comfy(raw_video).float().clamp(0.0, 1.0)
+        # Deliberately not ``wan_vae_to_comfy``: that helper permutes and then
+        # calls ``.cpu()`` straight away, so a 97-frame segment crosses to the
+        # host as ~2.4 GB of non-contiguous float over the pageable D2H path,
+        # and every subsequent step (.float(), .clamp(), the *255/to(uint8)
+        # inside save_to_video) runs single-threaded on the CPU because torchrun
+        # pins OMP_NUM_THREADS to 1.
+        #
+        # That is what makes SR erratic on these boxes. Measured on an idle
+        # 4xA100/aarch64 node, the same 603 MB payload took 0.44s / 0.96s /
+        # 5.96s / 72.18s over four consecutive pageable transfers -- a 164x
+        # spread -- while the pinned path held 0.037s every time. A 362-frame
+        # job jumps from 118s to 500s+ as soon as one of its four segments draws
+        # the slow end; a rank was caught sitting in that copy for 8m47s with
+        # its GPUs idle at 0%, no IO, no swap and no page reclaim.
+        #
+        # So do the same arithmetic here on the device, hand save_to_video a
+        # device tensor, and let it make the single crossing after the frames
+        # have been packed down to uint8 -- a quarter of the bytes, contiguous,
+        # through pinned memory.
+        video = raw_video.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
+        if video.ndim == 5:
+            b, c, t, h, w = video.shape
+            # [B, C, T, H, W] -> [B, T, H, W, C] -> [B*T, H, W, C]
+            video = video.permute(0, 2, 3, 4, 1).reshape(b * t, h, w, c)
+        else:
+            video = video.permute(0, 2, 3, 1)
         save_to_video(video, output_path, fps=fps, method="ffmpeg")
         del video
 

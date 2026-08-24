@@ -213,6 +213,37 @@ def diffusers_vae_to_comfy(vae_output: torch.Tensor) -> torch.Tensor:
     return vae_output.permute(0, 2, 3, 1).cpu()
 
 
+def _frames_to_host(frames: torch.Tensor):
+    """Bring a uint8 frame tensor to host memory through a pinned staging buffer.
+
+    ``.cpu()`` on a pageable destination makes the driver stage the transfer
+    through its own buffer and memcpy it in on the CPU. On the 4xA100/aarch64
+    boxes that path is pathological *and* erratic: the same idle 603 MB payload
+    measured 0.44s / 0.96s / 5.96s / 72.18s across four consecutive runs -- a
+    164x spread, 8 MB/s at its worst. The pinned copy is DMA'd straight in and
+    measured 0.037s (16 GB/s) on all four, no spread at all.
+
+    That variance is not academic: one SR segment is exactly this size, so a
+    362-frame job (4 segments) jumps from 118s to 500s+ the moment one segment
+    draws the slow end -- a rank was caught sitting in this very line for 8m47s
+    while its GPUs idled at 0% with no IO, no swap and no page reclaim.
+
+    Pinning is cheap to repeat: torch's CachingHostAllocator reuses the block
+    (first allocation ~0.5s, subsequent ones ~0). It is a finite resource
+    though, so fall back to the pageable copy rather than failing the job --
+    slower, never wrong.
+    """
+    if not frames.is_cuda:
+        return frames.numpy()
+    try:
+        host = torch.empty(frames.shape, dtype=frames.dtype, device="cpu", pin_memory=True)
+        host.copy_(frames)
+        # numpy() aliases the pinned buffer; the returned array keeps it alive.
+        return host.numpy()
+    except RuntimeError:
+        return frames.cpu().numpy()
+
+
 def save_to_video(
     images: torch.Tensor,
     output_path: str,
@@ -240,13 +271,13 @@ def save_to_video(
     if method == "imageio":
         # Convert to uint8
         # frames = (images * 255).cpu().numpy().astype(np.uint8)
-        frames = (images * 255).to(torch.uint8).cpu().numpy()
+        frames = _frames_to_host((images * 255).to(torch.uint8))
         imageio.mimsave(output_path, frames, fps=fps)  # type: ignore
 
     elif method == "ffmpeg":
         # Convert to numpy and scale to [0, 255]
         # frames = (images * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
-        frames = (images * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        frames = _frames_to_host((images * 255).clamp(0, 255).to(torch.uint8))
 
         # Frames are handed to ffmpeg as rgb24, which is the layout they already
         # have. The previous `frames[..., ::-1].copy()` existed only to feed a
