@@ -283,6 +283,34 @@ ENV PYTHONPATH=/opt/decord_shim:$PYTHONPATH
 RUN python -c "import decord; decord.bridge.set_bridge('torch'); from decord import VideoReader, cpu; print('decord shim OK', decord.__version__, '| VideoReader', bool(VideoReader), '| cpu', cpu(0) is None)" && \
     echo "decord            : OK (PyAV shim, 非原生 decord)" >> "$BUILD_REPORT"
 
+# ---------- q8_kernels(预编译 wheel,INT8 量化 GEMM)----------
+# 同样放在所有 CUDA 编译层之后:换 wheel 只重跑这一层,不触发 flash-attn 重编。
+#
+# 为什么用预编译 wheel 而不是在这里源码编译:
+#   上游 KONAKONA666/q8_kernels 不发 aarch64 wheel,且默认构建在 A100 上不可用,
+#   需要打 3 处 patch(cutlass 的 CUDA13 PFN 别名、setup.py 硬编码 sm_89、
+#   __init__.py 无条件 import models)。把这些 patch 固化进 Dockerfile 会让每次
+#   构建多几分钟、且 patch 要跟着上游漂移,所以改为一次性编好 wheel 挂在
+#   GitHub Release 上,构建时直接装。patch 细节见该 Release 的说明。
+#
+# A100 实测(sm_80):4096³ 相对误差 0.0124、加速 1.48x;8192×4096×4096 加速 1.54x。
+# ⚠ 小矩阵(如 512×1024×1024)结果错误且更慢,该 kernel 有最小规模门槛 ——
+#   若某模型 linear 维度偏小,走 int8-q8f 会得到错误结果。
+#
+# 消费者只有 LightX2V 的 int8-q8f / fp8-q8f 量化方案(默认不启用,需模型配置显式指定)。
+# acestep 继承本 base 时会带上这 26MB 但从不 import,无影响。
+# 注:A100 无 FP8 tensor core,fp8-q8f 拿不到硬件加速,实际可用的是 int8-q8f。
+#
+# 置空 Q8_WHEEL_URL 即可跳过安装。
+ARG Q8_WHEEL_URL=https://github.com/reputationly/LightX2V/releases/download/q8-kernels-a100-cu130/q8_kernels-0.0.0%2Ba100cu130-cp312-cp312-linux_aarch64.whl
+RUN if [ -n "${Q8_WHEEL_URL}" ]; then \
+      pip install --no-cache-dir "${Q8_WHEEL_URL}" && \
+      python -c "from q8_kernels.functional.linear import q8_linear, fp8_linear; print('q8_kernels OK')" && \
+      echo "q8_kernels        : OK (预编译 wheel, sm_80, INT8 4096³ 实测 1.48x)" >> "$BUILD_REPORT"; \
+    else \
+      echo "q8_kernels        : SKIPPED (Q8_WHEEL_URL 为空)" >> "$BUILD_REPORT"; \
+    fi
+
 # ---------- base 构建验收 ----------
 # 必须成功的组件硬断言(编不出来就不出包);可选组件打印报告。
 # cuda-compat 一并记录:留着它,混合驱动期(还有机器是 570)镜像仍能跑;
