@@ -18,7 +18,7 @@ RUN add-apt-repository -y ppa:ubuntuhandbook1/ffmpeg8 && apt-get update && apt-g
 
 RUN printf '[global]\nbreak-system-packages = true\n' > /etc/pip.conf
 
-RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn requests -U
+RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn python-multipart requests -U
 
 RUN apt-get remove -y python3-jwt && pip install vllm==0.23.0
 

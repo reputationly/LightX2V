@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y vim tmux zip unzip bzip2 wget git git-l
 
 RUN conda install conda-forge::ffmpeg=8.0.0 -y && conda clean -all -y
 
-RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn requests -U
+RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn python-multipart requests -U
 
 RUN git clone https://github.com/vllm-project/vllm.git && cd vllm \
     && python use_existing_torch.py && pip install --no-cache-dir -r requirements/build.txt \

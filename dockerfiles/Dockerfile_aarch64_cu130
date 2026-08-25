@@ -96,7 +96,7 @@ RUN python -m pip install --no-cache-dir --upgrade pip && \
     python -c "import sys; assert sys.version_info[:2]==(3,12), sys.version; print('python', sys.version.split()[0])"
 
 # PyTorch ARM64 + CUDA 13.0 (cp312)
-RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn requests -U && \
+RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn python-multipart requests -U && \
     pip install --no-cache-dir torch==2.11.0 torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu130 && \
     python -c "import torch; assert torch.version.cuda.startswith('13'), torch.version.cuda; \
