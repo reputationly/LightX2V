@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
 
 # PyTorch ARM64 + CUDA 12.8
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn requests -U && \
+    pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson fastapi uvicorn python-multipart requests -U && \
     pip install --no-cache-dir torch==2.11.0 torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 

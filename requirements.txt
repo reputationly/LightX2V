@@ -31,6 +31,7 @@ prometheus-client
 gguf
 fastapi
 uvicorn
+python-multipart
 PyJWT
 requests
 alibabacloud_dypnsapi20170525==1.2.2
