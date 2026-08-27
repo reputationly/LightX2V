@@ -22,7 +22,7 @@
     500,
     250
   ],
-  "rope_type": "torch",
+  "rope_type": "torch_real_rope",
   "boundary": 0.875,
   "dit_quantized": true,
   "dit_quant_scheme": "int8-triton",

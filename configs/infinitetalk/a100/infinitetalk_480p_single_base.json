@@ -35,5 +35,5 @@
     "offload_granularity": "block",
     "vae_cpu_offload": false,
     "clip_cpu_offload": false,
-    "rope_type": "torch"
+    "rope_type": "torch_real_rope"
 }

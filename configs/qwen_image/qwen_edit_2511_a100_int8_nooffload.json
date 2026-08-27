@@ -4,7 +4,7 @@
   "prompt_template_encode_start_idx": 64,
   "resize_mode": "adaptive",
   "attn_type": "torch_sdpa",
-  "rope_type": "torch",
+  "rope_type": "torch_real_rope",
   "enable_cfg": false,
   "sample_guide_scale": 4.0,
   "CONDITION_IMAGE_SIZE": 147456,

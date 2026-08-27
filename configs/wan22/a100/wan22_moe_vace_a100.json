@@ -18,7 +18,7 @@
     "vae_cpu_offload": true,
     "boundary": 0.9,
     "use_image_encoder": false,
-    "rope_type": "torch",
+    "rope_type": "torch_real_rope",
     "rope_chunk": true,
     "rope_chunk_size": 100
 }

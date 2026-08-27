@@ -24,7 +24,7 @@
     500,
     250
   ],
-  "rope_type": "torch",
+  "rope_type": "torch_real_rope",
   "dit_quantized": true,
   "high_noise_quantized_ckpt": "/nfs-data/models-int8/Wan2.2-I2V-720p-int8/high_noise",
   "low_noise_quantized_ckpt": "/nfs-data/models-int8/Wan2.2-I2V-720p-int8/low_noise",

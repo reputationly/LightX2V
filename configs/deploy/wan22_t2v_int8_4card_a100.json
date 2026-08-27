@@ -14,7 +14,7 @@
   "t5_cpu_offload": true,
   "vae_cpu_offload": false,
   "denoising_step_list": [1000, 750, 500, 250],
-  "rope_type": "torch",
+  "rope_type": "torch_real_rope",
   "boundary": 0.875,
   "boundary_step_index": 2,
   "dit_quantized": true,

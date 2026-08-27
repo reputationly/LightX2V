@@ -16,7 +16,7 @@
   "cpu_offload": true,
   "t5_cpu_offload": true,
   "vae_cpu_offload": false,
-  "rope_type": "torch",
+  "rope_type": "torch_real_rope",
   "boundary": 0.875,
   "fps": 16,
   "video_frame_interpolation": {

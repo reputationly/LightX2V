@@ -34,7 +34,7 @@
     "use_timestep_transform": true,
     "vae_cpu_offload": false,
     "clip_cpu_offload": false,
-    "rope_type": "torch",
+    "rope_type": "torch_real_rope",
     "dit_quantized": true,
     "dit_quant_scheme": "int8-triton",
     "dit_quantized_ckpt": "/nfs-data/models/Wan2.1-Distill-Models/wan2.1_i2v_480p_int8_lightx2v_4step.safetensors",
