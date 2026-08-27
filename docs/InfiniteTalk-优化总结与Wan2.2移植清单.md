@@ -3,6 +3,37 @@
 > 日期:2026-07-11 · 基于 `docs/InfiniteTalk-实验测试报告.md` 的全部实验(T1-T8/O系列)
 > 本文回答两个问题:①这轮优化的方法论沉淀;②哪些成果能直接搬到 Wan2.2 t2v/i2v 生产线。
 
+## 2026-08-02 增量结论：现网代码级优化已在 0030 实测
+
+旧文把 720p 4 卡 `136.7s/5s` 视为通信条件下的终点，这个结论需要修正：self-attention 的 ulysses 通信选项
+确实没有收益，但 InfiniteTalk 特有的 audio attention 在每个 block 中先 all-gather 全部视觉 token，再由四张卡各自
+重复完整 audio attention。它不是不可消除的 ulysses 通信，而是实现层面的重复计算。
+
+固定同图、同音频、同提示词、`seed=42`、4 steps、25 FPS、实际 `1280×704` 的严格 A/B：
+
+| 项目 | 原始 | 优化 | 收益 |
+|---|---:|---:|---:|
+| 5s 热态总时间 | 133.82s | **110.00s** | **-17.8%** |
+| DiT 单 step | ~13.74s | **~10.85s** | **-21.0%** |
+| 5s 容器峰值 | 89.45 GiB | **64.23 GiB** | **-28.2%** |
+| 5s 请求后 RSS | 88.76 GiB | **63.50 GiB** | **-28.5%** |
+| 10s 扩展样本 | 281.93s | **214.04s** | **-24.1%**（支撑值） |
+| 10s 请求后 RSS（含 trim） | 79.58 GiB | **62.08 GiB** | **-22.0%** |
+
+5s/10s 的 MP4 SHA256、解码 RGB hash、解码 PCM hash 均分别完全一致，PSNR=`inf`、SSIM=`1.0`。详细命令、
+冷/热态边界和 hash 见《InfiniteTalk-实验测试报告.md》的 2026-08-02 小节。
+
+落地分三层：
+
+1. **默认安全修复**：仅 rank0 累积/拼接/保存输出；请求结束解除所有大 tensor 引用；scheduler 实现真实 `clear()`。
+2. **灰度开关**：`INFINITETALK_RANK0_ENCODERS=1`，减少重复 T5/Wav2Vec 执行及非 rank0 常驻/峰值内存。编码结果复用服务端已有的长超时 Gloo 任务组广播；GPU context 先无损转到 CPU，经 Gloo 传输后再回到 GPU，避免 rank 1-3 在 rank 0 预处理期间占用默认 NCCL collective。当前明确限制为单节点多卡，因为转码后的临时参考视频仍通过本机路径共享。
+3. **灰度开关**：`INFINITETALK_LOCAL_AUDIO_ATTN=1`，单人模式删除全 token gather 与四卡重复 audio attention；多人
+   自动回退。严格 RSS 场景再开 `INFINITETALK_MALLOC_TRIM=1`。
+
+这项 local audio attention **不能直接照搬 Wan2.2 t2v/i2v**（后者没有 InfiniteTalk audio adapter），但方法论可移植：
+不要把“seq_p 下出现 collective”统称为不可优化通信，必须检查 collective 后是否在每个 rank 重复执行了本可按 token/
+frame 分片的独立算子。
+
 ---
 
 ## 一、优化过程复盘(从 22 分钟到 54 秒的路径)

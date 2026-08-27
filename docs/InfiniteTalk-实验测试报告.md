@@ -4,6 +4,63 @@
 > 镜像:`lightx2v:arm64-a100-latest` · harness:`run_batch.sh it_distill`
 > 模型:MeiGen-AI InfiniteTalk(Wan2.1-I2V-14B 底座 + 音频 adapter),配 lightx2v 4步蒸馏 DiT
 
+## 2026-08-02 现网复现与 0030 优化 A/B（以此节更新旧结论）
+
+本轮先在 `dev-gpustack-a100-0008` 只读复现现网，再在空闲的 `dev-gpustack-a100-0030` 用完全相同镜像
+`sha256:eb13e9ea...`、4×A100 40G、同 NFS 权重做单变量实验。固定输入如下：同一 `seko_input.png`、
+同一 `seko_input.mp3`、同一提示词、`seed=42`、4 steps、25 FPS、请求 5s/10s；实际桶分辨率为
+`1280×704`，不是字面上的 1280×720。
+
+### 主要结果
+
+| 工况 | 服务端时间 | DiT 单 step | GPU 峰值(rank0 / 其余) | 容器峰值 | 请求后 RSS |
+|---|---:|---:|---:|---:|---:|
+| 原始 5s 冷态（首个真实 shape） | 168.62s | 首步 26.40s，后续约 13.74s | 30.53 / 30.53 GiB | 86.09 GiB | 85.38 GiB |
+| 原始 5s 热态（主基线） | **133.82s** | **13.71–13.76s** | 31.21 / 30.51 GiB | **89.45 GiB** | **88.76 GiB** |
+| 仅生命周期/仅 rank0 保留输出，5s 热态 | 134.65s | 不变 | 31.11 / 31.11 GiB | 66.62 GiB | 65.89 GiB |
+| + rank0 T5/Wav2Vec 编码广播，5s 热态 | 132.93s | 不变 | 31.11 / 28.73 GiB | 63.96 GiB | 63.24 GiB |
+| + 本 rank 帧级 audio attention，5s 热态 | **110.00s** | **10.84–10.87s** | **30.23 / 27.87 GiB** | **64.23 GiB** | **63.50 GiB** |
+| 原始 10s / 4 段（重启后复用 Triton 磁盘缓存） | 281.93s | 约 13.74s | 31.23 / 31.21 GiB | 80.56 GiB | 79.58 GiB |
+| 全优化 10s 热态 + `malloc_trim` | **214.04s** | 约 10.85s | **30.13 / 27.79 GiB** | **67.35 GiB** | **62.08 GiB** |
+
+主结论：严格热态 5s 从 `133.82s` 降至 `110.00s`，缩短 **23.82s / 17.8%**；10s 支撑样本缩短
+`67.89s / 24.1%`（原始侧是服务重启后的首单，但 Triton 磁盘缓存已存在，故该比例只作扩展样本，不替代
+5s 热态主结论）。`malloc_trim` 对 10s 热态时间无可测影响：未 trim 与 trim 都为 `214.04s`，但结束 RSS
+从 71.39 GiB 降至 62.08 GiB。
+
+### 内容一致性
+
+- 5s MP4 SHA256（原始/优化相同）：`a80560d17695b137fa9b4f4fc9353bc51becc9516f430f5a365ab612e4ef6f9c`
+- 5s 解码 RGB SHA256：`4822567d64fdfd76960ac2e194ebe4026b48cbb70b0df3ad4b48e699e8555508`
+- 5s 解码 PCM SHA256：`e7b1a88be2464683bde10fefb5b025c93209fcfa1bc24673a51e1a373bbc6a86`
+- 10s MP4 SHA256（原始/优化相同）：`777c1a70892721c2480ea01c2c39e5b803c4d947d9d8d3d3856362bb06e73684`
+- FFmpeg 对比：PSNR=`inf`、SSIM=`1.000000`。不是“肉眼近似”，而是封装文件、逐帧像素、音轨均完全一致。
+
+### 代码检视修正后的回归
+
+针对“rank 1-3 在 rank 0 预处理期间阻塞于默认 NCCL 组”和“CPU 音频 embedding 经 GPU 中转”两项检视，编码广播已改为上述 Gloo 路径，并把开关锁存在 runner 初始化期。0030 重启后用同一 5s 请求完成四卡回归：任务成功，服务端 `115s`，GPU 峰值分别为 `30189/27807/27807/27807 MiB`，请求阶段无 collective/类型异常；产物 MP4 SHA256 仍为 `a80560d...e4ef6f9c`，与原始和优化前述产物逐位一致。该次用于验证传输与稳定性，不作为新的热态性能基线。
+
+### 已实现的代码优化
+
+1. `wan_infinitetalk_runner.py`：非 rank0 不再累积全部解码段，也不执行最终 concat/float32/postprocess；请求结束删除
+   `full_audio_embs/cond_frame/dit_inputs/gen_video*` 等持久引用。
+2. `scheduler.py`：实现 InfiniteTalk scheduler 的真实 `clear()`；基类原实现为空，过去会保留 latents/noise/timesteps。
+3. `INFINITETALK_RANK0_ENCODERS=1`：只由 rank0 执行 T5/Wav2Vec，并广播输出。T5 初始化仍要求所有 rank 按同一
+   collective 顺序参与权重加载，加载完成后才释放非 rank0 实例；`lazy_load/unload_modules` 下自动回退旧路径。编码广播复用服务端已有的长超时 Gloo 任务组；GPU context 采用 CPU staging 后广播再回到 GPU，不改变 dtype/内容，也不修改平台层默认 NCCL timeout。该开关当前只允许单节点多卡，避免跨节点读取 rank0 本地转码临时文件。
+4. `INFINITETALK_LOCAL_AUDIO_ATTN=1`：单人模式按本 sequence-parallel shard 所属视频帧计算 audio attention，删除
+   每个 block 的全 token all-gather 和四卡重复计算；多人模式自动回退旧路径。
+5. `INFINITETALK_MALLOC_TRIM=1`：在引用删除、CUDA cache 清理和 GC 后显式归还 glibc arena；保持显式开关，便于
+   在吞吐优先与严格 RSS/cgroup 场景间选择。
+
+### 上线前剩余验证
+
+- 30s 连续 N≥3 soak、失败/OOM 后恢复、不同宽高桶与不同音频长度；目前已覆盖确定性 5s/10s 单人链路。
+- 多人模式虽会自动走旧 audio attention，但仍需独立回归双音轨口型与 rank0 广播 metadata。
+- 生产必须增加请求时长硬上限和容器 memory limit；现网 `video_duration=30` 是默认值而非硬上限，容器也未设 cgroup
+  内存限制。
+- 预热应执行一次完整 InfiniteTalk 真实链路，而非仅服务 health：重启后首个真实 shape 的第一 DiT step 会从约
+  13.7s 增至 26.4s。服务常驻后相同 shape 走热态；新分辨率/帧长、缓存清理或容器迁移仍可能产生部分冷开销。
+
 ## 结论先行:音频数字人引擎选型定案 = InfiniteTalk
 
 与 Wan2.2-S2V 同素材(seko_input.png + seko_input.mp3, 5s)对比,**全维度胜出**:

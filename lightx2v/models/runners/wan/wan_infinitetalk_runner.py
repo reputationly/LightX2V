@@ -1,3 +1,4 @@
+import ctypes
 import gc
 import json
 import math
@@ -9,6 +10,7 @@ import tempfile
 import imageio_ffmpeg as ffmpeg
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -1059,7 +1061,10 @@ class InfiniteTalkRunner(WanRunner):
             output_start_frame = self.audio_start_idx + self.current_motion_frames_num
 
         valid_frames = min(output_videos.shape[2], max(self.expected_frames - output_start_frame, 0))
-        if valid_frames > 0:
+        # 每个 rank 都要解码出的尾帧来条件化下一段,但只有 rank 0 需要保存/返回成片。
+        # 各 rank 都留着每一段解码结果,长视频的宿主内存会乘以序列并行的卡数,
+        # 而且每个 rank 都要做最后的 concat 与后处理。
+        if valid_frames > 0 and is_main_process():
             output_videos = output_videos[:, :, :valid_frames]
             if self.stream_save_video:
                 self._publish_video_segment(output_videos, output_start_frame)
@@ -1103,6 +1108,9 @@ class InfiniteTalkRunner(WanRunner):
 
         if self.stream_save_video:
             return self.process_images_after_vae_decoder()
+
+        if not is_main_process():
+            return {"video": None}
 
         suffix_frames = self.expected_frames - self.reuse_prefix_frame_count()
         self.gen_video = torch.cat(self.gen_video_list, dim=2)[:, :, :suffix_frames].to(torch.float32)
@@ -1249,10 +1257,38 @@ class InfiniteTalkRunner(WanRunner):
         self._remove_cond_video_temp_path()
         self.video_audio_array = None
         self.stream_save_video = False
-        if hasattr(self, "inputs"):
-            del self.inputs
+
+        # The runner is persistent in server mode. Request-sized tensors left on
+        # self otherwise survive until the next request (decoded segments alone can
+        # be tens of GiB for long videos), even though the file response no longer
+        # needs them. A returned tensor remains alive through the result dictionary.
+        for attr in (
+            "inputs",
+            "input_data",
+            "full_audio_embs",
+            "cond_image",
+            "cond_frame",
+            "dit_inputs",
+            "gen_video_list",
+            "gen_video",
+            "gen_video_final",
+        ):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        if self.scheduler is not None:
+            self.scheduler.clear()
+        self.input_info = None
         torch.cuda.empty_cache()
         gc.collect()
+        if os.getenv("INFINITETALK_MALLOC_TRIM", "0") == "1":
+            try:
+                # PyTorch's freed CPU tensors can remain in glibc arenas after a
+                # long request. Return those pages to the host once all request
+                # references have been removed. This is Linux/glibc-specific and
+                # therefore kept behind an explicit deployment switch.
+                ctypes.CDLL(None).malloc_trim(0)
+            except (AttributeError, OSError) as exc:
+                logger.warning(f"InfiniteTalk malloc_trim unavailable: {exc}")
 
     @ProfilingContext4DebugL1(
         "RUN pipeline",

@@ -89,3 +89,13 @@ class InfiniteTalkScheduler(BaseScheduler):
         if not self.is_first_clip and self.latent_motion_frames is not None:
             self._consume_motion_noise(self.timesteps[self.step_index + 1])
         self._apply_clean_motion_prefix()
+
+    def clear(self):
+        # BaseScheduler.clear() is intentionally a no-op. InfiniteTalk keeps these
+        # request-sized tensors on its persistent scheduler, so release them once
+        # the request has finished (or failed).
+        self.latents = None
+        self.noise_pred = None
+        self.latent_motion_frames = None
+        self.timestep_input = None
+        self.timesteps = None
