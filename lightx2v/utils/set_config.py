@@ -412,47 +412,67 @@ def set_parallel_config(config):
         tensor_p_size = int(config["parallel"].get("tensor_p_size", 1))
         cfg_p_size = int(config["parallel"].get("cfg_p_size", 1))
         seq_p_size = int(config["parallel"].get("seq_p_size", 1))
-        world_size = dist.get_world_size()
-        expected_world_size = tensor_p_size * cfg_p_size * seq_p_size
-        if expected_world_size != world_size:
-            raise ValueError(
-                f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) != world_size ({world_size})."
-            )
+        seg_p_size = int(config["parallel"].get("seg_p_size", 1))
 
-        phase_aware = bool(config.get("model_cls") == "hunyuan_image3" and config["parallel"].get("phase_aware", False))
-        if phase_aware:
-            from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
-
-            initialize_hunyuan_image3_parallel_runtime(config)
-        elif tensor_p_size > 1:
-            # Tensor parallel is the innermost dimension. Optional CFG and
-            # sequence dimensions are prepended so ranks with the same
-            # non-TP coordinates form contiguous TP groups. For TP+SP+CFG:
-            #   mesh shape/names = [cfg_p, seq_p, tensor_p].
-            mesh_shape = []
-            mesh_dim_names = []
-            if cfg_p_size > 1:
-                mesh_shape.append(cfg_p_size)
-                mesh_dim_names.append("cfg_p")
-            if seq_p_size > 1:
-                mesh_shape.append(seq_p_size)
-                mesh_dim_names.append("seq_p")
-            mesh_shape.append(tensor_p_size)
-            mesh_dim_names.append("tensor_p")
-            config["device_mesh"] = init_device_mesh(
-                AI_DEVICE,
-                tuple(mesh_shape),
-                mesh_dim_names=tuple(mesh_dim_names),
+        if seg_p_size > 1:
+            # 段并行(SeedVR SR):并行轴是「整段」,模型是复制的,不经过任何
+            # mesh-aware 的层 —— runner 直接和进程组打交道。与下面的
+            # tensor/seq/cfg mesh 互斥,而且是断言而非假定:这个分支根本不读
+            # cfg_p_size/seq_p_size,若从混合 profile 拷来的配置仍在 JSON 里
+            # 写着 2D mesh,它会照样启动成纯段并行 —— 实际拓扑和签入的配置
+            # 悄悄不一致。
+            assert tensor_p_size == 1 and cfg_p_size == 1 and seq_p_size == 1, (
+                f"seg_p_size ({seg_p_size}) is exclusive with the tensor/seq/cfg meshes, but got tensor_p_size={tensor_p_size}, cfg_p_size={cfg_p_size}, seq_p_size={seq_p_size}"
             )
-            config["tensor_parallel"] = True
-            config["seq_parallel"] = seq_p_size > 1
-            config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
-        else:
-            # Original 2D mesh for cfg_p and seq_p
-            config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
+            assert seg_p_size == dist.get_world_size(), f"seg_p_size ({seg_p_size}) must be equal to world_size ({dist.get_world_size()})"
             config["tensor_parallel"] = False
-            config["seq_parallel"] = seq_p_size > 1
-            config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+            config["seq_parallel"] = False
+            config["cfg_parallel"] = False
+            config["seg_parallel"] = True
+        else:
+            # 上游的 mesh 分支整体下移一级。世界大小校验必须留在这个 else 里:
+            # 段并行下 tensor*cfg*seq 恒为 1,而 world_size 是卡数,放在外面必炸。
+            world_size = dist.get_world_size()
+            expected_world_size = tensor_p_size * cfg_p_size * seq_p_size
+            if expected_world_size != world_size:
+                raise ValueError(
+                    f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) != world_size ({world_size})."
+                )
+
+            phase_aware = bool(config.get("model_cls") == "hunyuan_image3" and config["parallel"].get("phase_aware", False))
+            if phase_aware:
+                from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
+
+                initialize_hunyuan_image3_parallel_runtime(config)
+            elif tensor_p_size > 1:
+                # Tensor parallel is the innermost dimension. Optional CFG and
+                # sequence dimensions are prepended so ranks with the same
+                # non-TP coordinates form contiguous TP groups. For TP+SP+CFG:
+                #   mesh shape/names = [cfg_p, seq_p, tensor_p].
+                mesh_shape = []
+                mesh_dim_names = []
+                if cfg_p_size > 1:
+                    mesh_shape.append(cfg_p_size)
+                    mesh_dim_names.append("cfg_p")
+                if seq_p_size > 1:
+                    mesh_shape.append(seq_p_size)
+                    mesh_dim_names.append("seq_p")
+                mesh_shape.append(tensor_p_size)
+                mesh_dim_names.append("tensor_p")
+                config["device_mesh"] = init_device_mesh(
+                    AI_DEVICE,
+                    tuple(mesh_shape),
+                    mesh_dim_names=tuple(mesh_dim_names),
+                )
+                config["tensor_parallel"] = True
+                config["seq_parallel"] = seq_p_size > 1
+                config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+            else:
+                # Original 2D mesh for cfg_p and seq_p
+                config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
+                config["tensor_parallel"] = False
+                config["seq_parallel"] = seq_p_size > 1
+                config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
 
         # warmup dist
         if AI_DEVICE == "cuda":

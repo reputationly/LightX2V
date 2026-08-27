@@ -44,14 +44,33 @@ the `gpustack-lx2v-launcher` block added to `Dockerfile_aarch64_app`).
 - **z_image** — ready: `profiles.yaml` points at
   `configs/z_image/z_image_a100_sage.json` (infer_steps=9, sage_attn2,
   enable_cfg=false, rope=torch — A100-safe).
-- **wan2.2_moe (4-card int8)** — `profiles.yaml` has a **TODO placeholder**: the
-  A100 int8 4-card ulysses config is not yet in `configs/`. Create it and update
-  the `config_json` path before deploying wan. The parallel mesh **must** live in
-  that config JSON's `"parallel"` block (e.g.
-  `{"seq_p_size": 4, "cfg_p_size": 1, "seq_p_attn_type": "ulysses"}`) — the engine
-  reads `config["parallel"]`, and top-level CLI args do NOT configure
-  parallelism. The launcher only runs `torchrun --nproc_per_node=N` and validates
-  the GPU count; it does not (and cannot) inject the mesh via CLI.
+- **wan2.2_moe (4-card int8)** — T2V uses
+  `configs/deploy/wan22_t2v_int8_4card_a100.json`.
+- **wan2.2_moe_distill (4-card int8)** — I2V and FLF2V are separate variants
+  selected by `--task i2v` / `--task flf2v`. FLF2V uses
+  `configs/deploy/wan22_flf2v_int8_4card_a100.json`, fixing the accepted
+  four-step `sample_shift=16` baseline at native 16fps (no RIFE).
+- **seedvr2 (1-card / 4-card)** — same segmentation either way; the 4-card
+  variant (`configs/seedvr/a100/seedvr2_3b_segp4.json`, `seg_p_size: 4`) deals
+  segments round-robin across ranks for bit-identical output (PSNR inf vs
+  1-card). Speedup tracks input length, not GPU count: `segments /
+  ceil(segments / 4)`, so clips of ≤121 frames gain nothing (they run pinned to
+  rank 0). Deploy it with `gpu_selector.gpus_per_replica: 4`; `model_cls` and
+  `task` are both inferred from the model directory name, so no backend
+  parameters are needed. Two things the profile cannot enforce: the request's
+  input video path has to be reachable *inside* the instance container (worker
+  `EXTRA_MOUNTS`), and only one replica may run per box — four working ranks
+  hold ~145G of host RAM and a second concurrent request would double it.
+  The boundary frames cross ranks over gloo, not NCCL, so that a rank dying
+  mid-segment fails the request instead of hanging its neighbours past the
+  watchdog and taking the instance with them. Set `sr_tail_transport: "file"`
+  in the config to route them through the scratch dir instead — the sender then
+  never waits at all, at the cost of a ~200 MiB write and read per segment
+  boundary on whatever backs the output directory.
+
+Every multi-GPU config carries its real `"parallel"` mesh in JSON. The launcher
+only runs `torchrun --nproc_per_node=N` and validates the GPU count; it does not
+and cannot inject the mesh via top-level CLI arguments.
 
 ## Smoke test (standalone, no GPUStack)
 

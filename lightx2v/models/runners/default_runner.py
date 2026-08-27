@@ -582,6 +582,70 @@ class DefaultRunner(BaseRunner):
             },
         }
 
+    # bernini v2v system prompt (bernini_template.py:113). The pure-t2v Bernini
+    # path uses the T5 text encoder; task_type only swaps this system-prompt
+    # prefix, so we prepend it to the prompt for v2v.
+    _V2V_SYSTEM_PROMPT = "You are a helpful assistant specialized in video editing."
+
+    @ProfilingContext4DebugL2("Run Encoders")
+    def _run_input_encoder_local_v2v(self):
+        # mv2v = comma-separated source videos (each own source_id). Only single
+        # source is fully supported now; multi is parsed but only first is used
+        # for the target-shape / context beyond a TODO. bernini wan_diffusion.py:430
+        raw = (self.input_info.src_video or "").strip()
+        if not raw:
+            raise ValueError("v2v task requires --src_video (source clip to edit).")
+        video_paths = [p.strip() for p in raw.split(",") if p.strip()]
+        if len(video_paths) > 1:
+            # TODO(bernini mv2v): support a LIST of sources; first joins V-combo,
+            # all join VI-combo. For now use every clip as VI context sources.
+            logger.warning(f"v2v: {len(video_paths)} source videos given; mv2v is future work, encoding all as VI context.")
+
+        # VAE-encode full source clip(s) into the normalized target latent space.
+        src_latents, latent_shape = self.run_vae_encoder_v2v(video_paths)
+        self.input_info.latent_shape = latent_shape  # Important: set latent_shape in input_info
+
+        # bernini wan_diffusion.py:416 _make_sids — context source ids 1..n, or
+        # linspace(1, max_trained=5, n) when n > 5. Target keeps id 0 (built in
+        # pre_infer). These ids drive the source-id RoPE (transformer_wan.py:274).
+        n = len(src_latents)
+        max_trained = int(self.config.get("max_trained_src_id", 5))
+        if self.config.get("interpolate_src_id", True) and n > max_trained:
+            src_ids = torch.linspace(1.0, float(max_trained), n).tolist()
+        else:
+            src_ids = [float(i) for i in range(1, n + 1)]
+
+        # v2v system-prompt prefix (video-editing task_type, bernini_template.py:113).
+        # Upstream applies the task system prompt to BOTH the cond and uncond text
+        # encodings (the template prepends it regardless of the user prompt), so we
+        # prefix the positive AND negative prompt for the CFG dual-forward.
+        base_prompt = self.input_info.prompt or ""
+        if not base_prompt.startswith(self._V2V_SYSTEM_PROMPT):
+            self.input_info.prompt = f"{self._V2V_SYSTEM_PROMPT} {base_prompt}".strip()
+        base_neg = self.input_info.negative_prompt or ""
+        if not base_neg.startswith(self._V2V_SYSTEM_PROMPT):
+            self.input_info.negative_prompt = f"{self._V2V_SYSTEM_PROMPT} {base_neg}".strip()
+
+        text_encoder_output = self.run_text_encoder(self.input_info)
+        torch_device_module.empty_cache()
+        gc.collect()
+
+        # Sanity log (single-GPU debuggability, M1 requirement).
+        for i, z in enumerate(src_latents):
+            logger.info(f"[v2v] src_latent[{i}] shape={tuple(z.shape)} mean={z.float().mean().item():.4f} std={z.float().std().item():.4f} src_id={src_ids[i]}")
+        logger.info(f"[v2v] latent_shape={latent_shape}, num_context_sources={n}")
+
+        return {
+            "text_encoder_output": text_encoder_output,
+            "image_encoder_output": None,
+            # v2v context: source latents + their source-ids for the pre_infer
+            # sequence-dim token concat + source-id RoPE (bernini wan_diffusion.py:479).
+            "v2v_context": {
+                "src_latents": src_latents,  # list of [C=16, T_lat, H_lat, W_lat]
+                "src_ids": src_ids,  # list[float], one per source (context ids 1..n)
+            },
+        }
+
     @ProfilingContext4DebugL2("Run Text Encoder")
     def _run_input_encoder_local_animate(self):
         text_encoder_output = self.run_text_encoder(self.input_info)
@@ -676,15 +740,22 @@ class DefaultRunner(BaseRunner):
         with ProfilingContext4DebugL2("wan_vae_to_comfy"):
             self.gen_video_final = wan_vae_to_comfy(self.gen_video_final)
 
+        # 插帧与保存帧率必须共用同一判定：target_fps 高于源帧率才真的插帧、
+        # 才按 target_fps 编码。否则（如 SR 源 24fps + 请求默认 target_fps=16）
+        # wrapper 原样返回全部帧，若保存端仍切 target_fps 会产出慢动作视频。
+        source_fps = self.config.get("fps", 16)
+        vfi_target_fps = None
         if "video_frame_interpolation" in self.config:
             assert self.vfi_model is not None and self.config["video_frame_interpolation"].get("target_fps", None) is not None
             target_fps = self.config["video_frame_interpolation"]["target_fps"]
-            logger.info(f"Interpolating frames from {self.config.get('fps', 16)} to {target_fps}")
-            self.gen_video_final = self.vfi_model.interpolate_frames(
-                self.gen_video_final,
-                source_fps=self.config.get("fps", 16),
-                target_fps=target_fps,
-            )
+            if target_fps > source_fps:
+                vfi_target_fps = target_fps
+                logger.info(f"Interpolating frames from {source_fps} to {target_fps}")
+                self.gen_video_final = self.vfi_model.interpolate_frames(
+                    self.gen_video_final,
+                    source_fps=source_fps,
+                    target_fps=target_fps,
+                )
 
         if return_result_tensor:
             self.gen_video_final = self.gen_video_final.cpu()
@@ -692,10 +763,10 @@ class DefaultRunner(BaseRunner):
 
         # Reaching here means should_process was true because this is the main
         # process and a save path was provided.
-        if "video_frame_interpolation" in self.config and self.config["video_frame_interpolation"].get("target_fps"):
-            fps = self.config["video_frame_interpolation"]["target_fps"]
-        else:
-            fps = self.config.get("fps", 16)
+        # 保存帧率要与「是否真的插了帧」共判,而不是「是否配置了插帧」。
+        # vfi_target_fps 只有在 target_fps > source_fps、插值确实跑了时才被设上;
+        # 配了插帧却没插(target <= source)还按 target_fps 存,出片就是慢动作。
+        fps = vfi_target_fps if vfi_target_fps else source_fps
 
         out_path = self.input_info.save_result_path
         img_in = (getattr(self.input_info, "image_path", None) or "").strip()

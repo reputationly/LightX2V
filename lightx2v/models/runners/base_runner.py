@@ -10,6 +10,16 @@ from loguru import logger
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 
+class TaskStopped(Exception):
+    """Raised by check_stop() when a cancellation/pause is observed.
+
+    A subclass of Exception so the existing broad `except Exception` handlers
+    still catch it, but a distinct type so callers can tell "the user cancelled"
+    apart from "inference blew up" — the former must not be logged or reported
+    as a failure, and check_stop() has already run end_run() teardown.
+    """
+
+
 class BaseRunner(ABC):
     """Abstract base class for all Runners
 
@@ -26,6 +36,17 @@ class BaseRunner(ABC):
         self._gc_frozen = False  # one-shot guard for _maybe_freeze_gc()
         self._init_modules_depth = 0
         self._warmup_done = False
+
+        self.input_broadcast_group = None
+
+        # Read once, off the hot path: check_stop() no longer routes the
+        # stop/pause flag through a designated rank, so these two select
+        # nothing any more. Say so instead of letting someone tune a knob
+        # that is not wired to anything.
+        for var in ("WORKER_RANK", "READER_RANK"):
+            value = os.getenv(var, "0")
+            if value not in ("", "0"):
+                logger.info(f"{var}={value} no longer selects a rank: check_stop() all-reduces the stop/pause flag across every rank")
 
     def __init_subclass__(cls, **kwargs):
         """Install common lifecycle hooks around runner entry points."""
@@ -106,6 +127,10 @@ class BaseRunner(ABC):
         gc.freeze()
         self._gc_frozen = True
         logger.info(f"[GC] gc.collect() reclaimed {collected} objects; gc.freeze() moved ~{n} live tracked objects out of future GC walks")
+
+    def set_input_broadcast_group(self, group):
+        """Attach the server-owned CPU process group used for encoder outputs."""
+        self.input_broadcast_group = group
 
     def apply_disagg_request_overrides(self, config_modify):
         """Mirror flat disagg request fields into ``disagg_config`` in disagg mode only."""
@@ -351,40 +376,52 @@ class BaseRunner(ABC):
         return 0
 
     def check_stop(self):
-        """Check if the stop signal is received"""
+        """Check if a stop/pause signal is received, and agree on it across ranks.
 
+        Whichever rank holds the flag propagates it. This used to broadcast from
+        a fixed source rank (WORKER_RANK/READER_RANK), which meant the holder and
+        the reader had to be configured to the same rank or the signal was
+        silently dropped: the server path can only set stop_signal on rank 0
+        (that is the only process holding the task's stop_event), while the
+        worker hub sets it on its own target rank. A MAX all-reduce covers both
+        without either side knowing what the other picked, and it collapses the
+        two per-step collectives into one.
+
+        Every rank must reach this together — a rank aborting unilaterally would
+        hang the others on the next collective. That premise fails under data
+        parallelism, where the ranks run different amounts of work: set
+        ``_rank_local_collectives`` for the duration and each rank decides on
+        its own flags instead, agreeing once at a rendezvous the owner arranges.
+        SeedVR segment parallelism does exactly that (see
+        ``SeedVRRunner._sr_seg_rendezvous``) — without it a request whose
+        segment count is not a multiple of the world size deadlocks here, since
+        the ranks holding no segment never reach the all-reduce.
+        """
         rank, world_size = 0, 1
         if dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
-        stop_rank = int(os.getenv("WORKER_RANK", "0")) % world_size  # same as worker hub target_rank
-        pause_rank = int(os.getenv("READER_RANK", "0")) % world_size  # same as va_reader target_rank
 
         stopped, paused = 0, 0
-        if rank == stop_rank and hasattr(self, "stop_signal") and self.stop_signal:
+        if hasattr(self, "stop_signal") and self.stop_signal:
             stopped = 1
-        if rank == pause_rank and hasattr(self, "pause_signal") and self.pause_signal:
+        if hasattr(self, "pause_signal") and self.pause_signal:
             paused = 1
 
-        if world_size > 1:
-            if rank == stop_rank:
-                t1 = torch.tensor([stopped], dtype=torch.int32).to(device=AI_DEVICE)
-            else:
-                t1 = torch.zeros(1, dtype=torch.int32, device=AI_DEVICE)
-            if rank == pause_rank:
-                t2 = torch.tensor([paused], dtype=torch.int32).to(device=AI_DEVICE)
-            else:
-                t2 = torch.zeros(1, dtype=torch.int32, device=AI_DEVICE)
-            dist.broadcast(t1, src=stop_rank)
-            dist.broadcast(t2, src=pause_rank)
-            stopped = t1.item()
-            paused = t2.item()
+        if world_size > 1 and not getattr(self, "_rank_local_collectives", False):
+            signals = torch.tensor([stopped, paused], dtype=torch.int32, device=AI_DEVICE)
+            dist.all_reduce(signals, op=dist.ReduceOp.MAX)
+            stopped, paused = int(signals[0].item()), int(signals[1].item())
 
         if stopped == 1:
             try:
                 self.end_run()
             except Exception as e:
                 print(f"end_run failed: {e}")
-            raise Exception(f"find rank: {rank} stop_signal, stop running, it's an expected behavior")
+            raise TaskStopped(f"find rank: {rank} stop_signal, stop running, it's an expected behavior")
         if paused == 1:
-            raise Exception(f"find rank: {rank} pause_signal, pause running, it's an expected behavior")
+            try:
+                self.end_run()
+            except Exception as e:
+                print(f"end_run failed: {e}")
+            raise TaskStopped(f"find rank: {rank} pause_signal, pause running, it's an expected behavior")

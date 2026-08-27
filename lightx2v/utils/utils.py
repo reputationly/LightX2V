@@ -214,6 +214,37 @@ def diffusers_vae_to_comfy(vae_output: torch.Tensor) -> torch.Tensor:
     return vae_output.permute(0, 2, 3, 1).cpu()
 
 
+def _frames_to_host(frames: torch.Tensor):
+    """Bring a uint8 frame tensor to host memory through a pinned staging buffer.
+
+    ``.cpu()`` on a pageable destination makes the driver stage the transfer
+    through its own buffer and memcpy it in on the CPU. On the 4xA100/aarch64
+    boxes that path is pathological *and* erratic: the same idle 603 MB payload
+    measured 0.44s / 0.96s / 5.96s / 72.18s across four consecutive runs -- a
+    164x spread, 8 MB/s at its worst. The pinned copy is DMA'd straight in and
+    measured 0.037s (16 GB/s) on all four, no spread at all.
+
+    That variance is not academic: one SR segment is exactly this size, so a
+    362-frame job (4 segments) jumps from 118s to 500s+ the moment one segment
+    draws the slow end -- a rank was caught sitting in this very line for 8m47s
+    while its GPUs idled at 0% with no IO, no swap and no page reclaim.
+
+    Pinning is cheap to repeat: torch's CachingHostAllocator reuses the block
+    (first allocation ~0.5s, subsequent ones ~0). It is a finite resource
+    though, so fall back to the pageable copy rather than failing the job --
+    slower, never wrong.
+    """
+    if not frames.is_cuda:
+        return frames.numpy()
+    try:
+        host = torch.empty(frames.shape, dtype=frames.dtype, device="cpu", pin_memory=True)
+        host.copy_(frames)
+        # numpy() aliases the pinned buffer; the returned array keeps it alive.
+        return host.numpy()
+    except RuntimeError:
+        return frames.cpu().numpy()
+
+
 def save_to_video(
     images: torch.Tensor,
     output_path: str,
@@ -240,16 +271,23 @@ def save_to_video(
 
     if method == "imageio":
         # Convert to uint8
-        frames = (images * 255).to(torch.uint8).cpu().numpy()
+        # frames = (images * 255).cpu().numpy().astype(np.uint8)
+        frames = _frames_to_host((images * 255).to(torch.uint8))
         imageio.mimsave(output_path, frames, fps=fps)  # type: ignore
 
     elif method == "ffmpeg":
         # Convert to numpy and scale to [0, 255]
-        frames = (images * 255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        # frames = (images * 255).cpu().numpy().clip(0, 255).astype(np.uint8)
+        frames = _frames_to_host((images * 255).clamp(0, 255).to(torch.uint8))
 
-        # Convert RGB to BGR for OpenCV/FFmpeg
-        frames = frames[..., ::-1].copy()
-
+        # Frames are handed to ffmpeg as rgb24, which is the layout they already
+        # have. The previous `frames[..., ::-1].copy()` existed only to feed a
+        # bgr24 pipe: reversing the last axis makes the array negative-strided,
+        # so numpy has to materialise it element by element. On the 4xA100
+        # aarch64 boxes that single line cost 23-166s per segment (it varies
+        # wildly under memory-bandwidth contention between ranks) -- one capture
+        # caught a rank sitting in it for 8m47s. Asking ffmpeg for the layout we
+        # already hold removes the copy entirely instead of moving it elsewhere.
         N, height, width, _ = frames.shape
 
         # Get ffmpeg executable from imageio_ffmpeg
@@ -275,7 +313,7 @@ def save_to_video(
                 "-s",
                 f"{int(width)}x{int(height)}",
                 "-pix_fmt",
-                "bgr24",
+                "rgb24",
                 "-r",
                 f"{fps}",
                 "-loglevel",
@@ -300,7 +338,7 @@ def save_to_video(
                 "-s",
                 f"{int(width)}x{int(height)}",
                 "-pix_fmt",
-                "bgr24",
+                "rgb24",
                 "-r",
                 f"{fps}",
                 "-loglevel",
@@ -311,6 +349,10 @@ def save_to_video(
                 "-",  # Input from pipe
                 "-vcodec",
                 "libx264",
+                "-crf",
+                "12",
+                "-preset",
+                "slow",
                 "-pix_fmt",
                 out_pix,
                 "-an",  # No audio
@@ -463,6 +505,7 @@ def mux_generated_audio_onto_video(
     audio,
     output_path: str,
     tempo: float = 1.0,
+    duration: Optional[float] = None,
 ) -> Optional[str]:
     """Mux a generated audio waveform onto ``source_video_path`` WITHOUT re-encoding the video.
 
@@ -478,6 +521,11 @@ def mux_generated_audio_onto_video(
         tempo: Audio speed factor (``atempo``, pitch-preserving). The v2a runner passes
             ``src_fps / model_fps`` so audio generated on the model's fps timeline lands
             exactly on the source clip's real timeline.
+        duration: Source video duration in seconds. When known, the output is bounded to
+            exactly this length with ``-t``: the audio is silence-padded (``apad``) up to it
+            and the stream-copied video plays in full — neither truncated nor hung. When
+            ``None`` (probe failed), falls back to ``atempo``-only + ``-shortest`` (no
+            ``apad``, which would hang under ``-c:v copy``), risking a sub-frame tail trim.
 
     Returns:
         The output path on success, or None on failure.
@@ -515,6 +563,20 @@ def mux_generated_audio_onto_video(
     if os.path.exists(tmp_path):
         os.remove(tmp_path)
 
+    # How the audio track is bounded to the video length differs by whether we know
+    # the source duration:
+    #   - duration known  → atempo (fps sync) + apad (pad silence) + ``-t duration``.
+    #     ``-t`` hard-caps the output at the video's real length: the padded audio can
+    #     never run away and the ``-c:v copy`` video plays in full — no truncation, no
+    #     hang. This is the correct path for v2a (the runner always probes duration).
+    #   - duration unknown → atempo-only + ``-shortest`` (NO apad). apad here would hang:
+    #     ffmpeg cannot resolve ``-shortest`` against an infinite pad under ``-c:v copy``.
+    #     A sub-frame tail trim is possible, accepted as the degraded fallback.
+    if duration is not None and float(duration) > 0:
+        audio_bound = ["-af", ",".join(_atempo_filters(tempo) + ["apad"]), "-t", f"{float(duration):.6f}"]
+    else:
+        audio_bound = ["-af", ",".join(_atempo_filters(tempo) or ["anull"]), "-shortest"]
+
     cmd = [
         ffmpeg_exe,
         "-y",
@@ -538,14 +600,7 @@ def mux_generated_audio_onto_video(
         "aac",
         "-b:a",
         "192k",
-        # Filter chain: optional atempo (sync for non-model-fps sources), then apad.
-        # apad pads the generated audio with silence indefinitely, so the finite
-        # (fully copied) video stream is always the "-shortest" one: the picture
-        # is NEVER truncated. Audio shorter than the video gets a silent tail;
-        # audio longer than the video is trimmed to the video's duration.
-        "-af",
-        ",".join(_atempo_filters(tempo) + ["apad"]),
-        "-shortest",
+        *audio_bound,
         "-f",
         "mp4",
         tmp_path,
