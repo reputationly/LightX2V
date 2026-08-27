@@ -50,13 +50,19 @@ class ImageGenerationService(BaseGenerationService):
             task_data.pop("presigned_url", None)
             task_data["return_result_tensor"] = prefer_memory_result
 
-            result = await self.inference_service.submit_task_async(task_data)
+            result = await self.inference_service.submit_task_async(task_data, stop_event=stop_event)
 
             if result is None:
                 if stop_event.is_set():
                     logger.info(f"Task {message.task_id} cancelled during processing")
                     return None
                 raise RuntimeError("Task processing failed")
+
+            if result.get("status") == "cancelled":
+                # check_stop() aborted the denoise loop; not an error, and the
+                # task is already in its terminal CANCELLED state.
+                logger.info(f"Task {message.task_id} cancelled during inference")
+                return None
 
             if result.get("status") == "success":
                 actual_save_path = self.file_service.get_output_path(message.save_result_path)

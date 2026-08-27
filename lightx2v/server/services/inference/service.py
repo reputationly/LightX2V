@@ -46,7 +46,7 @@ class DistributedInferenceService:
             self.worker = None
             self.is_running = False
 
-    async def submit_task_async(self, task_data: dict) -> Optional[dict]:
+    async def submit_task_async(self, task_data: dict, stop_event=None) -> Optional[dict]:
         if not self.is_running or not self.worker:
             logger.error("Inference service is not started")
             return None
@@ -59,7 +59,10 @@ class DistributedInferenceService:
                 logger.info(f"Waiting for previous task to complete before processing task {task_data.get('task_id')}")
 
             self.worker.processing = True
-            result = await self.worker.process_request(task_data)
+            # Passed alongside task_data, never inside it: task_data is pickled
+            # and broadcast to the other ranks, and a threading.Event is neither
+            # picklable nor meaningful outside this process.
+            result = await self.worker.process_request(task_data, stop_event=stop_event)
             self.worker.processing = False
             return result
         except Exception as e:
