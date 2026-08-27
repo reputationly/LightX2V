@@ -2,7 +2,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
-from lightx2v.models.networks.seedvr.utils.ops import slice_inputs
+# 同 transformer_infer:上游 #1345 删了 seedvr/utils/ops.py 里的转发,
+# 但没改这里的 import。指向真实现(无 SP 组时直接 return x,单卡等价)。
+from lightx2v.models.video_encoders.hf.seedvr.common.distributed.ops import slice_inputs
 
 
 def rms_norm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:

@@ -7,8 +7,14 @@ from lightx2v.common.ops.norm.rms_norm_weight import apply_qk_rms_norm
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.models.networks.seedvr.utils import na
 from lightx2v.models.networks.seedvr.utils.attention import FlashAttentionVarlen
-from lightx2v.models.networks.seedvr.utils.ops import gather_heads_scatter_seq, gather_seq_scatter_heads_qkv, safe_pad_operation
+from lightx2v.models.networks.seedvr.utils.ops import safe_pad_operation
 from lightx2v.models.networks.seedvr.utils.window import get_window_op
+
+# 上游 #1345(support sp for seedvr2)把 seedvr/utils/ops.py 里的这两个转发删了,
+# 却没改这里的 import —— upstream/main 上 `--model_cls seedvr2` 一启动就 ImportError。
+# 指向真实现:无序列并行组时它们直接 return x,单卡行为与原来的空转桩一致;
+# 有组时才做 all-to-all,正是 #1345 想要的效果。
+from lightx2v.models.video_encoders.hf.seedvr.common.distributed.ops import gather_heads_scatter_seq, gather_seq_scatter_heads_qkv
 
 from .utils import apply_adaln_single, norm_no_weight
 
