@@ -1,19 +1,21 @@
 {
-  "target_video_length": 121,
-  "target_height": 1080,
-  "target_width": 1920,
-  "infer_steps": 1,
-  "fps": 16,
-  "use_tiling_vae": true,
-  "vae_tile_size": 512,
-  "vae_memory_limit_gb": 0,
-  "cpu_offload": true,
-  "offload_granularity": "model",
-  "resize_mode": "adaptive",
-  "color_fix": "gpu",
-  "sr_segment_length": 121,
-  "sr_overlap": 8,
-  "parallel": {
-    "seg_p_size": 4
-  }
+    "target_video_length": 121,
+    "target_height": 1080,
+    "target_width": 1920,
+    "infer_steps": 1,
+    "fps": 16,
+    "use_tiling_vae": true,
+    "vae_tile_size": 512,
+    "vae_memory_limit_gb": 0,
+    "cpu_offload": true,
+    "offload_granularity": "model",
+    "resize_mode": "adaptive",
+    "color_fix": "gpu",
+    "sr_segment_length": 121,
+    "sr_overlap": 8,
+    "parallel": {
+        "seg_p_size": 4
+    },
+    "video_crf": 12,
+    "video_preset": "slow"
 }

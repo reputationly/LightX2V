@@ -21,8 +21,10 @@
     "dit_quant_scheme": "fp8-q8f",
     "dit_quantized": true,
     "parallel": {
-      "seq_p_size": 8,
-      "seq_p_attn_type": "ulysses-4090",
-      "vae_parallel": true
-    }
+        "seq_p_size": 8,
+        "seq_p_attn_type": "ulysses-4090",
+        "vae_parallel": true
+    },
+    "video_crf": 12,
+    "video_preset": "slow"
 }
