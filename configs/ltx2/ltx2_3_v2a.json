@@ -13,7 +13,7 @@
   "cpu_offload": true,
   "offload_granularity": "block",
   "vae_cpu_offload": true,
-  "gemma_cpu_offload": false,
+  "gemma_cpu_offload": true,
   "num_channels_latents": 128,
   "fps": 24,
   "audio_fps": 24000,
@@ -90,5 +90,6 @@
     32
   ],
   "use_upsampler": false,
-  "use_tiling_vae": true
+  "use_tiling_vae": true,
+  "v2a_cond_max_side": 768
 }

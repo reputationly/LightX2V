@@ -1,4 +1,5 @@
 import gc
+import os
 from pathlib import Path
 
 import torch
@@ -168,15 +169,37 @@ class LTX2TextEncoder:
         Returns:
             List of tuples, each containing (v_context, a_context) tensors for each prompt.
         """
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to(AI_DEVICE)
-        result = []
-        for prompt in prompts:
-            v_context, a_context, _ = self.text_encoder(prompt)
-            result.append((v_context, a_context))
-        if self.cpu_offload:
-            self.text_encoder = self.text_encoder.to("cpu")
-        return result
+        gemma_on_cpu = os.environ.get("LTX_GEMMA_ON_CPU", "") == "1"
+        # cpu_offload keeps the 28.6GB (15.36B-param bf16) Gemma backbone resident on CPU
+        # and streams it to the GPU one submodule at a time for the (sub-second) text
+        # encode — see GemmaTextEncoder._run_text_model_layerwise_on_gpu. This is what
+        # makes v2a fit a 40GB card in a persistent server: the whole backbone on GPU
+        # peaks 38.85GB in gemma's forward alone and leaves no room for the DiT denoise,
+        # so it OOMs; streaming keeps only the module in flight resident, measured 3.96GB
+        # encode peak and 0.02GB retained once it returns. Transfers go through page-locked
+        # homes (pinned lazily on first stream) so each round trip is ~15-20 GB/s, not
+        # pageable ~2 GB/s. See docs/LTX2.3-纯配音V2A-设计文档.md.
+        layerwise = self.cpu_offload and not gemma_on_cpu
+        # Drive the encoder's per-submodule streaming from cpu_offload (env fallback keeps
+        # the offline precompute path working). Off when LTX_GEMMA_ON_CPU forces a full
+        # CPU run whose contexts are moved to GPU below.
+        self.text_encoder.pinned_layerwise = layerwise
+        try:
+            result = []
+            for prompt in prompts:
+                v_context, a_context, _ = self.text_encoder(prompt)
+                if gemma_on_cpu:
+                    v_context = v_context.to(AI_DEVICE)
+                    a_context = a_context.to(AI_DEVICE)
+                result.append((v_context, a_context))
+            return result
+        finally:
+            # A failed/OOM'd encode can strand the module it was mid-stream on (at most one
+            # ~1GB layer) on GPU. The persistent worker's failure cleanup clears the
+            # scheduler/cache but not the text encoder, so reclaim any stranded weights here
+            # to keep the worker from accumulating GPU memory across requests.
+            if layerwise:
+                self.text_encoder.restore_offloaded()
 
     def infer(
         self,
@@ -223,6 +246,10 @@ class LTX2TextEncoder:
             logger.warning("Text encoder does not have expected structure. Skipping LoRA application.")
             return False
 
+        # LoRA rebinds feature_extractor .weight tensors. Under pinned-layerwise streaming
+        # the page-lock lives on each tensor's own .data (not a side table), so the rebound
+        # post-LoRA weights simply arrive unpinned and _stream_to_gpu re-pins them on first
+        # use — no home invalidation needed here.
         encoder_model = self.text_encoder
 
         if not hasattr(encoder_model, "feature_extractor"):
