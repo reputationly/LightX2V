@@ -1,6 +1,7 @@
 import torch
 import torch.distributed as dist
 
+from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
 from lightx2v.models.networks.wan.infer.s2v.audio_inject import apply_audio_inject
 from lightx2v.models.networks.wan.infer.s2v.wan_ops import (
     cross_attn_forward,
@@ -11,7 +12,6 @@ from lightx2v.models.networks.wan.infer.s2v.wan_ops import (
     segment_modulate_bld,
     wan_rms_norm,
 )
-from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
 from lightx2v.models.networks.wan.infer.transformer_infer import WanTransformerInfer
 from lightx2v_platform.base.global_var import AI_DEVICE
 

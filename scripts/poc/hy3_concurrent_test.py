@@ -9,12 +9,13 @@
 #     HY3_CONC=2 python hy3_concurrent_test.py          # 保守先试 2 并发
 #   产物:hy3_conc_out-<n>.png,逐张人工核验有没有串台/花图。
 # =============================================================================
-import os
 import json
 import math
-import time
+import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
@@ -24,13 +25,13 @@ MODEL = os.environ.get(
     "/nfs-models/wuhanjisuan894/models/HunyuanImage-3.0-Instruct-Distil-NF4-v2",
 )
 OUT_DIR = os.environ.get("HY3_OUT_DIR", "/nfs-models/wuhanjisuan894")
-CONC    = int(os.environ.get("HY3_CONC", "3"))     # 并发数
-ROUNDS  = int(os.environ.get("HY3_ROUNDS", "2"))   # 每个并发槽连发几张
-STEPS   = int(os.environ.get("HY3_STEPS", "8"))
+CONC = int(os.environ.get("HY3_CONC", "3"))  # 并发数
+ROUNDS = int(os.environ.get("HY3_ROUNDS", "2"))  # 每个并发槽连发几张
+STEPS = int(os.environ.get("HY3_STEPS", "8"))
 GPU_CAP = os.environ.get("HY3_GPU_CAP", "30GiB")
 STAGGER = float(os.environ.get("HY3_STAGGER", "5"))  # 错峰提交间隔(秒)
-TOPO    = os.environ.get("HY3_TOPO", "auto")   # auto | group(群友拓扑:base钉cuda:0,层均分其余卡)
-MODE    = os.environ.get("HY3_MODE", "batch")  # batch=原生批量(安全,推荐) | thread=多线程(已审计:不安全,仅验证用)
+TOPO = os.environ.get("HY3_TOPO", "auto")  # auto | group(群友拓扑:base钉cuda:0,层均分其余卡)
+MODE = os.environ.get("HY3_MODE", "batch")  # batch=原生批量(安全,推荐) | thread=多线程(已审计:不安全,仅验证用)
 
 
 def build_group_device_map(model_dir, ndev):
@@ -53,9 +54,9 @@ def build_group_device_map(model_dir, ndev):
     per = math.ceil(n_layers / len(gpus))
     for i in range(n_layers):
         dm[f"model.layers.{i}"] = gpus[min(i // per, len(gpus) - 1)]
-    print(f">>> group topo: {len(base_modules)} base modules -> cuda:0 | "
-          f"{n_layers} layers -> cuda:1..{ndev - 1} (~{per}/gpu)", flush=True)
+    print(f">>> group topo: {len(base_modules)} base modules -> cuda:0 | {n_layers} layers -> cuda:1..{ndev - 1} (~{per}/gpu)", flush=True)
     return dm
+
 
 # 每个槽不同 prompt,串台(输出对不上 prompt)一眼可见
 PROMPTS = [
@@ -65,12 +66,14 @@ PROMPTS = [
     "A steaming cup of coffee on a rustic table, macro shot, shallow depth of field",
 ]
 
+
 def vram(tag):
     parts = []
     for i in range(torch.cuda.device_count()):
         free, total = torch.cuda.mem_get_info(i)
         parts.append(f"cuda:{i} {(total - free) / 2**30:.1f}G")
     print(f"  [{tag}] " + " | ".join(parts), flush=True)
+
 
 def find_image(o):
     if isinstance(o, Image.Image):
@@ -83,6 +86,7 @@ def find_image(o):
             if r is not None:
                 return r
     return None
+
 
 def main():
     print(f">>> conc={CONC} rounds={ROUNDS} stagger={STAGGER}s steps={STEPS}", flush=True)
@@ -100,8 +104,10 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
         quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16,
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
         ),
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
@@ -119,9 +125,7 @@ def main():
     # 单流热身一张,顺便拿单流基准
     print(">>> warmup (serial baseline) ...", flush=True)
     t = time.time()
-    model.generate_image(prompt=PROMPTS[0], seed=1, image_size="1024x1024",
-                         bot_task="image", use_system_prompt="en_vanilla",
-                         diff_infer_steps=STEPS, verbose=0)
+    model.generate_image(prompt=PROMPTS[0], seed=1, image_size="1024x1024", bot_task="image", use_system_prompt="en_vanilla", diff_infer_steps=STEPS, verbose=0)
     serial = time.time() - t
     print(f">>> serial baseline: {serial:.1f}s", flush=True)
 
@@ -132,9 +136,13 @@ def main():
             print(f">>> batch round {rnd + 1}/{ROUNDS}: {CONC} prompts in one call ...", flush=True)
             t = time.time()
             out = model.generate_image(
-                prompt=prompts, seed=100 + rnd, image_size="1024x1024",
-                bot_task="image", use_system_prompt="en_vanilla",
-                diff_infer_steps=STEPS, verbose=1,
+                prompt=prompts,
+                seed=100 + rnd,
+                image_size="1024x1024",
+                bot_task="image",
+                use_system_prompt="en_vanilla",
+                diff_infer_steps=STEPS,
+                verbose=1,
             )
             dt = time.time() - t
             imgs = out if isinstance(out, (list, tuple)) else [out]
@@ -143,10 +151,12 @@ def main():
             for i, im in enumerate(imgs):
                 im.save(f"{OUT_DIR}/hy3_batch_out-r{rnd}-{i}.png")
             vram(f"after-batch-{rnd + 1}")
-            print(f">>> batch {CONC}: {dt:.1f}s 总 | {dt / max(len(imgs), 1):.1f}s/张 "
-                  f"| 吞吐 {len(imgs) / dt * 60:.2f} 张/分 "
-                  f"({(len(imgs) / dt * 60) / (60 / serial):.2f}x 单流) | 出图 {len(imgs)}/{CONC}",
-                  flush=True)
+            print(
+                f">>> batch {CONC}: {dt:.1f}s 总 | {dt / max(len(imgs), 1):.1f}s/张 "
+                f"| 吞吐 {len(imgs) / dt * 60:.2f} 张/分 "
+                f"({(len(imgs) / dt * 60) / (60 / serial):.2f}x 单流) | 出图 {len(imgs)}/{CONC}",
+                flush=True,
+            )
         print(">>> 逐张检查 hy3_batch_out-*.png:内容须与 prompt 对应、无花图", flush=True)
         return
 
@@ -159,10 +169,13 @@ def main():
         t = time.time()
         try:
             out = model.generate_image(
-                prompt=PROMPTS[slot % len(PROMPTS)], seed=100 + idx,
-                image_size="1024x1024", bot_task="image",
+                prompt=PROMPTS[slot % len(PROMPTS)],
+                seed=100 + idx,
+                image_size="1024x1024",
+                bot_task="image",
                 use_system_prompt="en_vanilla",
-                diff_infer_steps=STEPS, verbose=0,
+                diff_infer_steps=STEPS,
+                verbose=0,
             )
             dt = time.time() - t
             img = find_image(out)
@@ -191,13 +204,11 @@ def main():
     lats = [dt for _, dt, ok in results if ok]
     print("=" * 50, flush=True)
     print(f">>> 单流基准: {serial:.1f}s/张  (吞吐 {60 / serial:.2f} 张/分)", flush=True)
-    print(f">>> 并发 {CONC}: 成功 {n_ok}/{n}, 总墙钟 {wall:.1f}s, "
-          f"吞吐 {n_ok / wall * 60:.2f} 张/分 "
-          f"({(n_ok / wall * 60) / (60 / serial):.2f}x 单流)", flush=True)
+    print(f">>> 并发 {CONC}: 成功 {n_ok}/{n}, 总墙钟 {wall:.1f}s, 吞吐 {n_ok / wall * 60:.2f} 张/分 ({(n_ok / wall * 60) / (60 / serial):.2f}x 单流)", flush=True)
     if lats:
-        print(f">>> 并发下单张时延: 均值 {sum(lats) / len(lats):.1f}s, "
-              f"min {min(lats):.1f}s, max {max(lats):.1f}s", flush=True)
+        print(f">>> 并发下单张时延: 均值 {sum(lats) / len(lats):.1f}s, min {min(lats):.1f}s, max {max(lats):.1f}s", flush=True)
     print(">>> 逐张检查 hy3_conc_out-*.png:内容必须和各自 prompt 对上、无花图", flush=True)
+
 
 if __name__ == "__main__":
     main()

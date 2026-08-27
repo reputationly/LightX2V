@@ -5,6 +5,8 @@ import os
 
 import av
 import numpy as np
+import torch
+import torch.nn.functional as F
 
 SRC = "/data/outputs/vace_r2v_int8.mp4"
 OUTD = "/data/vace_inputs"
@@ -51,8 +53,6 @@ write_video(f"{OUTD}/inpaint_mask.mp4", [m] * len(frames))
 # 2) outpaint: 画面缩到60%居中灰底 + 周边mask白(重画)中心黑(保留)
 sh, sw = int(H * 0.6) // 2 * 2, int(W * 0.6) // 2 * 2
 top, left = (H - sh) // 2, (W - sw) // 2
-import torch
-import torch.nn.functional as F
 
 small = [F.interpolate(torch.from_numpy(f).permute(2, 0, 1)[None].float(), size=(sh, sw), mode="bilinear")[0].permute(1, 2, 0).byte().numpy() for f in frames]
 osrc, om = [], white.copy()

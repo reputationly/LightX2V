@@ -141,7 +141,6 @@ class TaskManager:
             task.phase = phase
             task.phase_progress = max(0.0, min(100.0, float(phase_progress)))
 
-
     def complete_task(
         self,
         task_id: str,

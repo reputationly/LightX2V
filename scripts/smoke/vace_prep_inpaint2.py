@@ -1,7 +1,6 @@
 # inpaint 修正版输入: mask 区域灰底填充(模型看不见原内容, 才会按提示词重画)
 # 容器内运行: python /data/smoke/vace_prep_inpaint2.py
 import av
-import numpy as np
 
 SRC = "/data/outputs/vace_r2v_int8.mp4"
 c = av.open(SRC)

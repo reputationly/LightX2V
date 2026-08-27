@@ -18,6 +18,7 @@ transformer_blocks.N key 映射,和运行时 apply_lora 完全一致,只是一�
 
 输出单文件 safetensors → 配置里用 "dit_original_ckpt" 指向它即可。
 """
+
 import argparse
 import glob
 import os

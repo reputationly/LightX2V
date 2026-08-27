@@ -10,7 +10,6 @@ import tempfile
 import imageio_ffmpeg as ffmpeg
 import numpy as np
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image

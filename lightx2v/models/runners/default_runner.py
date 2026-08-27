@@ -578,7 +578,7 @@ class DefaultRunner(BaseRunner):
             # sequence-dim token concat + source-id RoPE (bernini wan_diffusion.py:479).
             "v2v_context": {
                 "src_latents": src_latents,  # list of [C=16, T_lat, H_lat, W_lat]
-                "src_ids": src_ids,          # list[float], one per source (context ids 1..n)
+                "src_ids": src_ids,  # list[float], one per source (context ids 1..n)
             },
         }
 
