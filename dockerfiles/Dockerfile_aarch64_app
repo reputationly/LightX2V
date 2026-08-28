@@ -39,6 +39,9 @@ RUN printf '#!/bin/sh\nexec python /opt/LightX2V/deploy/gpustack-lx2v-launcher/g
 #   - /opt/LightX2V 下若有构建残留的空 decord 目录,会作为 namespace package 劫持
 #     import(属性数 0、调用即崩、还让 try/except fallback 失效),所以顺带删掉。
 RUN rm -rf /opt/LightX2V/decord
+# 垫片在 app 层也覆盖一次:base 是低频重建的重镜像,垫片修复不该等它。
+# 与 base COPY 的是同一个源文件,不会漂移。
+COPY dockerfiles/decord_shim/decord.py /opt/decord_shim/decord.py
 ENV PYTHONPATH=/opt/decord_shim:/opt/LightX2V
 WORKDIR /workspace
 CMD ["/bin/bash"]
