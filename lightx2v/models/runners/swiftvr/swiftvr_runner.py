@@ -614,8 +614,10 @@ class SwiftVRRunner(DefaultRunner):
             self._concat_segment_parts(part_paths, output_path)
             # 拼完立刻核帧数:段并行最容易错在边界与裁剪上,而这种错不会报异常,
             # 只会悄悄少几帧。宁可在这里炸,也别交付一个短了的视频。
+            # 数**包**不解码:-count_frames 会把整段解一遍,4K 上实测要 28 秒;
+            # 拼接是 -c copy,包数即帧数。
             probe = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", output_path],
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", output_path],
                 capture_output=True,
                 text=True,
             )
