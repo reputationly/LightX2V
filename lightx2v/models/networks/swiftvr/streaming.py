@@ -71,6 +71,17 @@ class StreamingTransformer:
         self.previous_input = None
         self.previous_latents = None
 
+    def seed_temporal_offset(self, latent_offset: int):
+        """Start this stream as if ``latent_offset`` latent frames had already been consumed.
+
+        Only used by segment parallel: a rank that begins mid-video must place its
+        chunks at their *global* RoPE positions, otherwise every rank would restart
+        the temporal axis at 0 and the joined output would drift at every seam.
+        The causal AE state is rebuilt by actually running a warm-up chunk; only
+        this counter cannot be recovered that way, because it is pure bookkeeping.
+        """
+        self.temporal_offset = int(latent_offset)
+
     @torch.inference_mode()
     def restore(self, latents: torch.Tensor, clip_latents: int) -> torch.Tensor:
         low_quality = latents.permute(0, 2, 1, 3, 4).contiguous()
@@ -130,6 +141,9 @@ class SwiftVRRestorer:
     def reset(self):
         self.autoencoder.reset()
         self.transformer.reset()
+
+    def seed_temporal_offset(self, latent_offset: int):
+        self.transformer.seed_temporal_offset(latent_offset)
 
     @torch.inference_mode()
     def restore_chunk(self, video: torch.Tensor, chunk: VideoChunk, clip_latents: int) -> torch.Tensor:

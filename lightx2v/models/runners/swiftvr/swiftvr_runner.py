@@ -1,4 +1,7 @@
+import contextlib
 import os
+import shutil
+import subprocess
 import time
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -7,6 +10,7 @@ from dataclasses import dataclass
 import imageio
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from PIL import Image
 from decord import VideoReader
@@ -63,13 +67,20 @@ class SwiftVRRunner(DefaultRunner):
     def __init__(self, config):
         if config["task"] != "sr":
             raise ValueError("SwiftVR only supports the `sr` task.")
-        if config.get("parallel"):
-            raise ValueError("SwiftVR currently supports single-GPU inference only.")
+        parallel = config.get("parallel") or {}
+        if parallel:
+            # 上游原本一律拒绝多卡。这里只放开「段级数据并行」这一种:整块视频按 chunk
+            # 连续切给各 rank,块之间不需要跨卡通信,末尾按块号 concat。
+            # 序列/张量并行仍然拒绝 —— SwiftVR 的注意力是窗口内 SDPA,切 head 或切 seq
+            # 都要动 MFSWA 的窗口布局,不是配置层面的事。
+            if not isinstance(parallel, dict) or set(parallel) - {"seg_p_size"}:
+                raise ValueError(f"SwiftVR only supports segment parallel via parallel.seg_p_size, got {parallel!r}")
         if config.get("cpu_offload"):
             raise NotImplementedError("SwiftVR does not support CPU offload yet.")
         normalize_swiftvr_config(config)
         super().__init__(config)
         self.copy_stream = torch.cuda.Stream(device=self.init_device) if self.init_device.type == "cuda" else None
+        self._seg_gloo_group = None
 
     def init_modules(self):
         logger.info(f"Loading native SwiftVR weights from {self.config['model_path']}")
@@ -346,6 +357,65 @@ class SwiftVRRunner(DefaultRunner):
         logger.info(f"SwiftVR restored image to {output_path or 'memory'} in {elapsed:.3f}s")
         return {"images": images, "stats": stats}
 
+    def _seg_barrier(self):
+        """控制面汇合点,走 **gloo**,不走 NCCL。
+
+        这里要同步的是「分片文件是否已经落盘」——主机侧的事。NCCL 的集合是 GPU 流上的
+        操作,两次实测都翻车:
+          1) `dist.barrier()` + `torch.cuda.synchronize()`:rank3 直接冲过屏障返回,
+             而 rank1/2 还没关闭 mp4 写出,rank0 提前拼接,成片只有 97 帧(应为 372);
+          2) 改成 `all_reduce` + `.item()`:rank0/rank3 配成一对、rank1/rank2 配成
+             另一对,双方各自拿到 "2 of 4"。
+        gloo 组在 CPU 上跑,barrier 语义就是主机侧阻塞,才是这个场景该用的东西。
+        """
+        group = self._seg_gloo_group
+        if group is None:
+            return
+        dist.barrier(group=group)
+
+    def _seg_parallel_info(self):
+        """段级并行的 ``(rank, world)``;未启用时返回 ``(0, 1)``。
+
+        只有 file 输出这一条路径,所以不像 SeedVR 那样还要判 tensor 输出 ——
+        run_video_pipeline 开头已经强制要求 save_result_path。
+        """
+        parallel = self.config.get("parallel") or {}
+        seg_size = int(parallel.get("seg_p_size", 1)) if isinstance(parallel, dict) else 1
+        if seg_size <= 1 or not dist.is_available() or not dist.is_initialized():
+            return 0, 1
+        world = dist.get_world_size()
+        if world != seg_size:
+            raise ValueError(f"seg_p_size ({seg_size}) must equal world_size ({world}).")
+        return dist.get_rank(), world
+
+    @staticmethod
+    def _partition_chunks(chunk_count: int, world: int) -> list[tuple[int, int]]:
+        """把块按**连续区间**切给各 rank,不是轮转。
+
+        连续切是关键:每个 rank 只需要在自己区间开头预热一次因果状态;轮转的话
+        每一块前面都得预热,开销要乘以块数。
+        """
+        base, extra = divmod(chunk_count, world)
+        ranges, start = [], 0
+        for r in range(world):
+            take = base + (1 if r < extra else 0)
+            ranges.append((start, start + take))
+            start += take
+        return ranges
+
+    def _concat_segment_parts(self, part_paths: list[str], output_path: str):
+        """按块号顺序把各 rank 的分片拼成成片。各 rank 编码参数相同,可以 -c copy。"""
+        list_path = output_path + ".concat.txt"
+        with open(list_path, "w", encoding="utf-8") as handle:
+            for path in part_paths:
+                handle.write(f"file '{os.path.abspath(path)}'\n")
+        command = ["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", list_path, "-c", "copy", output_path]
+        try:
+            subprocess.run(command, check=True)
+        finally:
+            with contextlib.suppress(OSError):
+                os.remove(list_path)
+
     def run_video_pipeline(self, input_info):
         if not input_info.save_result_path:
             raise ValueError("SwiftVR video restoration requires `save_result_path`.")
@@ -374,8 +444,55 @@ class SwiftVRRunner(DefaultRunner):
 
         output_path = os.path.abspath(input_info.save_result_path)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        # ---- 段级数据并行 ----
+        # 块之间唯一的真依赖是 ReAE 的因果状态(encoder_state/decoder_state)和
+        # StreamingTransformer 的 temporal_offset。实测因果状态在 4-8 帧内就收敛
+        # (从第 96 帧冷启动 vs 完整跑,首帧差 2.1、稳态差 1.09 即编码噪声),所以每个
+        # rank 只要在自己区间前多跑一块预热就够;temporal_offset 是纯记账,直接播种。
+        # 因此这里不需要任何跨卡通信,只在末尾按块号 concat —— PCIe 无 NVLink 也不吃亏。
+        seg_rank, seg_world = self._seg_parallel_info()
+        # new_group 是集合操作,必须所有 rank 以相同顺序调用 —— 放在这里,
+        # 因为无论是否启用段并行,每个 rank 都会执行到这一行。
+        if seg_world > 1 and self._seg_gloo_group is None:
+            self._seg_gloo_group = dist.new_group(backend="gloo")
+        warmup_chunks = max(0, int(self.config.get("seg_warmup_chunks", 1)))
+        parts_dir = None
+        part_paths = []
+        if seg_world > 1:
+            my_start, my_end = self._partition_chunks(len(chunks), seg_world)[seg_rank]
+            run_start = max(0, my_start - warmup_chunks)
+            parts_dir = os.path.join(os.path.dirname(output_path), f".{os.path.basename(output_path)}.segparts")
+            if seg_rank == 0:
+                shutil.rmtree(parts_dir, ignore_errors=True)
+                os.makedirs(parts_dir, exist_ok=True)
+            # 汇合点:保证目录建好之后各 rank 才开始写
+            self._seg_barrier()
+            part_paths = [os.path.join(parts_dir, f"part_{r:03d}.mp4") for r in range(seg_world)]
+            writer_path = part_paths[seg_rank]
+            logger.info(f"SwiftVR seg_parallel: rank {seg_rank}/{seg_world} owns chunks [{my_start}, {my_end}) of {len(chunks)}, warming up from chunk {run_start}")
+        else:
+            my_start, my_end, run_start = 0, len(chunks), 0
+            writer_path = output_path
+
+        # 首块用 clip_len+4 帧进、只吐 clip_len+1 帧出 —— 3 帧被 ReAE 的因果预热吃掉。
+        # 所以 chunk.start(名义帧位)比「实际已发出帧数」多 3,拿它算末块裁剪会多剪 3 帧:
+        # 实测 4 卡成片 369 帧、单卡 372,差的正是这个。
+        first_chunk_priming = max(0, chunks[0].frame_count - (clip_length + 1)) if len(chunks) > 1 else 0
+
+        run_chunks = chunks[run_start:my_end]
+        # check_stop() 默认每步做一次全 rank 的 MAX all-reduce。段并行下各 rank 的块数
+        # 不一样(31 块切 4 份是 8/8/8/7,再加预热块),集合次数对不上就会死锁 ——
+        # 实测:rank0/rank3 跑完退出循环,rank1/rank2 卡在自己多出来的那次 all_reduce 上,
+        # GPU 100% 空转,块数永远停在 23。base_runner.check_stop 的文档也写明了这点。
+        # 解法同 SeedVR 段并行:整个并行段内改成各 rank 本地判断,只在末尾 gloo 汇合点
+        # 统一(汇合点本身就是所有 rank 都会到的)。
+        outer_rank_local = getattr(self, "_rank_local_collectives", False)
+        self._rank_local_collectives = outer_rank_local or seg_world > 1
         self.restorer.reset()
-        writer = self.open_video_writer(output_path, fps)
+        # 播种全局 RoPE 时间位置:各 rank 都从 0 起算的话,拼接处会整段错位。
+        self.restorer.seed_temporal_offset(sum(c.latent_count for c in chunks[:run_start]))
+        writer = self.open_video_writer(writer_path, fps)
         reader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-reader")
         writer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-writer")
         max_pending = self.config.get("queue_size", 3)
@@ -391,7 +508,7 @@ class SwiftVRRunner(DefaultRunner):
             "writer_wait": 0.0,
         }
         started_at = time.perf_counter()
-        for chunk in chunks[:max_pending]:
+        for chunk in run_chunks[:max_pending]:
             pending_reads.append(
                 reader_executor.submit(
                     self.read_video_frames,
@@ -404,18 +521,18 @@ class SwiftVRRunner(DefaultRunner):
                 )
             )
         try:
-            for chunk_index, chunk in enumerate(chunks):
+            for local_index, chunk in enumerate(run_chunks):
                 self.check_stop()
                 reader_wait_started_at = time.perf_counter()
                 frames, read_seconds = pending_reads.popleft().result()
                 reader_wait_seconds = time.perf_counter() - reader_wait_started_at
-                next_read_index = chunk_index + max_pending
-                if next_read_index < len(chunks):
+                next_read_index = local_index + max_pending
+                if next_read_index < len(run_chunks):
                     pending_reads.append(
                         reader_executor.submit(
                             self.read_video_frames,
                             reader,
-                            chunks[next_read_index],
+                            run_chunks[next_read_index],
                             raw_frame_count,
                             source_height,
                             source_width,
@@ -434,16 +551,24 @@ class SwiftVRRunner(DefaultRunner):
                     pad_width,
                     stage_marks,
                 )
-                restored = restored[:, : raw_frame_count - written]
+                # 用**全局已发出帧数**裁尾巴,而不是本 rank 的 written(段并行下它只算自己
+                # 那段,会把中间段截没),也不是裸的 chunk.start(名义帧位,比实际多 3)。
+                emitted_before = chunk.start - (0 if chunk.index == 0 else first_chunk_priming)
+                restored = restored[:, : max(0, raw_frame_count - emitted_before)]
                 output_frames = (restored[0].permute(0, 2, 3, 1) * 255).clamp_(0, 255).to(torch.uint8)
                 cpu_frames, copy_complete = self.copy_frames_to_cpu(output_frames, self.copy_stream)
                 stage_marks.append(copy_complete)
 
+                if chunk.index < my_start:
+                    # 预热块:只为把因果状态跑起来,输出丢弃(它归上一个 rank 写)
+                    del cpu_frames
+                    continue
+
                 if len(pending_writes) >= max_pending:
-                    self.finish_video_write(pending_writes.popleft(), stage_seconds, len(chunks))
+                    self.finish_video_write(pending_writes.popleft(), stage_seconds, len(run_chunks))
                 pending_writes.append(
                     PendingVideoWrite(
-                        chunk_index=chunk_index,
+                        chunk_index=local_index,
                         frame_count=len(cpu_frames),
                         read_seconds=read_seconds,
                         reader_wait_seconds=reader_wait_seconds,
@@ -458,17 +583,50 @@ class SwiftVRRunner(DefaultRunner):
                 )
                 written += len(cpu_frames)
 
-                if self.progress_callback:
-                    self.progress_callback((chunk.index + 1) / len(chunks) * 100, 100)
+                if self.progress_callback and seg_rank == 0:
+                    # 只有 rank0 上报。按**本 rank 自己的**块序折算:各 rank 均分且末尾
+                    # 汇合,本地进度是全局进度的良好估计,而且一定走得到 100%。
+                    done = chunk.index - my_start + 1
+                    total = max(1, my_end - my_start)
+                    self.progress_callback(done / total * 100, 100)
             while pending_writes:
-                self.finish_video_write(pending_writes.popleft(), stage_seconds, len(chunks))
+                self.finish_video_write(pending_writes.popleft(), stage_seconds, len(run_chunks))
         finally:
             reader_executor.shutdown(wait=True, cancel_futures=True)
             writer_executor.shutdown(wait=True)
             writer.close()
+            if seg_world > 1:
+                logger.info(f"SwiftVR seg_parallel: rank {seg_rank} closed writer {os.path.basename(writer_path)}")
+            self._rank_local_collectives = outer_rank_local
             self.restorer.reset()
 
         elapsed = time.perf_counter() - started_at
+
+        if seg_world > 1:
+            # 汇合:所有 rank 的分片都已关闭落盘,才能拼。
+            self._seg_barrier()
+            if seg_rank != 0:
+                logger.info(f"SwiftVR seg_parallel: rank {seg_rank} wrote {written} frames to {writer_path}")
+                return {"video": None, "stats": {"frames": written, "seconds": elapsed}}
+            missing = [path for path in part_paths if not os.path.isfile(path) or os.path.getsize(path) == 0]
+            if missing:
+                raise RuntimeError(f"SwiftVR seg_parallel: missing or empty segment parts {missing}")
+            self._concat_segment_parts(part_paths, output_path)
+            # 拼完立刻核帧数:段并行最容易错在边界与裁剪上,而这种错不会报异常,
+            # 只会悄悄少几帧。宁可在这里炸,也别交付一个短了的视频。
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", output_path],
+                capture_output=True,
+                text=True,
+            )
+            joined = int((probe.stdout or "0").strip() or 0)
+            if joined != raw_frame_count:
+                raise RuntimeError(f"SwiftVR seg_parallel: joined video has {joined} frames, expected {raw_frame_count}")
+            logger.info(f"SwiftVR seg_parallel: joined {len(part_paths)} parts into {joined} frames")
+            # 这里**不**删 parts_dir:清理放在下次运行开头(rank0 建目录前 rmtree)。
+            # 之前在这里删,会把仍在写 mp4 trailer 的其他 rank 的分片抽走,
+            # 报 "Unable to re-open ... for shifting data"。
+
         mux_audio_from_video(
             input_info.video_path,
             output_path,
