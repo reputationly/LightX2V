@@ -137,14 +137,69 @@ class SwiftVRRunner(DefaultRunner):
         logger.info("[Warmup] Warmup completed")
         self._maybe_freeze_gc()
 
-    @staticmethod
+    def _oriented_target(self, source_height: int, source_width: int) -> tuple[int, int]:
+        """配置里的标称输出档位,按源的朝向配对长短边。
+
+        与 SeedVR2 的 `_oriented_target`(seedvr_runner.py:220)同语义:config 写的
+        1080×1920 表示的是「1080P 这一档」,不是死的高×宽 —— 竖版源要出 1080×1920、
+        横版出 1920×1080、方形塌到短边(横竖都救不了方的)。
+
+        返回 (0, 0) 表示没配档位,调用方退回纯 sr_ratio 放大。
+        """
+        target_height = int(self.config.get("target_height", 1080) or 0)
+        target_width = int(self.config.get("target_width", 1920) or 0)
+        if target_height <= 0 or target_width <= 0:
+            return 0, 0
+        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+        if source_height > source_width:
+            return long_side, short_side
+        if source_width > source_height:
+            return short_side, long_side
+        return short_side, short_side
+
+    def _clamp_to_ceiling(self, height: int, width: int) -> tuple[int, int]:
+        """按面积把输出压到显存安全上限内,保持请求的宽高比。
+
+        这条是兜底护栏,拦的是**显式 target_shape**:标称档位那条路已经被
+        `_oriented_target` 封住了,但请求可以直接点名尺寸,而 SwiftVR 的显存随像素数
+        线性涨(实测单卡 1080p 15.8G / 2K 19.8G / 4K 32.5G,40G 卡上 4K 已是上限)。
+        没有这道闸,一个 8K 的 target_shape 就能把整台机器的卡打爆。
+
+        按**面积**而不是逐边压:显存跟像素数走,而且等比缩放不会改变请求的画幅比例。
+        配 0 或负数 = 关闭上限(自建/离线跑大图时用)。
+        """
+        max_height = int(self.config.get("max_target_height", 2160) or 0)
+        max_width = int(self.config.get("max_target_width", 3840) or 0)
+        if max_height <= 0 or max_width <= 0:
+            return height, width
+        budget = max_height * max_width
+        if height * width <= budget:
+            return height, width
+        scale = (budget / (height * width)) ** 0.5
+        clamped_height, clamped_width = max(1, round(height * scale)), max(1, round(width * scale))
+        logger.warning(f"SwiftVR: requested {width}x{height} exceeds the {max_width}x{max_height} ceiling, clamped to {clamped_width}x{clamped_height}")
+        return clamped_height, clamped_width
+
     def resolve_output_size(
+        self,
         input_info,
         source_height: int,
         source_width: int,
         *,
         require_even: bool = False,
     ) -> tuple[int, int]:
+        """定输出尺寸。两条路各有各的封顶,别把它们混起来看。
+
+        ⚠️ sr_ratio 这条路**必须**封顶,这是现网 SR 的既有契约,不是防呆:网关前端
+        固定下发 sr_ratio=4.0(new-api `VIDEO_SR_RATIO_UNCAPPED`),注释原话是"一个够不着
+        的上限",指望引擎拿 config 档位去 min 掉它 —— SeedVR2 靠 seedvr_runner.py:241
+        那个 min 兜住。SwiftVR 早先没有这层,1344×768 的源乘 4 会去出 5376×3072(≈5.3K),
+        远超 4K/33G 的实测上限,必 OOM,而且不报参数错、跑起来才炸。
+
+        target_shape 这条路是 SwiftVR 独有的能力(SeedVR2 压根不读 target_shape),
+        一份配置串行吃 1080p/2K/4K 靠的就是它,所以**不能**用档位去封 —— 那会把 2K/4K
+        一起封死。它只过 `_clamp_to_ceiling` 的显存护栏。
+        """
         if input_info.target_shape:
             if len(input_info.target_shape) != 2:
                 raise ValueError(f"SwiftVR target_shape must be [height, width], got {input_info.target_shape}")
@@ -152,8 +207,18 @@ class SwiftVRRunner(DefaultRunner):
         else:
             ratio = input_info.sr_ratio
             height, width = round(source_height * ratio), round(source_width * ratio)
+            target_height, target_width = self._oriented_target(source_height, source_width)
+            if target_height and height * width > target_height * target_width:
+                # 落到档位上就出**精确**档位尺寸,不是等比缩到档位面积:界面标着 1080P
+                # 就得真是 1920×1080。SeedVR2 是靠 fixed_shape 中心裁到精确档位达成的
+                # (new-api videoPlayground.constants.js:512 记了这个决定),SwiftVR 这边
+                # preprocess_frames 直接 interpolate 到目标尺寸,等价结果、少一次裁剪。
+                # 代价是源与档位画幅比不一致时会有轻微拉伸(1344×768 的 1.75 → 1.778,
+                # 1.6%),而 SeedVR2 那边是上下各裁 12 像素 —— 两种取舍,量级都可忽略。
+                height, width = target_height, target_width
         if height <= 0 or width <= 0:
             raise ValueError(f"SwiftVR output size must be positive, got {height}x{width}")
+        height, width = self._clamp_to_ceiling(height, width)
         if require_even:
             height = max(2, int(round(height / 2)) * 2)
             width = max(2, int(round(width / 2)) * 2)
