@@ -8,6 +8,6 @@
     "fps": null,
     "video_codec": "libx265",
     "quality": 76,
-    "ffmpeg_preset": "medium",
+    "ffmpeg_preset": "veryfast",
     "queue_size": 3
 }
