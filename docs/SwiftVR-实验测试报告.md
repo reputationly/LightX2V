@@ -1,0 +1,458 @@
+# SwiftVR 视频超分 实验测试报告
+
+> 日期:2026-08-26 ~ 2026-08-28 · 环境:dev-gpustack-a100-0046 ~ 0050(五节点并行)
+> GPU:A100 PCIE 40G × 4 / 节点 · ARM 鲲鹏920 · 251G 宿主内存 · 无 NVLink
+> 镜像:`lightx2v:arm64-a100-latest` · 权重:`/nfs-data/models/SwiftVR_lightx2v`
+> 目标:评估 SwiftVR 能否替代 SeedVR2 成为超分主力,并定出生产配置
+
+## 结论先行
+
+1. **速度上是碾压,单卡对单卡快 11.4 倍**(同素材同目标:SwiftVR 44s vs SeedVR2 503s),
+   四卡段并行再快 2.1~2.4 倍。静态细节也更好(锐度 752.4 vs 688.5)。
+2. **有一类素材要留给 SeedVR2,但范围比原先判断的窄得多**。木工特写上 SwiftVR 的运动
+   能量相对源 **−8.7%**(SeedVR2 +12.0%),用户肉眼先发现的(飞出的木屑"像弹出来")。
+   这是 ReAE 时间轴 4× 下采样的**架构代价,配置调不动**(`clip_len` 24→96、
+   `dit_overlap` 0→4、`upscale_mode` 四种,实测均无改善)。
+
+   **但补齐四条素材后,这个现象只在木工特写上出现**:运动最剧烈的雨夜奔跑反而是
+   **+2.3%**(SeedVR2 +14.1%),四条里最贴近源。差别不在运动快慢,在**运动物的形态** ——
+   吃亏的是**细小、高对比、彼此独立的飞溅颗粒**(亚像素尺度短暂存在),大面积连贯位移
+   不受影响。**分流判据:细小高速飞溅/粒子(火花、木屑、水花、碎屑)→ SeedVR2;
+   其余(含大幅动作、体育、人像、静态)→ SwiftVR。** 锐度四条全胜 SwiftVR。
+3. **生产配置一份吃全分辨率**:`clip_len=24` + `reae_frame_batch_size=1`,画质全程最高档,
+   1080p/2K/4K 显存 15.8G / 19.8G / 32.5G。`reae_frame_batch_size=1` 是免费午餐 ——
+   显存减半、画质逐位不变、4K 上反而更快。
+4. **上游禁多卡的限制可以安全放开一种**:段级数据并行(切时间,不切模型)。已实现并
+   实测 2.1~2.4×,成片与单卡逐帧一致。序列/张量并行仍拒绝(要动 MFSWA 窗口布局)。
+5. **⚠️ 接生产前必须补分辨率封顶**,否则网关默认载荷会让 768p 源去出 5.3K 而 OOM。
+   已修,见 §六 —— 这是接入过程中最危险的一个坑,且不报参数错、跑起来才炸。
+
+## 一、模型与调研
+
+SwiftVR 是一步式(one-step)生成式视频修复,骨架 Wan2.2-TI2V-5B。相对 SeedVR2 的
+多步扩散,它的速度来自三处:
+
+| 组件 | 做法 | 后果 |
+|---|---|---|
+| 采样 | 一步生成,不是多步扩散 | 速度的主要来源 |
+| MFSWA | mask-free shifted-window attention:预先 gather 成稠密窗口,单次 SDPA | 省掉 mask 分支,但窗口布局写死 → 不能切 head/seq |
+| ReAE | Restoration-aware Autoencoder 替代重型 3D VAE,因果 chunk 流式 | 省显存与时间,**但时间轴 4× 下采样** |
+
+**ReAE 的 4× 时间下采样既是速度来源,也是 §五 那个运动细节问题的根因** —— DiT 拿到的
+latent 里,高速运动那条轨迹已经被抽掉了,后面任何配置都补不回来。这一条在选型阶段
+就该被识别为风险,我们是靠肉眼对比才发现的。
+
+权重来自 ModelScope `H-oliday/SwiftVR`,已转成 `wan_dit` 布局落 NFS。下载脚本:
+`scripts/download_animate2_swiftvr.sh`(与 Animate-2 合并,T5/CLIP 与一代权重
+sha256 相同的部分做软链去重)。
+
+## 二、配置调优(逐轮实测)
+
+素材:1344×768 / 372 帧 / 15.6s,单卡,目标 1080p。
+
+### 2.1 编码档位 —— 瓶颈根本不在 GPU
+
+把耗时拆开后发现 restore 段(编码器之外的全部 GPU 计算)在所有档位都是 14.5~14.7s,
+**差异全在编码器**:
+
+| 档位 | 总耗时 | 码率 | 标签 |
+|---|---|---|---|
+| q60 / x265 / ultrafast(上游默认) | 46s | 3.6 Mbps | hev1 |
+| q76 / x265 / medium | 60s | 15.9 Mbps | hev1 |
+| q76 / x265 / veryfast | 44s | 14.8 Mbps | hev1 |
+| q76 / x264 / veryfast | 41s | 18.1 Mbps | avc1 |
+| **q76 / x264 / fast** | **39s** | **19.2 Mbps** | **avc1** ← 选它 |
+
+两个独立的坑:
+
+- **上游默认 quality=60 只有 crf 20、3.6 Mbps**。换算式是 `round((100-q)*51/100)`。
+  SR 是画质产品,交付码率不能比对照组(SeedVR2 走 crf 12 / 18.7 Mbps)低两档 ——
+  等于把刚超上去的细节又压回去。
+- **上游默认 libx265 写出的是 `hev1` 标签**。HEVC 在 MP4 里有 hev1/hvc1 两种标签,
+  Apple 的 QuickTime 与预览**只认 hvc1**,出片在 Mac 上直接打不开(文件没坏,
+  ffprobe 一切正常)。已有产物可用 `ffmpeg -i x.mp4 -c copy -tag:v hvc1 y.mp4` 秒级救回。
+
+x264/fast 在三个维度同时最优:比上游档快 7 秒、码率高 5.3 倍、avc1 到处能播,
+且与 SeedVR2 同编码,下游链路与前端不用为 SwiftVR 单独适配。
+
+### 2.2 `reae_frame_batch_size=1` —— 免费午餐
+
+ReAE 里那些逐帧独立的层原本一次性展开整块全部帧。改成逐帧过之后:
+
+| 场景 | 之前 | 之后 |
+|---|---|---|
+| 4K clip_len=12 | 39641 MiB / restore 81.9s | **22601 MiB / 70.8s** |
+| 4K clip_len=24 | 直接 OOM | **32487 MiB / 74.0s** |
+| 2K clip_len=24 | 39183 MiB(96%,不敢上生产) | **19821 MiB(48%)** |
+| 1080p clip_len=24 | 28867 MiB | **15787 MiB(39%)** |
+
+**画质逐位不变**(它只改分批方式,不改数学):1080p 锐度 352.9 vs 352.9、2K 279.9 vs
+279.9,与不分批版本逐像素差 0.239(编码噪声级)。而且 4K 上还更快 —— 显存压力小,
+分配器少做同步与碎片整理。1080p 上约慢 3%。
+
+### 2.3 `clip_len` 是有画质代价的(一次自我纠正)
+
+我最初判断"`clip_len` 只吃显存,画质免费",**这是错的**。用户追问"对质量什么的没有
+差异吧"之后实测:
+
+| 目标 | clip_len=24 | 12 | 4 |
+|---|---|---|---|
+| 1080p 锐度 | 352.9 | 344.3 | 292.4 |
+| 2K 锐度 | 279.9 | 275.5 | 245.0 |
+| 4K 锐度 | 169.2 | 164.9 | 146.7 |
+
+24→12 掉 2%,12→4 掉 11~17%。机理:`clip_latents = clip_len / 4`,`clip_len=4` 时
+DiT 每次只看 1 个 latent 帧,块内完全没有时间上下文。
+
+**结论**:靠 2.2 的显存红利,`clip_len` 不必再为省显存降档,生产固定 24。原先按分辨率
+分的 `swiftvr_4k.json` / `swiftvr_allres.json` 一并删除,也不再需要 clip_len 自适应。
+
+## 三、分辨率矩阵(最终配置)
+
+素材 15.1s / 362 帧 / 1344×768。**目标分辨率由请求给,同一常驻实例串行处理
+1080p → 2K → 4K → 再回 1080p,切换不用重启、无劣化。**
+
+| 目标 | 单卡 pipeline | 单卡显存 | 4卡 worker | 4卡显存/卡 |
+|---|---|---|---|---|
+| 1080p | 23s | 15.8G (39%) | 9.2~11.0s | ~16.0G |
+| 2K | 37s | 19.8G (48%) | 14.1~17.4s | ~19.8G |
+| 4K | 78s | 32.5G (79%) | 28.7~32.2s | ~33.2G |
+
+**⚠️ 混部要按最高档 33G 算,不是按当前请求算**。PyTorch 缓存分配器不把显存还给驱动,
+实例处理过一次 4K 之后占用就停在 32G 不降(实测 4K 后回 1080p 仍占 32.3G)。
+
+## 四、四卡段级数据并行
+
+上游 runner 里写死 `raise ValueError("SwiftVR currently supports single-GPU inference only.")`。
+我们只放开**段级数据并行**一种:整段按 chunk 连续切给各 rank,末尾按块号 concat。
+序列/张量并行仍拒绝 —— SwiftVR 的注意力是窗口内 SDPA,切 head 或切 seq 要动 MFSWA
+的窗口布局,不是配置层面的事。
+
+### 4.1 为什么可行(先测后写)
+
+块之间唯一的真依赖是 ReAE 的因果状态和 `temporal_offset`。把源视频从第 96 帧切开单跑、
+与完整跑逐帧比:**首帧差 2.1、第 4 帧 1.3、第 8 帧起稳定在 1.09(即编码噪声)**。
+因果状态 4~8 帧内就收敛,不是按层数估的 30~40 帧。所以每个 rank 只要在自己区间前多跑
+一块预热;`temporal_offset` 是纯记账,直接播种。**连续切而不是轮转,预热才只做一次。**
+
+### 4.2 性能
+
+```
+单卡 RUN pipeline 22.4s  ->  4 卡 11.4 / 12.5 / 12.4s(rank0 19.8s 含拼接校验)
+Total Cost        29.4s  ->  18.7s
+峰值显存 21331 / 19251 / 19251 / 19251 MiB(段并行只切时间不切显存,与单卡同量级)
+成片 372 帧,与单卡逐帧一致
+```
+
+出包后复测(362 帧,含加载):**4 卡 50.0 fps vs 单卡 16.9 fps = 2.96×**。
+
+**⚠️ 吞吐上 4 个单卡实例仍然更划算**(线性 4×、零通信、零改码);四卡一实例只赢
+单请求延迟。两者不要混淆。
+
+### 4.3 调试中踩到并修掉的四个并发坑(都值得留档)
+
+1. **NCCL barrier 不阻塞主机**。分片文件是否落盘是主机侧的事,`dist.barrier()` 只是把
+   集合入队到 CUDA 流。实测 rank3 冲过屏障返回、rank1/2 还在写 mp4 trailer,rank0 提前
+   拼接,**成片只有 97 帧(应 372)**。补 `torch.cuda.synchronize()` 仍不够;改成
+   `all_reduce`+`.item()` 后又出现 rank0/3 配一对、rank1/2 配另一对,双方各拿到 "2 of 4"。
+   最终改用 **gloo 组** —— CPU 后端,barrier 语义就是主机阻塞。
+2. **`check_stop` 的集合次数必须对齐**。它每步做一次全 rank MAX all-reduce,而段并行下
+   各 rank 块数不同(31 切 4 = 8/8/8/7,再加预热),集合次数对不上直接死锁:rank0/3 退出
+   循环后 rank1/2 卡在多出来的那次 all_reduce 上,**GPU 100% 空转、块数永远停在 23**。
+   解法照 SeedVR 段并行:并行段内置 `_rank_local_collectives`,各 rank 本地判断,
+   只在末尾 gloo 汇合点统一。
+3. **末块少 3 帧**。首块用 `clip_len+4` 帧进、只吐 `clip_len+1` 帧出(3 帧被 ReAE 因果
+   预热吃掉),所以 `chunk.start` 这个名义帧位比"实际已发出帧数"多 3,拿它算末块裁剪
+   就多剪 3 帧 —— 成片 369 而非 372。已按 `first_chunk_priming` 修正。
+4. **收尾不能删分片目录**。rank0 删的时候别的 rank 可能还在写 mp4 trailer,报
+   `Unable to re-open ... for shifting data`。清理改到下次运行开头做,同 SeedVR2。
+
+另加拼接后的帧数校验:段并行错在边界与裁剪上**不会抛异常,只会悄悄少几帧**,宁可在
+这里炸也别交付短片。校验用 `-count_packets` 而非 `-count_frames` —— 后者会把整段解一遍,
+4K 上实测要 28 秒;拼接是 `-c copy`,包数即帧数。
+
+### 4.4 一条被实测推翻的猜想
+
+我一度认为"段并行与 `dit_overlap` 冲突"并准备加断言。实测否定:4 卡+overlap2 vs
+单卡+overlap2 平均差 **0.303**、差>3 占 0.032%,**比 `dit_overlap` 这个参数本身造成的
+差异(0.621)还小**。原因是预热块跑完就把 `previous_input` 设好了。最终没加断言,改为
+写注释说明,并标出真正的陷阱:`seg_warmup_chunks=0` 配 `dit_overlap>0` 时各 rank 首块
+拿不到 `previous_input`,那一块静默退化成无重叠,不报错、只在块边界留细微不连续。
+
+## 五、画质对比:与 SeedVR2 的分工
+
+### 5.1 素材换代
+
+前期测试全用一段动画(平涂色块 + 线稿)拼出来的 15 秒,**对超分是很弱的判别器** ——
+没有皮肤纹理、毛发、织物、噪点这些真正吃分辨率的东西。后改用 MiniMax-H3 生成的四条
+15.1s / 768p 真实素材(木工特写、雨夜奔跑、雨林微距、爵士低光),各 1344×768 / 362 帧 / 24fps。
+
+### 5.2 四素材全量对比(2026-08-28 补齐,单卡对单卡,均出 1080p 档)
+
+四条素材各跑一遍 SeedVR2(生产配置 `seedvr2_3b_seg121`,`sr_ratio=2`)与 SwiftVR
+(生产配置,`target_shape 1080 1920`)。耗时:SwiftVR 43~47s,SeedVR2 503~522s ——
+**稳定快 11 倍以上**。
+
+| 素材 | | 锐度 | 运动>40 占比 | 相对源 |
+|---|---|---|---|---|
+| **p1** 木工特写(飞溅木屑) | 源 | 426.3 | 3.149% | — |
+| | SeedVR2 | 688.5 | 3.527% | +12.0% |
+| | **SwiftVR** | **752.4** | 2.875% | **−8.7%** ⚠️ |
+| **p2** 雨夜奔跑(运动最剧烈) | 源 | 143.7 | 10.177% | — |
+| | SeedVR2 | 271.2 | 11.608% | +14.1% |
+| | **SwiftVR** | **400.2** | 10.413% | **+2.3%** |
+| **p3** 雨林微距(风吹叶动) | 源 | 820.9 | 4.588% | — |
+| | SeedVR2 | 1376.1 | 6.106% | +33.1% |
+| | **SwiftVR** | **1848.3** | 7.406% | +61.4% |
+| **p4** 爵士低光 | 源 | 321.3 | 0.358% | — |
+| | SeedVR2 | 568.1 | 0.502% | +40.2% |
+| | **SwiftVR** | **608.4** | 0.469% | +31.0% |
+
+**锐度四战四胜**,SwiftVR 全面高于 SeedVR2。
+
+**⚠️ 一条被自己的数据推翻的预测。** 补测前我写过:"p2 是运动最剧烈的一条,理论上会把
+−8.7% 放得更大,值得补测以确定分流阈值。"**测出来正好相反** —— p2 上 SwiftVR 是
+**+2.3%**,四条里最贴近源的一条,反倒是 SeedVR2 偏离更多(+14.1%)。
+
+所以"SwiftVR 抹快速运动细节"这个结论**不能按"运动剧烈程度"推广**。四条里只有 p1
+落到源以下。p1 与 p2 的区别不在快慢,在**运动物的形态**:
+
+- p1 是**细小、高对比、彼此独立的飞溅颗粒**(木屑),每一粒只占几个像素;
+- p2 是**大面积连贯位移**(人体奔跑 + 相机跟摇 + 雨丝),运动主体尺度远大于像素。
+
+ReAE 在时间轴 4× 下采样,吃掉的是**亚像素尺度上短暂存在的小目标**;大尺度连贯运动
+在下采样后依然可辨,所以不受影响。**分流判据应收窄为"细小高速飞溅/粒子",而不是
+泛泛的"运动剧烈"。**
+
+### 5.2.1 指标的边界(必须一起读)
+
+"运动>40 占比"量的是帧差能量,**它分不清"忠实的细节"和"幻觉出来的高频噪声"**,
+所以"越接近源越好"只是个代理判据,不能单独用来排名:
+
+- p3 上两者都远高于源(+61.4% / +33.1%),锐度也翻倍(1848 vs 源 821)。这未必是好事 ——
+  SeedVR2 官方就明确警告过轻退化输入(768p AIGC)容易**过度生成细节/过锐化**。
+- 因此上表能支撑的结论只有一条:**p1 那个"运动被抹平"的现象没有在另外三条上复现**。
+  谁在 p3/p4 上"更好看",指标判不了,得靠肉眼。
+
+**建议**:p2 的产物值得你亲自看一眼 —— 如果肉眼也认可 SwiftVR 在雨夜奔跑上没有 p1
+那种"弹出来"的观感,分流判据就可以按 5.2 收窄;否则维持保守口径。
+产物在 `/nfs-data/lx2v_test/out_cmp/`(`swiftvr.p2_motion.mp4` / `seedvr.p2_motion.mp4`)。
+
+### 5.2.2 顺带发现:SeedVR2 会掉帧
+
+四条源都是 362 帧,**SeedVR2 出片只有 358~359 帧,SwiftVR 全部 362 帧**。SeedVR2 的
+输出还是 1920×1104(`resize_mode: adaptive` + `DivisibleCrop(16)`),SwiftVR 是精确 1920×1080。
+
+### 5.3 指标方法论上的一次纠正
+
+这个问题是**用户肉眼先发现的**:"高速飞出的木屑效果还是 SeedVR2 好一些,SwiftVR 的
+效果有点像把高速的细节去掉了,旁边产生的木屑像是弹出来的。"
+
+我原来的两个指标都看不见它:
+
+- **拉普拉斯方差**只量静态空间细节,对运动渲染完全盲;
+- **帧间抖动取中位数**会被大面积静止区域主导。我曾据此说"SwiftVR 抖动更低 = 时序更
+  稳定",**这是错的** —— 抖动低在这里恰恰是运动被抹平的症状。
+
+改用**帧差高分位 + 运动像素占比**(直接反映快速运动物体的能量,判读基准是"源"那一行,
+越接近源越好)才量出 −8.7% vs +12.0%。脚本见 §八。
+
+### 5.4 配置救不了(已穷举)
+
+| 配置 | 运动>40 相对源 | 锐度 |
+|---|---|---|
+| 基准 clip_len=24 | −8.7% | 752.4 |
+| clip_len=48 | −8.6% | 748.5 |
+| clip_len=96 | −9.1% | 729.5 |
+| clip_len=24 + dit_overlap=2 | −8.7% | 755.3 |
+| clip_len=24 + dit_overlap=4 | −8.8% | 750.1 |
+
+全部在 −8.6% ~ −9.1% 区间纹丝不动。**根因在 ReAE 的 4× 时间下采样,是架构层面的,
+不是超参层面的。** 因此判定:不全量替换,按素材类型分流。
+
+## 五.五、其余可调项扫描(2026-08-28 补)
+
+素材 p1_craftsman,单卡,目标 1080p,其余参数固定为生产配置。
+
+### 5.5.1 `use_compile` —— 冷启动贵、稳态快 17%,但生产不建议开
+
+官方 5090/a800/h100 都提供了 `swiftvr_compile.json` 变体。这个开关经
+`BaseTransformerInfer.init_compile` 生效,对每个 DiT block 做 `torch.compile`。
+
+| | 端到端 | 块1 | 块2 | 稳态(块3~15) | 块16 |
+|---|---|---|---|---|---|
+| 基线 | **44s** | 1.998s | 1.183s | **1.180s** | 1.108s |
+| `use_compile=true` | 62s | 14.321s | 9.030s | **0.980s** | 0.880s |
+
+拆开看是很清楚的两段:**编译一次性成本约 +20s**(块1、块2 分别对应 SwiftVR 交替使用
+的两种窗口布局,`block_idx % 2`),之后**每块快 16.9%**(1.180 → 0.980s)。
+
+**画质等价但非逐位相同**:锐度 752.4 vs 753.0、运动指标同为 −8.7%,逐像素平均差 0.736
+(最大 41,差>3 占 2.4%)—— 编译后算子融合与归约次序变了,属数值噪声,不是行为改变。
+
+**为什么仍然不建议在生产开**:
+
+1. **收益太薄**。单请求 362 帧只有 14 个稳态块,省 0.2s×14 ≈ **2.8s**,占 44s 的 6.4%;
+   而冷成本 20s 要**约 7 个同分辨率请求**才摊平。
+2. **与"一份配置吃全分辨率"相冲**。编译缓存 key 是 `block_idx`(`get_compile_block_key`),
+   不含形状;分辨率一换,torch.compile 内部 guard 失效必然重编译。而 SwiftVR 的卖点
+   正是单实例串行吃 1080p/2K/4K —— 混合流量下可能次次付冷成本,净亏。
+   **⚠️ 这一条是推断,未实测**:CLI 每次都是新进程、必付冷成本,验证需要常驻 server
+   连发两个不同分辨率的请求。若将来要开这个开关,必须先补这个实验。
+
+**结论:保持关闭**(生产配置里不写这个键)。
+
+### 5.5.2 `upscale_mode` —— 默认 `bilinear` 已是最优,不用改
+
+这个参数控制 `preprocess_frames` 把源帧插值到目标尺寸时用的核。四种全测:
+
+| 模式 | 锐度 | 运动>40 相对源 | 端到端 |
+|---|---|---|---|
+| **bilinear(默认)** | **752.4** | −8.7% | 44s |
+| bicubic | 750.1 | −9.8% | 44s |
+| area | 722.0 | −9.2% | 47s |
+| nearest | 690.5 | −10.4% | 46s |
+
+`bilinear` 在锐度和运动保留上**同时最优**,耗时也最低档。反直觉的是 `bicubic` 没赢 ——
+它在这条链路里是给 DiT 喂输入,不是出片,更锐的预插值反而让模型少了发挥空间。
+`nearest` 明显最差(锐度 −8%)。**结论:维持默认,不引入该键。**
+
+### 5.5.3 "streaming 因果模式"—— 没有这个开关
+
+我在上一版待办里列过"streaming 因果模式未测",**这个表述不准确**。查证后:
+`streaming.py` 里的因果 chunk 流式是 SwiftVR 的**唯一**推理模式,没有开关也没有
+非因果的对照实现。这条路径上真正可调的只有 `dit_overlap`(块间重叠的 latent 帧数),
+而它已在 §5.4 扫过(0/2/4,对运动指标无改善)。该待办作废。
+
+## 六、分辨率封顶(接生产必需,2026-08-28 补)
+
+**这是接入过程中最危险的一个坑。**
+
+现网 SR 的输出分辨率历来不是用户定的,而是引擎按部署档位出片:网关前端固定下发
+`sr_ratio=4.0`(new-api `VIDEO_SR_RATIO_UNCAPPED`,其注释原话是"一个够不着的上限"),
+指望引擎用 config 档位 `min` 掉它 —— SeedVR2 靠 `seedvr_runner.py:241` 兜住。
+
+SwiftVR 接进来时**没有这层**:`resolve_output_size` 在没给 `target_shape` 时直接
+`source × sr_ratio`,配置里也没有 `target_height/target_width`。把管理端的 upscale 规则
+从 seedvr2 换成 swiftvr,1344×768 的源乘 4 就会去出 **5376×3072(≈5.3K)**,远超实测的
+4K/33G 上限,**必 OOM;且不报参数错,跑起来才炸**。
+
+修法是两条路分开封顶,不能用同一把尺:
+
+| 请求形态 | 封顶 | 结果 |
+|---|---|---|
+| 只给 `sr_ratio`(网关默认) | `target_height/target_width` = 1080P 档,按源朝向配长短边 | 横源 1920×1080、竖源 1080×1920、方源 1080×1080 |
+| 显式 `target_shape` | 仅 `max_target_height/width` = 4K 显存护栏,超了按**面积**等比压回并 WARNING | 2K/4K 照常放行 |
+
+`target_shape` 这条**不能**用档位封 —— 那会把 2K/4K 一起封死,而"一份配置吃全分辨率"
+正是靠它。按面积而非逐边压,是因为显存跟像素数走,且等比不改变请求的画幅比例。
+
+出包后端到端验证(纯镜像代码,不挂任何覆盖):
+
+| 场景 | 卡 | 参数 | 源 → 产物 | 耗时 |
+|---|---|---|---|---|
+| 网关真实载荷 | 4 | `sr_ratio 4.0` | 1344×768 → **1920×1080** | 40s |
+| 显式 4K 能力 | 4 | `target_shape 2160 3840` | → **3840×2160** | 61s |
+| 显存护栏 | 4 | `target_shape 4320 7680` | → **3840×2160** + WARNING | 62s |
+| 单卡 profile | 1 | `sr_ratio 4.0` | → **1920×1080** | 50s |
+
+**一处与 SeedVR2 的行为差异**:落档位时 SwiftVR 直接 interpolate 到精确档位尺寸,源与
+档位画幅比不一致时有 1.6% 拉伸(1344×768 的 1.75 → 1.778);SeedVR2 是 `fixed_shape`
+上下各裁 12 像素。选前者是因为 new-api 侧记载过他们专门改用 `fixed_shape` 就为拿到
+精确档位尺寸("标着 1080P 却不是"是他们修过的 bug)。两种取舍量级都可忽略。
+
+## 七、生产配置与部署
+
+`configs/swiftvr/a100/swiftvr.json`(单卡)与 `swiftvr_segp4.json`(四卡,多
+`parallel.seg_p_size=4` 与 `seg_warmup_chunks=1`):
+
+```json
+{
+    "attention_backend": "torch_sdpa",
+    "cross_attention_backend": "torch_sdpa",
+    "rope_type": "torch_real_rope",
+    "target_height": 1080,  "target_width": 1920,
+    "max_target_height": 2160, "max_target_width": 3840,
+    "clip_len": 24, "dit_overlap": 0, "reae_frame_batch_size": 1,
+    "fps": null,
+    "video_codec": "libx264", "quality": 76, "ffmpeg_preset": "fast",
+    "queue_size": 3
+}
+```
+
+**GPUStack 侧零配置**:`profiles.yaml` 与配置 JSON 都随 `COPY . /opt/LightX2V` 打进镜像,
+launcher 按 `(model_cls, gpu_count)` 自动选变体 —— 权重目录传
+`/nfs-data/models/SwiftVR_lightx2v`(名字含 `swiftvr` 即被识别为 `model_cls=swiftvr` /
+`task=sr`),卡数选 1 → `swiftvr/1card`,选 4 → `swiftvr/segp4`,选 2/3 会被直接拒绝。
+
+gpustack 主仓**不需要改代码**:`sr` 已在 `_VIDEO_TASK_TYPES`,输入字段
+`video → video_path` 已有,`lightx2v_resource_fit_selector` 是整卡预订、不做权重显存
+估算。建议补的是**运行时配置**:准入表 `lightx2v_model_latency_seconds` /
+`lightx2v_model_queue_wait_seconds` 给 swiftvr 单独条目(11s vs SeedVR2 的 200s,
+套用视频默认值会把背压算得太松)。
+
+**new-api 侧必须改两处(截至 2026-08-28 未改)**:
+
+1. **〔阻塞〕`inferTaskType` 认不出 swiftvr** —— `relay/channel/task/gpustackplus/adaptor.go:805`
+   的 sr 分支是 `Contains("seedvr") || Contains("-sr") || HasSuffix("sr")`,`swiftvr` 三条
+   全不中(结尾是 `vr` 不是 `sr`),落到 `default: t2v`。后果不是报错而是**静默走错路径**:
+   `materializeSRInputs` 不被调用,源视频压根不物化。
+2. `ModelList` 缺 `swiftvr` 条目(`constants.go`)。
+
+## 八、复现
+
+```bash
+# 四卡段并行,目标由请求给
+docker run --rm --gpus all --ipc=host --shm-size=32g \
+  -v /nfs-models:/nfs-models -v /nfs-data:/nfs-data \
+  lightx2v:arm64-a100-latest \
+  torchrun --nproc_per_node=4 -m lightx2v.infer \
+    --model_cls swiftvr --task sr \
+    --model_path /nfs-data/models/SwiftVR_lightx2v \
+    --config_json /opt/LightX2V/configs/swiftvr/a100/swiftvr_segp4.json \
+    --video_path <源.mp4> --target_shape 1080 1920 \
+    --save_result_path <出.mp4>
+```
+
+`--target_shape` 是 **`高 宽`**(我第一次写反过,出了张 1080×1920 竖版)。不给它就走
+`--sr_ratio`,按 §六 封到 1080P 档。
+
+运动指标脚本 `/data/lx2v_test/motion_cmp.py`(帧差高分位 + 运动像素占比 + 锐度),
+判读基准是"源"那一行,越接近源越好;明显低于源 = 抹掉了运动细节。
+
+## 九、踩坑记录(SwiftVR 相关)
+
+1. **decord 垫片缺 `.shape`(我们自己的坑)**。aarch64 没有 decord wheel,镜像里放的是
+   PyAV 写的垫片,其 `_NDArray` 只给了 `asnumpy()`。真 decord 返回的 tvm NDArray 有
+   `.shape/.dtype/.ndim`,所以 `run_video_pipeline` 里 `first_frame.shape[0] // 8 * 8`
+   直接 `AttributeError`。已补三个属性 + `__getattr__` 委派,并把垫片从 base Dockerfile
+   的内联 heredoc 抽成仓库文件 `dockerfiles/decord_shim/decord.py`,base 与 app 共用一份。
+2. **`rope_type: "torch"` 在新上游会 KeyError**。上游 `ROPE_REGISTER` 改名为
+   `torch_real_rope` / `torch_complex_rope` / `flashinfer_rope`。镜像没装 flashinfer,
+   用 `torch_real_rope`。
+3. **段并行 `stats` 报的是 rank0 本地帧数**(Codex 评审发现)。拼接后 rank0 继续用本地
+   `written` 构造 `stats` 与吞吐日志,4 卡 372 帧时报成约 93 帧、fps 同步缩水到 1/4。
+   产物无误(有 ffprobe 硬校验),但监控口径错。已改为拼接后取 `joined`。
+4. **并行 `docker pull` 静默不生效**。用 `pull -q` 且吞掉 stderr 时,多台并行拉取会出现
+   `latest` 标签没更新却不报错的情况;逐台执行正常。别吞 pull 的输出。
+
+## 十、待办 / 未验证
+
+- **待你肉眼确认**:p2(雨夜奔跑)的产物。指标说 SwiftVR 在这条上贴近源(+2.3%),
+  与 p1 的 −8.7% 相反;若肉眼也认可,分流判据就按 §5.2 收窄为"细小高速飞溅/粒子",
+  否则维持保守口径。产物 `/nfs-data/lx2v_test/out_cmp/swiftvr.p2_motion.mp4`。
+- **未测**:`use_compile` 在**常驻 server 里跨分辨率**是否重编译(§5.5.1 的推断)。
+  只有将来想开这个开关时才需要补。
+- ~~streaming 因果模式~~ —— 查证后无此开关,见 §5.5.3,作废。
+- ~~`upscale_mode` 其它取值~~ —— 已扫完四种,默认最优,见 §5.5.2。
+- **插帧**:SwiftVR 配置里没有 `video_frame_interpolation` 块。new-api 侧
+  `INTERPOLATION_ENABLED` 当前是关的,不阻塞;但其注释记载超分段插帧会让 SeedVR2 的
+  seg_parallel 退回串行(362 帧 207s→673s),这个约束对 SwiftVR 的段并行**同样成立**,
+  将来要开插帧须重新评估。
+- **new-api 两处改动**(§七)未完成,由另一路并行处理。
+
+## 相关文档
+
+- `docs/现网部署清单.md` —— 4b 行与"SwiftVR 部署说明"
+- `docs/SeedVR2-实验测试报告.md` / `docs/SeedVR2-超分-运行手册.md` —— 对照组
+- `docs/视频超分-SeedVR2与FlashVSR备查.md` —— 更早的超分选型调研
