@@ -106,6 +106,10 @@ def _infer_model_cls(model_path: str, override: str) -> str:
         return "infinitetalk"
     if "seedvr" in name:
         return "seedvr2"
+    # 转换后的权重目录叫 SwiftVR_lightx2v。与 seedvr 分支互不误伤("swiftvr" 里没有
+    # "seedvr"),也不含 wan/qwen/vace/ltx 这些 token,放这里只是因为同属 SR 便于阅读。
+    if "swiftvr" in name:
+        return "swiftvr"
     if "vace" in name:
         return "wan2.2_moe_vace"
     if "wan" in name:
@@ -140,6 +144,8 @@ def _infer_task_hint(model_path: str, override: str) -> str:
     if "infinitetalk" in name:
         return "s2v"
     if "seedvr" in name:
+        return "sr"
+    if "swiftvr" in name:
         return "sr"
     if "vace" in name:
         return "vace"

@@ -456,6 +456,19 @@ class SwiftVRRunner(DefaultRunner):
         # 因为无论是否启用段并行,每个 rank 都会执行到这一行。
         if seg_world > 1 and self._seg_gloo_group is None:
             self._seg_gloo_group = dist.new_group(backend="gloo")
+        # 预热块数。默认 1 足够,原因分两条:
+        #
+        # 1) ReAE 的因果状态收敛极快。把源视频从第 96 帧切开单跑、与完整跑逐帧比:
+        #    首帧差 2.1、第 4 帧 1.3、第 8 帧起稳定在 1.09(编码噪声级)。一块绰绰有余。
+        #
+        # 2) dit_overlap 让 DiT 额外看前一块尾部的若干 latent 帧(previous_input)。
+        #    预热块跑完就把它设好了,所以段并行**不与 dit_overlap 冲突** —— 实测
+        #    4 卡+overlap2 vs 单卡+overlap2 平均差 0.303、差>3 占 0.032%,比 overlap
+        #    这个参数本身造成的差异(0.621)还小。
+        #
+        # ⚠️ 但 seg_warmup_chunks=0 配 dit_overlap>0 是个静默陷阱:各 rank 的首块拿不到
+        #    previous_input,那一块会退化成无重叠,不报错,只在块边界留细微不连续。
+        #    要把它调成 0,得同时确认 dit_overlap 也是 0。
         warmup_chunks = max(0, int(self.config.get("seg_warmup_chunks", 1)))
         parts_dir = None
         part_paths = []
@@ -625,6 +638,10 @@ class SwiftVRRunner(DefaultRunner):
             if joined != raw_frame_count:
                 raise RuntimeError(f"SwiftVR seg_parallel: joined video has {joined} frames, expected {raw_frame_count}")
             logger.info(f"SwiftVR seg_parallel: joined {len(part_paths)} parts into {joined} frames")
+            # written 到这里只是 rank0 自己那段的帧数(4 卡约 1/4)。下面的 stats 和吞吐
+            # 日志描述的是整个请求,必须换成拼接后的总帧数,否则监控里的 frames/fps 会
+            # 按卡数缩水。
+            written = joined
             # 这里**不**删 parts_dir:清理放在下次运行开头(rank0 建目录前 rmtree)。
             # 之前在这里删,会把仍在写 mp4 trailer 的其他 rank 的分片抽走,
             # 报 "Unable to re-open ... for shifting data"。

@@ -237,6 +237,31 @@ wan2.2_moe_vace:
 # Input red lines are enforced UPSTREAM (gateway VideoModelConfig): suggested
 # launch caps ≤720p in, ≤15s (engine warns >361 frames). Non-24fps sources are
 # tempo-aligned at mux (atempo) — sync is exact, but ~24fps material is best.
+
+# SwiftVR:实时一步式视频修复(骨架 Wan2.2-TI2V-5B)。
+# 目标分辨率来自请求的 target_shape / sr_ratio,**不在配置里** —— 一个实例串行吃
+# 1080p/2K/4K,切换不用重启(已实测,含跑完 4K 再回 1080p 无劣化)。
+# 显存(1080p / 2K / 4K):单卡 15.8G / 19.8G / 32.5G;四卡每卡 16.0G / 19.8G / 33.2G。
+# ⚠️ 混部按最高档 33G 算:PyTorch 缓存分配器不归还,实例处理过 4K 之后占用不再降。
+# ⚠️ 高速运动素材(飞溅/粒子)上 SwiftVR 会压低运动细节(运动能量相对源 -8.7%,
+#    SeedVR2 是 +12%),这是 ReAE 时间轴 4x 下采样的架构代价,配置调不动
+#    (clip_len 24->96、dit_overlap 0->4 实测均无改善)。那类素材仍走 SeedVR2。
+swiftvr:
+  variants:
+    - name: swiftvr/1card
+      gpus: 1
+      task: sr
+      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr.json
+    # 段级数据并行:整段按 chunk **连续**切给各 rank(连续而非轮转,这样每个 rank 只需
+    # 在自己区间开头预热一次 ReAE 因果状态),末尾按块号 concat 并校验总帧数。
+    # 单请求 1080p 23s->11s、2K 37s->18s、4K 78s->32s(2.1~2.4x)。
+    # 注意:**吞吐上 4 个单卡实例仍然更划算**(线性 4x,零通信),四卡只赢单请求延迟。
+    - name: swiftvr/segp4
+      gpus: 4
+      task: sr
+      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_segp4.json
+      seg_p_size: 4
+
 ltx2:
   variants:
     - name: ltx2-v2a/bf16-1card
