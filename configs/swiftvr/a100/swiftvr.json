@@ -6,8 +6,8 @@
     "dit_overlap": 0,
     "reae_frame_batch_size": 0,
     "fps": null,
-    "video_codec": "libx265",
+    "video_codec": "libx264",
     "quality": 76,
-    "ffmpeg_preset": "veryfast",
+    "ffmpeg_preset": "fast",
     "queue_size": 3
 }
