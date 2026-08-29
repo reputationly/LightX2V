@@ -52,6 +52,10 @@ class SRInputInfo:
     image_path: str = field(default_factory=str)  # Single image input
     video_path: str = field(default_factory=str)  # Video input for SR
     sr_ratio: float = field(default_factory=lambda: 2.0)
+    # 目标短边(像素)。给了它就按**源的真实画幅**等比放大到该短边 —— 只有引擎知道源的
+    # 真实宽高,前端拿到的只是用户选的比例标签(H3 的 768P/16:9 实际出 1344x768=1.75,
+    # 不是 1.778),照标签算会带形变。0 = 未设。
+    target_short_edge: int = field(default_factory=int)
     save_result_path: str = field(default_factory=str)
     return_result_tensor: bool = field(default_factory=lambda: False)
     # shape related

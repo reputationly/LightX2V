@@ -199,11 +199,28 @@ class SwiftVRRunner(DefaultRunner):
         target_shape 这条路是 SwiftVR 独有的能力(SeedVR2 压根不读 target_shape),
         一份配置串行吃 1080p/2K/4K 靠的就是它,所以**不能**用档位去封 —— 那会把 2K/4K
         一起封死。它只过 `_clamp_to_ceiling` 的显存护栏。
+
+        target_short_edge 是给网关用的第三条路:只给一个目标短边,输出按**源的真实画幅**
+        等比放大。它存在的理由是「只有引擎知道源有多大」—— 网关手里只有用户选的比例
+        标签,而标签和实际画幅并不相等(H3 的 768P/16:9 实际出 1344x768 = 1.75,不是
+        1.778;wan 的 720P 是 1280x720 = 1.778),照标签算 target_shape 会带约 1.6% 的
+        横向拉伸,且档位越高越明显。按短边对齐则画幅零形变、短边精确命中目标档,
+        1080P/2K/4K 共用同一个机制,网关只需下发一个数字。
+
+        三条路的优先级:target_shape(精确尺寸,调用方完全指定) > target_short_edge
+        (指定档位、画幅随源) > sr_ratio(倍率,按部署档位封顶)。
         """
         if input_info.target_shape:
             if len(input_info.target_shape) != 2:
                 raise ValueError(f"SwiftVR target_shape must be [height, width], got {input_info.target_shape}")
             height, width = input_info.target_shape
+        elif int(getattr(input_info, "target_short_edge", 0) or 0) > 0:
+            edge = int(input_info.target_short_edge)
+            source_edge = min(source_height, source_width)
+            if source_edge <= 0:
+                raise ValueError(f"SwiftVR source size must be positive, got {source_width}x{source_height}")
+            scale = edge / source_edge
+            height, width = round(source_height * scale), round(source_width * scale)
         else:
             ratio = input_info.sr_ratio
             height, width = round(source_height * ratio), round(source_width * ratio)
