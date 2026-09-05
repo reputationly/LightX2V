@@ -380,12 +380,14 @@ class BaseTransformerModel(ABC):
             lora_weight = self._load_lora_file(lora_path)
         self.pre_weight.update_lora(lora_weight, strength)
         self.transformer_weights.update_lora(lora_weight, strength)
-        self.post_weight.update_lora(lora_weight, strength)
+        if hasattr(self, "post_weight"):
+            self.post_weight.update_lora(lora_weight, strength)
 
     def _remove_lora(self):
         self.pre_weight.remove_lora()
         self.transformer_weights.remove_lora()
-        self.post_weight.remove_lora()
+        if hasattr(self, "post_weight"):
+            self.post_weight.remove_lora()
 
     def _load_safetensor_to_dict(self, file_path, unified_dtype, sensitive_layer):
         """Load a safetensors file into a dictionary.
@@ -440,10 +442,7 @@ class BaseTransformerModel(ABC):
         if _tp_dev:
             _saved_device, self.device = self.device, torch.device("cpu")
 
-        if self.config.get("dit_original_ckpt", None):
-            safetensors_path = self.config["dit_original_ckpt"]
-        else:
-            safetensors_path = self.model_path
+        safetensors_path = self.config.get("dit_original_ckpt") or self.config.get("transformer_model_path") or self.model_path
 
         if os.path.isdir(safetensors_path):
             if self.lazy_load:
@@ -454,10 +453,7 @@ class BaseTransformerModel(ABC):
                 else:
                     raise ValueError(f"Non-block file not found in {safetensors_path}. Please check the model path.")
             else:
-                if self.config["model_cls"] == "hunyuan_video_1.5":
-                    safetensors_files = glob.glob(os.path.join(safetensors_path, "transformer", self.config["transformer_model_name"], "*.safetensors"))
-                else:
-                    safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
+                safetensors_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
         else:
             if self.lazy_load:
                 self.lazy_load_path = safetensors_path

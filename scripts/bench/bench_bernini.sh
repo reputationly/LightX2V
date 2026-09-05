@@ -37,7 +37,7 @@ run_one() { # $1=idx $2=gpu
   local out="$OUT/${id}.mp4" log="$OUT/${id}.log"
   docker run --rm --runtime nvidia --gpus "\"device=${g}\"" --memory 60g \
     -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output -e PYTHONPATH=/opt/LightX2V "$IMG" \
-    python -m lightx2v.infer --model_cls wan2.2_moe_distill --task "$LX_TASK" \
+    python -m lightx2v.infer --model_cls wan2.2_moe --task "$LX_TASK" \
     --model_path "$MODEL_PATH" --config_json "$CONFIG" \
     --prompt "$prompt" --negative_prompt "$NEG" \
     --save_result_path "$out" > "$log" 2>&1

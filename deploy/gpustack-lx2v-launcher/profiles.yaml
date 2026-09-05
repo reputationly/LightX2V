@@ -58,25 +58,27 @@ wan2.2_moe:
       seq_p_attn_type: ulysses
       cfg_p_size: 1
 
-# Wan2.2 I2V — the launcher maps model paths containing i2v/flf2v to this
-# DISTILL cls (docs/Wan2.2-I2V-实验测试报告.md: model_cls=wan2.2_moe_distill,
-# task=i2v or flf2v). Same production shape as T2V: int8 4-card ulysses
-# (~33-35G/GPU), int8 single-card OOMs at 720p, bf16 multi-card CPU-OOMs.
-# int8 DiT ckpts live on shared NFS (models-int8/).
-#
-# DEPLOY NOTE: there is no separate I2V base dir — the I2V pipeline takes
-# VAE/T5 from the T2V base (report §2), so deploy with
-#   Model Path = .../models/Wan-AI/Wan2.2-T2V-A14B
-#   I2V backend parameters:  --model-cls wan2.2_moe_distill --task i2v
-#   FLF2V backend parameters: --model-cls wan2.2_moe_distill --task flf2v
-# (without them the launcher infers t2v from the path and fails loudly).
-# FLF2V uses the same weights but a separate task/profile so sample_shift=16
-# stays a startup-time production setting rather than a per-request override.
-# Like T2V/I2V, it generates at native 16fps and applies RIFE post-processing
-# to output 32fps by default. Clients can explicitly request target_fps=16 to
-# keep the native frames without interpolation.
-wan2.2_moe_distill:
-  variants:
+    # Wan2.2 I2V / FLF2V —— 与 T2V 同一个 model_cls,靠 task 区分变体。
+    #
+    # ⚠️ 上游 #1455(23fc3d45)把 wan2.2_moe_distill 并进了 wan2.2_moe:蒸馏不再是
+    # 独立 runner,而是由 config 里的 `distill_method: dmd2` 选调度器
+    # (scheduler_factory.get_wan_distill_method -> WanStepDistillScheduler)。
+    # 所以三份 configs/deploy/wan22_*_int8_4card_a100.json 都补了该字段,
+    # 且 i2v/flf2v 从原来的 wan2.2_moe_distill 段移到这里。**别再传
+    # --model-cls wan2.2_moe_distill,那个注册名已经不存在。**
+    #
+    # 生产形态同 T2V:int8 4 卡 ulysses(~33-35G/卡),int8 单卡 720p 会 OOM,
+    # bf16 多卡会 CPU-OOM。int8 DiT ckpt 在共享 NFS(models-int8/)。
+    #
+    # DEPLOY NOTE: 没有独立的 I2V base 目录 —— I2V 管线的 VAE/T5 取自 T2V base
+    # (报告 §2),所以部署时:
+    #   Model Path = .../models/Wan-AI/Wan2.2-T2V-A14B
+    #   I2V   backend parameters: --task i2v
+    #   FLF2V backend parameters: --task flf2v
+    # (不传 task 的话 launcher 会从路径推出 t2v,然后响亮地失败。)
+    # FLF2V 用同一份权重但单独一个 task/profile,好让 sample_shift=16 是启动期的
+    # 生产设定,而不是每请求覆盖。与 T2V/I2V 一样原生 16fps + RIFE 出 32fps;
+    # 客户端可显式 target_fps=16 拿不插帧的原生帧。
     - name: wan2.2-i2v/int8-4card
       gpus: 4
       task: i2v

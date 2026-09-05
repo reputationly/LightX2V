@@ -67,7 +67,7 @@ docker run -d --name "$NAME" --gpus all --memory=240g --memory-swap=240g $SHM -p
   -v /nfs-models:/nfs-models -v /nfs-output:/nfs-output \
   -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
   -e CUDA_VISIBLE_DEVICES="$GPUS" \
-  "$IMG" $RUNCMD --model_cls wan2.2_moe_distill --task t2v --model_path "$MODEL_PATH" --config_json "$CFG" \
+  "$IMG" $RUNCMD --model_cls wan2.2_moe --task t2v --model_path "$MODEL_PATH" --config_json "$CFG" \
   --host 0.0.0.0 --port 8000 >/dev/null || { echo "${R}容器启动失败${N0}"; exit 2; }
 
 # ---- 后台监控采样器: 每 2s 一行 CSV ----

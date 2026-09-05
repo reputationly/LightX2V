@@ -9,7 +9,7 @@ P="实拍风格，一条瀑布从青灰色岩壁倾泻而下，水雾弥漫，�
 exec > >(tee -a "$OUTD/tbest.log") 2>&1
 
 echo "########## [$(date +%T)] 第一步: t2v 720p 4卡 triton ##########"
-LX_IMG=$LX_IMG NAME=tbest-gen MODEL_CLS=wan2.2_moe_distill TASK=t2v NP=4 GPUS="0,1,2,3" PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
+LX_IMG=$LX_IMG NAME=tbest-gen MODEL_CLS=wan2.2_moe TASK=t2v NP=4 GPUS="0,1,2,3" PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
 MODEL_PATH=/nfs-data/models/Wan-AI/Wan2.2-T2V-A14B \
 CFG="$SMOKE/w1c_t2v_triton.json" \
 PROMPT="$P" \

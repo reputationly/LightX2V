@@ -113,10 +113,9 @@ def _infer_model_cls(model_path: str, override: str) -> str:
     if "vace" in name:
         return "wan2.2_moe_vace"
     if "wan" in name:
-        # I2V/FLF2V is the distill cls (Wan2.2-I2V experiment report:
-        # model_cls=wan2.2_moe_distill); T2V is the plain MoE cls (§12.2).
-        if "i2v" in name or "flf2v" in name:
-            return "wan2.2_moe_distill"
+        # T2V / I2V / FLF2V 现在同属 wan2.2_moe,靠 task 区分 profile 变体。
+        # 上游 #1455 把 wan2.2_moe_distill 并了进来,蒸馏改由 config 的
+        # `distill_method: dmd2` 决定(见 profiles.yaml 里 wan2.2_moe 段的说明)。
         return "wan2.2_moe"
     if "qwen" in name:
         return "qwen_image"

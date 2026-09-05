@@ -82,7 +82,7 @@ FAILED=""
 run(){  # $1=变体 $2=卡数
   local v=$1 np=$2 cfg; cfg=$(gen_cfg "$v")
   echo; echo "######### Wan2.2-I2V 720p [$v] (np=$np) #########"
-  if ! NAME="wan-$TASK-$v" MODEL_CLS=wan2.2_moe_distill TASK="$TASK" MODEL_PATH="$BASE" CFG="$cfg" \
+  if ! NAME="wan-$TASK-$v" MODEL_CLS=wan2.2_moe TASK="$TASK" MODEL_PATH="$BASE" CFG="$cfg" \
     PROMPT="$PROMPT" NEG_PROMPT="$NEG_PROMPT" IMAGE="$IMAGE" LAST_FRAME="$LAST_FRAME" OUT="$RUNDIR/${v}_s${SEED}.mp4" \
     NP="$np" FRAMES="$FRAMES" SEED="$SEED" STEPS="$INFER_STEPS" RESIZE_MODE="${RESIZE_MODE:-}" \
     bash "$HARNESS"; then

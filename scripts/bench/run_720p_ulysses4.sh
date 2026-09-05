@@ -16,7 +16,7 @@ docker run --rm --runtime nvidia --gpus all --memory 200g --shm-size 16g \
   `# -e NCCL_P2P_DISABLE=1 -e NCCL_IB_DISABLE=1   # NCCL 卡死时去注释` \
   "$IMG" \
   torchrun --nproc_per_node=4 -m lightx2v.infer \
-    --model_cls wan2.2_moe_distill \
+    --model_cls wan2.2_moe \
     --task t2v \
     --model_path "$MODEL_PATH" \
     --config_json "$CONFIG" \

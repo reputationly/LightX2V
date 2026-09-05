@@ -1,4 +1,5 @@
 {
+  "distill_method": "dmd2",
   "infer_steps": 4,
   "target_video_length": 81,
   "target_height": 720,

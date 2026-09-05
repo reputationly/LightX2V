@@ -206,7 +206,7 @@ case "${1:?用法: run_batch.sh srloop|s2v|seg121}" in
     exec > >(tee -a "$OUTD/${OUTN}.log") 2>&1
     IMG_ARG=""; [ "$TK" = "i2v" ] && IMG_ARG="/opt/LightX2V/assets/inputs/imgs/girl.png"
     GP="0"; [ "$NPn" -gt 1 ] && GP="0,1,2,3"
-    NAME="$OUTN" MODEL_CLS=$( [ "$ST" = "40" ] && echo wan2.2_moe || echo wan2.2_moe_distill ) TASK="$TK" \
+    NAME="$OUTN" MODEL_CLS=wan2.2_moe TASK="$TK" \
     NP="$NPn" GPUS="$GP" PORT=8100 STEPS="$ST" SEED=42 RESIZE_MODE="$RSZ" HEALTH_TO=1800 \
     MODEL_PATH=/nfs-data/models/Wan-AI/Wan2.2-T2V-A14B \
     CFG="$SMOKE/${CFGN}.json" \
@@ -253,7 +253,7 @@ case "${1:?用法: run_batch.sh srloop|s2v|seg121}" in
         P="实拍风格，一条瀑布从青灰色岩壁倾泻而下，水雾弥漫，阳光在水汽中形成光斑，岩石表面湿润反光，苔藓细节清晰，长焦镜头，自然光，纪录片质感，35mm胶片，浅景深，真实物理水流"
       fi
       exec > >(tee -a "$OUTD/tprompt_${arm}.log") 2>&1
-      NAME="tprompt-$arm" MODEL_CLS=wan2.2_moe_distill TASK=t2v NP=1 GPUS=0 PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
+      NAME="tprompt-$arm" MODEL_CLS=wan2.2_moe TASK=t2v NP=1 GPUS=0 PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
       MODEL_PATH=/nfs-data/models/Wan-AI/Wan2.2-T2V-A14B \
       CFG="$SMOKE/w1d_t2v_triton_1card.json" \
       PROMPT="$P" \

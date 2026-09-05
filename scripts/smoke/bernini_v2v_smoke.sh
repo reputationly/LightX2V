@@ -51,7 +51,7 @@ docker run --rm --runtime nvidia --gpus all --memory 200g $SHM \
   -v "$P/lightx2v/utils/input_info.py":/opt/LightX2V/lightx2v/utils/input_info.py:ro \
   -e PYTHONPATH=/opt/LightX2V \
   "$IMG" $RUNCMD \
-    --model_cls wan2.2_moe_distill \
+    --model_cls wan2.2_moe \
     --task v2v \
     --model_path "$MODEL_PATH" \
     --config_json "$CFG" \

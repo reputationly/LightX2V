@@ -16,7 +16,7 @@ case "${1:?用法: run_batch2.sh tcamera}" in
         P="$BASE_P，镜头缓慢向前推进，前进运镜"
       fi
       exec > >(tee -a "$OUTD/tcam720_${arm}.log") 2>&1
-      NAME="tcam-$arm" MODEL_CLS=wan2.2_moe_distill TASK=t2v NP=4 GPUS="0,1,2,3" PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
+      NAME="tcam-$arm" MODEL_CLS=wan2.2_moe TASK=t2v NP=4 GPUS="0,1,2,3" PORT=8100 STEPS=4 SEED=42 HEALTH_TO=1800 \
       MODEL_PATH=/nfs-data/models/Wan-AI/Wan2.2-T2V-A14B \
       CFG="$SMOKE/w1c_t2v_triton.json" \
       PROMPT="$P" \

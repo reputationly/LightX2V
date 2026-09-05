@@ -64,7 +64,7 @@ for TASK in $TASKS; do
     -e PYTHONPATH=/opt/LightX2V -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
     -e CUDA_VISIBLE_DEVICES=0,1,2,3 \
     "$IMG" torchrun --nproc_per_node=4 --master_port=29533 -m lightx2v.server \
-    --model_cls wan2.2_moe_distill --task "$TASK" --model_path "$BASE" --config_json "$CFG" \
+    --model_cls wan2.2_moe --task "$TASK" --model_path "$BASE" --config_json "$CFG" \
     --host 0.0.0.0 --port 8000 >/dev/null || { echo "[$TASK] 容器启动失败"; continue; }
 
   # 等 health
