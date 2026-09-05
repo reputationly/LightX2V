@@ -85,7 +85,9 @@ class VideoTaskRequest(BaseTaskRequest):
     src_mask: str = Field("", description="Mask video path, white=repaint (VACE MV2V; gray-fill the masked area in src_video for true inpaint)")
     src_ref_images: str = Field("", description="Reference image path(s), comma-separated (VACE R2V)")
     sr_ratio: float = Field(2.0, gt=0, description="Super-resolution scale factor used when target_shape is not set")
-    target_short_edge: int = Field(0, ge=0, description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset")
+    target_short_edge: int = Field(
+        0, ge=0, description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset"
+    )
     audio_path: str = Field("", description="Input audio path (Wan-Audio)")
     video_duration: int = Field(5, description="Video duration (Wan-Audio)")
     talk_objects: Optional[list[TalkObject]] = Field(None, description="Talk objects (Wan-Audio)")
@@ -97,7 +99,9 @@ class ImageTaskRequest(BaseTaskRequest):
     aspect_ratio: str = Field("16:9", description="Output aspect ratio")
     i2i_denoise_strength: Optional[float] = Field(None, description="Single-image I2I edit denoising strength in [0.0, 1.0]; omit to keep existing behavior")
     sr_ratio: float = Field(2.0, gt=0, description="Super-resolution scale factor used when target_shape is not set")
-    target_short_edge: int = Field(0, ge=0, description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset")
+    target_short_edge: int = Field(
+        0, ge=0, description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset"
+    )
 
 
 class SenseNovaVisionTaskRequest(BaseModel):
