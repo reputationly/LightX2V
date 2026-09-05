@@ -612,7 +612,8 @@ class SwiftVRRunner(DefaultRunner):
         parts_dir = None
         part_paths = []
         if seg_world > 1:
-            my_start, my_end = self._partition_chunks(len(chunks), seg_world)[seg_rank]
+            seg_ranges = self._partition_chunks(len(chunks), seg_world)
+            my_start, my_end = seg_ranges[seg_rank]
             run_start = max(0, my_start - warmup_chunks)
             parts_dir = os.path.join(os.path.dirname(output_path), f".{os.path.basename(output_path)}.segparts")
             if seg_rank == 0:
@@ -620,8 +621,18 @@ class SwiftVRRunner(DefaultRunner):
                 os.makedirs(parts_dir, exist_ok=True)
             # 汇合点:保证目录建好之后各 rank 才开始写
             self._seg_barrier()
-            part_paths = [os.path.join(parts_dir, f"part_{r:03d}.mp4") for r in range(seg_world)]
-            writer_path = part_paths[seg_rank]
+            # 块数 < 卡数时尾部 rank 分不到块。短视频必然如此:clip_len=24 下首块吃 28 帧、
+            # 之后每块 24,要凑够 4 块得 74 帧(24fps 才 3.1 秒)——2~5 秒的素材全部落在这里。
+            # 这些 rank **不产出分片**,而不是产出 0 字节分片:后者会被 rank0 的完整性检查
+            # 当成「这一路挂了」而抛 missing or empty segment parts(上游报告问题 C / G8)。
+            # 它们仍然要走两个 gloo 汇合点,否则其余 rank 会卡在屏障上。
+            owner_ranks = [r for r, (start, end) in enumerate(seg_ranges) if start < end]
+            part_paths = [os.path.join(parts_dir, f"part_{r:03d}.mp4") for r in owner_ranks]
+            writer_path = os.path.join(parts_dir, f"part_{seg_rank:03d}.mp4")
+            if my_start >= my_end:
+                logger.info(f"SwiftVR seg_parallel: rank {seg_rank}/{seg_world} idle — only {len(chunks)} chunk(s) to go around, {len(owner_ranks)} rank(s) working")
+                self._seg_barrier()  # 与末尾「分片都已落盘」那个汇合点配对
+                return {"video": None, "stats": {"frames": 0, "seconds": 0.0}}
             logger.info(f"SwiftVR seg_parallel: rank {seg_rank}/{seg_world} owns chunks [{my_start}, {my_end}) of {len(chunks)}, warming up from chunk {run_start}")
         else:
             my_start, my_end, run_start = 0, len(chunks), 0
