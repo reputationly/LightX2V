@@ -259,20 +259,32 @@ wan2.2_moe_vace:
 # 不开 use_compile:冷编译 +20s,稳态每块才快 17%(单请求省 2.8s),约 7 个同分辨率
 #    请求才摊平;且编译缓存 key 不含形状,换分辨率必重编译,与"一份配置吃全分辨率"相冲。
 # upscale_mode 保持默认 bilinear:四种全测过,它在锐度与运动保留上同时最优。
+# 2026-09-05 起默认走**反相双跑**配置(antiphase_dual_pass + antiphase_strength_gain=1.4)。
+# 买的是 2beat:ReAE 解码器最后一个 TemporalGrow 把 3 抽头时间卷积关在每一对帧内部,
+# 输出帧天生两两成对,匀速素材也「走两帧顿一下」—— 这是上游那份闪烁投诉的根因。
+# 把输入整体移 1 帧再跑一遍、两路平均即可对消,gain=1.4 补回平均削掉的高频。
+# 四素材验收:锐度 99.0~118.7%(不降反升三条)、2beat 偏离源 0.13~0.33 收到 0.0003~0.028。
+# 代价随分辨率涨(restore 阶段确实翻倍,占比越大端到端越吃亏):
+#   1080p 4卡 13.6~15.1s -> 16.6~17.2s(约 1.1~1.3x),显存/卡 13.54 -> 14.04 GiB
+#   2K    4卡 16.6s      -> 29.6s     (1.79x),        显存/卡 16.71 -> 17.58 GiB
+# 不满意可随时回退:把 config_json 换回同目录不带 _antiphase 的那两份即可,
+# 关掉开关时输出与改造前 **md5 逐位相同**(已验)。
 swiftvr:
   variants:
     - name: swiftvr/1card
       gpus: 1
       task: sr
-      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr.json
+      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_antiphase.json
     # 段级数据并行:整段按 chunk **连续**切给各 rank(连续而非轮转,这样每个 rank 只需
     # 在自己区间开头预热一次 ReAE 因果状态),末尾按块号 concat 并校验总帧数。
     # 单请求 1080p 23s->11s、2K 37s->18s、4K 78s->32s(2.1~2.4x)。
     # 注意:**吞吐上 4 个单卡实例仍然更划算**(线性 4x,零通信),四卡只赢单请求延迟。
+    # ⚠️ 反相双跑靠 carry 跨块传帧,各 rank 的首帧要与预热块产生的 carry 配对,
+    #    所以段并行下 seg_warmup_chunks 必须 >=1(配置里已设,runner 也会强制校验)。
     - name: swiftvr/segp4
       gpus: 4
       task: sr
-      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_segp4.json
+      config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_antiphase_segp4.json
       seg_p_size: 4
 
 ltx2:
