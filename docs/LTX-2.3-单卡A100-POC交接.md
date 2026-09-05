@@ -416,7 +416,18 @@ docker tag <本地 base> crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.
 while ! docker push crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu128-a100-base; do sleep 5; done
 ```
 **B. 同步到 Docker Hub**：GitHub Actions → 手动触发 `Sync base image (ACR -> Docker Hub)`。
-**C. 日常出包**：push 代码即可，`Build ARM64 Docker Image` 自动跑，4.5 分钟双推两地。
+**C. 日常出包**：`Build ARM64 Docker Image` 是 **`workflow_dispatch` 手动触发**，
+push **不会**自动构建（本文原写"push 代码即可自动跑"，**已不成立**，2026-09-05 更正）：
+
+```bash
+gh workflow run build-arm64-docker.yml --repo reputationly/LightX2V --ref main
+gh run watch <run-id> --repo reputationly/LightX2V --exit-status   # 约 4.5 分钟,双推两地
+```
+
+产出 `arm64-a100-<YYYYMMDD-HHMM>-<shortsha>` + 覆盖 `arm64-a100-latest`，并自动建 GitHub Release。
+另注意 `dockerfiles/build_deploy.sh` 是**上游**的脚本（`linux/amd64` + `lightx2v/lightx2v` 仓，
+且强制 main 分支），**不是我们这条 ARM 线**，别用错。
+节点侧的分发与升级见 gpustack 仓 `docs/lightx2v-节点运维手册.md`。
 **D. GHA secrets**：`ACR_USERNAME`/`ACR_PASSWORD`（推 ACR）、`DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN`（账号 arronlee，同步/双推 Docker Hub）。
 
 ### 13.8 已知坑
