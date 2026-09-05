@@ -1,8 +1,9 @@
 from .model import SwiftVRModel, normalize_swiftvr_config
 from .reae import RestorationAutoencoder
-from .streaming import SwiftVRRestorer, build_video_chunks, padded_frame_count
+from .streaming import AntiphaseBlender, SwiftVRRestorer, build_video_chunks, padded_frame_count
 
 __all__ = [
+    "AntiphaseBlender",
     "RestorationAutoencoder",
     "SwiftVRModel",
     "SwiftVRRestorer",

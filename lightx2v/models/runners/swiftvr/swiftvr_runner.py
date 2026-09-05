@@ -18,6 +18,7 @@ from loguru import logger
 from safetensors import safe_open
 
 from lightx2v.models.networks.swiftvr import (
+    AntiphaseBlender,
     RestorationAutoencoder,
     SwiftVRModel,
     SwiftVRRestorer,
@@ -97,14 +98,51 @@ class SwiftVRRunner(DefaultRunner):
         ) as weights:
             prompt_embedding = weights.get_tensor("prompt_emb").to(self.init_device, GET_DTYPE())
 
-        self.restorer = SwiftVRRestorer(
-            autoencoder,
-            self.model,
-            prompt_embedding,
-            overlap=self.config.get("dit_overlap", 0),
-            reae_frame_batch_size=self.config.get("reae_frame_batch_size", 1),
-        )
+        def build_restorer(strength: float):
+            return SwiftVRRestorer(
+                autoencoder,
+                self.model,
+                prompt_embedding,
+                overlap=self.config.get("dit_overlap", 0),
+                reae_frame_batch_size=self.config.get("reae_frame_batch_size", 1),
+                strength=strength,
+            )
+
+        # 两个数,两件事,别混：
+        #
+        # restoration_strength 是**用户旋钮**。1.0 = 上游原行为;调低用于抑制「把源本身的
+        # 缺陷(水波纹/噪点/压缩块)当成细节一起放大」——SwiftVR 在重退化数据上训过,喂它
+        # 轻退化素材(AIGC 直出、干净拍摄)会过度生成。
+        #
+        # antiphase_strength_gain 是**引擎补偿**。反相平均是逐像素取两条流的均值,这个平均
+        # 本身要削掉约三成高频(实测锐度 lap 2905 -> 1969),所以双跑路径得把残差按比例放大
+        # 才能回到基线画质(1.40 实测补平:2876~2921)。它不代表「用户想要更强的恢复」。
+        base_strength = float(self.config.get("restoration_strength", 1.0))
+        antiphase = bool(self.config.get("antiphase_dual_pass"))
+        gain = float(self.config.get("antiphase_strength_gain", 1.4)) if antiphase else 1.0
+
+        self.restorer = build_restorer(base_strength * gain)
+        # 反相双跑的第二条流。SwiftVRRestorer 只持有流式状态(encoder_state/decoder_state/
+        # temporal_offset),权重在 autoencoder 与 self.model 里,由 run_causal_layers 把
+        # 状态穿进穿出 —— 所以再建一个实例是**共享权重、独立状态**,不吃第二份显存。
+        self.restorer_shifted = build_restorer(base_strength * gain) if antiphase else None
+        # 图像路径**不能**吃补偿系数:单张图没有时间轴,反相平均无从谈起,补偿加上去就是纯
+        # 过锐(实测 s1.40 不做反相 lap 4349,是基线 2905 的 1.5 倍)。而 run_pipeline 是按
+        # 输入类型**运行时**分流的,同一个部署会同时收到图和视频,靠约定隔离必然静默出错。
+        # 反相关闭时它与 self.restorer 等价,不必单独建 —— restore_frames 的
+        # `restorer or self.restorer` 会自然兜住 None。
+        self.restorer_image = build_restorer(base_strength) if antiphase else None
         self.config.lock()
+
+    def _reset_restorers(self):
+        for restorer in (self.restorer, self.restorer_shifted, self.restorer_image):
+            if restorer is not None:
+                restorer.reset()
+
+    def _seed_temporal_offset(self, latent_offset: int):
+        self.restorer.seed_temporal_offset(latent_offset)
+        if self.restorer_shifted is not None:
+            self.restorer_shifted.seed_temporal_offset(latent_offset)
 
     @ProfilingContext4DebugL1("Warmup")
     @torch.inference_mode()
@@ -132,7 +170,9 @@ class SwiftVRRunner(DefaultRunner):
                     restored = self.restorer.restore_chunk(video, chunk, clip_latents)
                     del video, restored
             finally:
-                self.restorer.reset()
+                # 移位流走同一批权重、同一组形状,编译缓存与它共用,不必单独预热一遍;
+                # 但它的因果状态必须干净地进正式请求。
+                self._reset_restorers()
 
         logger.info("[Warmup] Warmup completed")
         self._maybe_freeze_gc()
@@ -270,6 +310,7 @@ class SwiftVRRunner(DefaultRunner):
         pad_height,
         pad_width,
         stage_marks=None,
+        restorer=None,
     ):
         video = self.preprocess_frames(
             frames,
@@ -283,15 +324,21 @@ class SwiftVRRunner(DefaultRunner):
         )
         if stage_marks is not None:
             stage_marks.append(mark_stage(self.init_device))
-        restored = self.restorer.restore_chunk(video, chunk, clip_latents)
+        restored = (restorer or self.restorer).restore_chunk(video, chunk, clip_latents)
         if stage_marks is not None:
             stage_marks.append(mark_stage(self.init_device))
         return restored[..., :output_height, :output_width]
 
     @staticmethod
-    def read_video_frames(reader, chunk, raw_frame_count: int, source_height: int, source_width: int, pin_memory: bool):
+    def read_video_frames(reader, chunk, raw_frame_count: int, source_height: int, source_width: int, pin_memory: bool, lead: int = 0):
+        """读一块。``lead>0`` 时向前多读几帧,供反相双跑的移位流用。
+
+        反相双跑要的两条流是 [start, start+n) 与 [start-1, start+n-1),并集恰好是
+        [start-1, start+n) —— 多读一帧就够,不必读两遍。块首越界的负号夹到 0,
+        等价于「复制首帧插到最前面」,与离线配方一致。
+        """
         started_at = time.perf_counter()
-        indices = [min(index, raw_frame_count - 1) for index in range(chunk.start, chunk.start + chunk.frame_count)]
+        indices = [min(max(index, 0), raw_frame_count - 1) for index in range(chunk.start - lead, chunk.start + chunk.frame_count)]
         frames = reader.get_batch(indices)
         if not torch.is_tensor(frames):
             frames = torch.from_numpy(frames.asnumpy())
@@ -405,7 +452,10 @@ class SwiftVRRunner(DefaultRunner):
         if output_path:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
         started_at = time.perf_counter()
-        self.restorer.reset()
+        # 单张图没有时间轴,反相双跑无从谈起 —— 图像路径固定走正相这一条流,而且用的是
+        # **不含反相补偿**的那个 restorer(见 init_modules)。反相关闭时它是 None,
+        # restore_frames 会退回 self.restorer。
+        self._reset_restorers()
         try:
             restored = self.restore_frames(
                 frames,
@@ -415,6 +465,7 @@ class SwiftVRRunner(DefaultRunner):
                 output_width,
                 pad_height,
                 pad_width,
+                restorer=self.restorer_image,
             )
             images = restored[0].permute(0, 2, 3, 1).contiguous()
             if input_info.return_result_tensor:
@@ -423,7 +474,7 @@ class SwiftVRRunner(DefaultRunner):
                 save_to_image(images, output_path)
                 images = None
         finally:
-            self.restorer.reset()
+            self._reset_restorers()
 
         elapsed = time.perf_counter() - started_at
         stats = {
@@ -552,6 +603,12 @@ class SwiftVRRunner(DefaultRunner):
         #    previous_input,那一块会退化成无重叠,不报错,只在块边界留细微不连续。
         #    要把它调成 0,得同时确认 dit_overlap 也是 0。
         warmup_chunks = max(0, int(self.config.get("seg_warmup_chunks", 1)))
+        antiphase = self.restorer_shifted is not None
+        if antiphase and seg_world > 1 and warmup_chunks < 1:
+            # 反相双跑靠 carry 跨块传递「上一块最后一帧」。段并行下,rank r 的首帧要与
+            # 前一块的 carry 配对,而那个 carry 正是预热块产生的。没有预热块,每个 rank
+            # 都会少发一帧,成片短 (world-1) 帧 —— 末尾的帧数校验会拦住,但报错离根因太远。
+            raise ValueError("SwiftVR antiphase_dual_pass with segment parallel requires seg_warmup_chunks >= 1.")
         parts_dir = None
         part_paths = []
         if seg_world > 1:
@@ -584,9 +641,11 @@ class SwiftVRRunner(DefaultRunner):
         # 统一(汇合点本身就是所有 rank 都会到的)。
         outer_rank_local = getattr(self, "_rank_local_collectives", False)
         self._rank_local_collectives = outer_rank_local or seg_world > 1
-        self.restorer.reset()
+        self._reset_restorers()
         # 播种全局 RoPE 时间位置:各 rank 都从 0 起算的话,拼接处会整段错位。
-        self.restorer.seed_temporal_offset(sum(c.latent_count for c in chunks[:run_start]))
+        self._seed_temporal_offset(sum(c.latent_count for c in chunks[:run_start]))
+        blender = AntiphaseBlender() if antiphase else None
+        read_lead = 1 if antiphase else 0
         writer = self.open_video_writer(writer_path, fps)
         reader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-reader")
         writer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-writer")
@@ -613,6 +672,7 @@ class SwiftVRRunner(DefaultRunner):
                     source_height,
                     source_width,
                     self.copy_stream is not None,
+                    read_lead,
                 )
             )
         try:
@@ -632,12 +692,13 @@ class SwiftVRRunner(DefaultRunner):
                             source_height,
                             source_width,
                             self.copy_stream is not None,
+                            read_lead,
                         )
                     )
 
                 stage_marks = [mark_stage(self.init_device)]
                 restored = self.restore_frames(
-                    frames,
+                    frames[read_lead:],
                     chunk,
                     clip_latents,
                     output_height,
@@ -646,9 +707,36 @@ class SwiftVRRunner(DefaultRunner):
                     pad_width,
                     stage_marks,
                 )
+                if antiphase:
+                    shifted = self.restore_frames(
+                        frames[:-1],
+                        chunk,
+                        clip_latents,
+                        output_height,
+                        output_width,
+                        pad_height,
+                        pad_width,
+                        restorer=self.restorer_shifted,
+                    )
+                    # 在**浮点**上平均,而不是像离线配方那样 blend 两个已编码的 8bit 视频。
+                    restored = blender.push(restored, shifted)
+                    del shifted
+                    # 第二遍不单独打点:把 restore 的结束点挪到它之后,两遍的算力都记在
+                    # restore 头上(第二遍的 preprocess 也一并计入,它本来就是恢复的开销)。
+                    stage_marks[-1] = mark_stage(self.init_device)
+                    if chunk.index == len(chunks) - 1:
+                        # 全片最后一块:carry 是最后一帧,移位流已经没有对应帧能与它配对
+                        # (移位流整体比正相流短一帧),原样接在尾巴上。
+                        tail = blender.flush()
+                        if tail is not None:
+                            restored = torch.cat([restored, tail], dim=1)
                 # 用**全局已发出帧数**裁尾巴,而不是本 rank 的 written(段并行下它只算自己
                 # 那段,会把中间段截没),也不是裸的 chunk.start(名义帧位,比实际多 3)。
                 emitted_before = chunk.start - (0 if chunk.index == 0 else first_chunk_priming)
+                if antiphase:
+                    # 反相双跑把整条输出整体推迟一帧:首块少发一帧(它的末帧成了 carry),
+                    # 之后每块都是「上一块的 carry + 本块前 n-1 帧」。所以全局帧位减一。
+                    emitted_before = max(0, emitted_before - 1)
                 restored = restored[:, : max(0, raw_frame_count - emitted_before)]
                 output_frames = (restored[0].permute(0, 2, 3, 1) * 255).clamp_(0, 255).to(torch.uint8)
                 cpu_frames, copy_complete = self.copy_frames_to_cpu(output_frames, self.copy_stream)
@@ -693,7 +781,7 @@ class SwiftVRRunner(DefaultRunner):
             if seg_world > 1:
                 logger.info(f"SwiftVR seg_parallel: rank {seg_rank} closed writer {os.path.basename(writer_path)}")
             self._rank_local_collectives = outer_rank_local
-            self.restorer.reset()
+            self._reset_restorers()
 
         elapsed = time.perf_counter() - started_at
 

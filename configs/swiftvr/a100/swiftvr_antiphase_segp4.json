@@ -1,0 +1,23 @@
+{
+    "attention_backend": "torch_sdpa",
+    "cross_attention_backend": "torch_sdpa",
+    "rope_type": "torch_real_rope",
+    "target_height": 1080,
+    "target_width": 1920,
+    "max_target_height": 2160,
+    "max_target_width": 3840,
+    "clip_len": 24,
+    "dit_overlap": 0,
+    "reae_frame_batch_size": 1,
+    "fps": null,
+    "video_codec": "libx264",
+    "quality": 76,
+    "ffmpeg_preset": "fast",
+    "queue_size": 3,
+    "antiphase_dual_pass": true,
+    "antiphase_strength_gain": 1.4,
+    "parallel": {
+        "seg_p_size": 4
+    },
+    "seg_warmup_chunks": 1
+}
