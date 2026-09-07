@@ -78,7 +78,6 @@ class TestConfigPerRequestIsolation(unittest.TestCase):
             self.assertEqual(runner.config["infer_steps"], 8)
 
 
-
 def _make_qwen_runner(config_dict):
     """A QwenImageRunner with only ``config`` populated (disagg mode on)."""
     qwen = import_module("lightx2v.models.runners.qwen_image.qwen_image_runner")
@@ -156,6 +155,7 @@ class TestDisaggRequestFieldIsolation(unittest.TestCase):
         runner.set_config({"prompt": "b"})
         self.assertEqual(runner.config["infer_steps"], 8)
         self.assertNotIn("data_bootstrap_room", runner.config)
+
 
 if __name__ == "__main__":
     unittest.main()
