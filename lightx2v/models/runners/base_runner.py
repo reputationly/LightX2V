@@ -132,6 +132,60 @@ class BaseRunner(ABC):
         """Attach the server-owned CPU process group used for encoder outputs."""
         self.input_broadcast_group = group
 
+    # Every field apply_disagg_request_overrides may write, as (container, key)
+    # where container is "config" or "disagg_config". Kept next to the writes so
+    # the two cannot drift: anything added below must be added here as well.
+    _DISAGG_REQUEST_FIELDS = (
+        ("config", "data_bootstrap_room"),
+        ("config", "disagg_phase1_receiver_engine_rank"),
+        ("disagg_config", "bootstrap_room"),
+        ("disagg_config", "decoder_bootstrap_room"),
+        ("disagg_config", "receiver_engine_rank"),
+    )
+
+    def _revert_disagg_request_fields(self, disagg_config):
+        """Undo the previous request's disagg overrides before applying this one.
+
+        DefaultRunner.set_config rolls back the flat keys a request actually sent,
+        but that is not enough here for two reasons:
+
+          * DERIVED writes. ``disagg_bootstrap_room=111`` also writes
+            ``config["data_bootstrap_room"]``; a later request that omits the flat
+            key reverts only the flat key, leaving the derived one at 111.
+          * NESTED writes. ``disagg_config["bootstrap_room"]`` and friends are not
+            top-level config keys at all, so the flat rollback never sees them.
+
+        Either way a request that says nothing about rooms inherits the previous
+        caller's transfer room / receiver rank, which is then used for transfer
+        setup (disagg_mixin.py). Snapshot once, restore every time.
+        """
+        if not hasattr(self, "_disagg_request_baseline"):
+            self._disagg_request_baseline = {}
+            # Careful with the top-level fields: this runs AFTER
+            # DefaultRunner.set_config already applied config_modify, so reading
+            # them from self.config now would snapshot request A's value as the
+            # "baseline" and pin it forever. DefaultRunner recorded the real
+            # pre-request value, so take it from there when it has one.
+            flat_keys = getattr(self, "_config_request_keys", set())
+            flat_baseline = getattr(self, "_config_request_baseline", {})
+            for container_name, key in self._DISAGG_REQUEST_FIELDS:
+                if container_name == "config" and key in flat_keys:
+                    entry = (key in flat_baseline, flat_baseline.get(key))
+                else:
+                    # Nested disagg_config keys are never written by
+                    # config.update(config_modify), so reading them here is safe.
+                    container = self.config if container_name == "config" else disagg_config
+                    entry = (key in container, container.get(key))
+                self._disagg_request_baseline[(container_name, key)] = entry
+
+        for container_name, key in self._DISAGG_REQUEST_FIELDS:
+            container = self.config if container_name == "config" else disagg_config
+            existed, value = self._disagg_request_baseline[(container_name, key)]
+            if existed:
+                container[key] = value
+            else:
+                container.pop(key, None)
+
     def apply_disagg_request_overrides(self, config_modify):
         """Mirror flat disagg request fields into ``disagg_config`` in disagg mode only."""
         if not isinstance(config_modify, dict):
@@ -152,6 +206,7 @@ class BaseRunner(ABC):
                 return None
 
         with self.config.temporarily_unlocked():
+            self._revert_disagg_request_fields(disagg_config)
             data_bootstrap_room = _safe_int("data_bootstrap_room")
             if data_bootstrap_room is not None:
                 self.config["data_bootstrap_room"] = data_bootstrap_room

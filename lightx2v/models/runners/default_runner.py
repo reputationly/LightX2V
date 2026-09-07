@@ -1,3 +1,4 @@
+import copy
 import gc
 import json
 import os
@@ -319,8 +320,48 @@ class DefaultRunner(BaseRunner):
             self.input_info.save_action_path = inputs.get("save_action_path", "")
 
     def set_config(self, config_modify):
+        """Apply ONE request's config overrides, discarding the previous request's.
+
+        ``config.update()`` alone mutates a runner-lifetime object, so a field the
+        current request omits keeps whatever the PREVIOUS request set — the server
+        has no per-request reset. Measured on a production qwen_image deployment
+        whose config pins ``infer_steps: 8``:
+
+            explicit infer_steps=8  -> 21.0s
+            (omitted)               -> 15.5s   inherited 8
+            explicit infer_steps=40 -> 73.1s
+            (omitted)               -> 73.2s   inherited 40
+
+        i.e. an identical request took 4.7x longer purely because of what the
+        previous caller sent. This is the same defect already fixed one line up in
+        server/services/inference/worker.py for ``input_info`` (media paths and
+        sr_ratio leaked across requests; VACE/SR hit it in production).
+
+        Only the keys THIS mechanism injected are reverted, against a baseline
+        snapshotted on first use. A blanket reset would also undo deliberate
+        post-init mutations made elsewhere through ``temporarily_unlocked()``.
+        """
         logger.info(f"modify config: {config_modify}")
+        if not hasattr(self, "_config_request_baseline"):
+            # Snapshot lazily: at __init__ time subclasses may still be filling
+            # the config in, whereas by the first request it is settled.
+            self._config_request_baseline = {}
+            self._config_request_keys = set()
+
         with self.config.temporarily_unlocked():
+            for key in self._config_request_keys - set(config_modify):
+                if key in self._config_request_baseline:
+                    self.config[key] = self._config_request_baseline[key]
+                else:
+                    # The key did not exist before any request introduced it.
+                    self.config.pop(key, None)
+
+            for key in config_modify:
+                if key not in self._config_request_baseline and key not in self._config_request_keys:
+                    if key in self.config:
+                        self._config_request_baseline[key] = copy.deepcopy(self.config[key])
+                self._config_request_keys.add(key)
+
             self.config.update(config_modify)
 
     def set_progress_callback(self, callback):
