@@ -22,11 +22,21 @@ z_image:
       # Z-Image experiment report §5.1 and commit a169c04a. z_image VRAM is
       # ample (bf16 ~21.8G/40G), so int8/multi-card are unnecessary.
       config_json: /opt/LightX2V/configs/z_image/z_image_a100_sdpa.json
-      # Optional warmup so the first real request is hot. Verify the body first.
-      # warmup:
-      #   endpoint: /v1/tasks/image/sync
-      #   timeout: 600
-      #   body: {prompt: "warmup", aspect_ratio: "1:1"}
+      # Warmup: /ready stays 503 until this completes, so the first real request
+      # lands on a hot engine instead of paying cold-start. Measured on
+      # qwen-image-edit across 4 freshly restarted production instances, the
+      # penalty this removes is 10-16s (first 26.1-31.6s vs 16.0-16.5s warm).
+      #
+      # infer_steps is deliberately OMITTED: the deploy config's value is used,
+      # which is the only step count guaranteed valid for that scheduler. Do NOT
+      # put `infer_steps: 1` here — on the merged-distill schedulers it raises
+      # `index 0 is out of bounds for dimension 0 with size 0` and the warmup
+      # silently fails (the launcher logs a warning and readies anyway, so the
+      # cold-start cost comes back without any obvious symptom).
+      warmup:
+        endpoint: /v1/tasks/image/sync
+        timeout: 600
+        body: {prompt: "warmup", target_shape: [512, 512]}
 
 # IMPORTANT (all multi-GPU variants): the parallel mesh MUST live in the config
 # JSON's "parallel" block — the engine reads config["parallel"], and top-level
@@ -116,6 +126,16 @@ qwen_image:
       gpus: 1
       task: i2i
       config_json: /opt/LightX2V/configs/deploy/qwen_edit_2511_lightning_merged_a100.json
+      # See the z_image warmup note for why infer_steps is omitted. image_path
+      # must be a file baked into THIS image (profiles must not depend on NFS);
+      # assets/inputs/imgs/girl.png ships with the repo via Dockerfile `COPY .`.
+      warmup:
+        endpoint: /v1/tasks/image/sync
+        timeout: 600
+        body:
+          prompt: "warmup"
+          image_path: /opt/LightX2V/assets/inputs/imgs/girl.png
+          target_shape: [512, 512]
     # Qwen-Image t2i (docs/Qwen-Image-实验测试报告.md): bf16 merged 8-step +
     # qwen25vl_cpu_offload=false = 17.0s/image hot, single GPU, torch_sdpa only
     # (sage_attn2 NaN-black-images). Same ~60G-Shmem-per-instance host-memory
@@ -126,6 +146,11 @@ qwen_image:
       gpus: 1
       task: t2i
       config_json: /opt/LightX2V/configs/deploy/qwen_2512_lightning_merged_a100.json
+      # See the z_image warmup note for why infer_steps is omitted.
+      warmup:
+        endpoint: /v1/tasks/image/sync
+        timeout: 600
+        body: {prompt: "warmup", target_shape: [512, 512]}
 
 # InfiniteTalk digital human (audio-driven video, task=s2v). Production shapes
 # from the 现网部署清单 (2026-07-11): both tiers run 4-card ulysses × 1
