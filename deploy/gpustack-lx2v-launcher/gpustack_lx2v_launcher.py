@@ -23,9 +23,15 @@ This launcher, running INSIDE the engine image, then:
         N  > 1 : torchrun --nproc_per_node=N -m lightx2v.server ...   (rank0 = HTTP)
   4. Binds {{PORT}} itself as a thin reverse proxy that:
         - answers  GET /ready  -> 503 until the engine is up (and warmup done),
-                                   200 afterwards  (this is what GPUStack's
-                                   health_check_path=/ready polls, so scheduling
-                                   never routes to a still-loading instance);
+                                   200 afterwards.  This is what GPUStack's
+                                   health_check_path=/ready WOULD poll, but that
+                                   option is not set on any deployed model today
+                                   (verified 2026-09-08 on a production instance:
+                                   zero /ready probes in its whole log), so
+                                   /ready currently gates nothing — generation
+                                   requests are proxied through even while the
+                                   warmup is still running.  See the warmup note
+                                   in profiles.yaml for the exposure this leaves;
         - forwards GET /metrics -> the engine's Prometheus server (on its own
                                    ephemeral port), so GPUStack/Grafana can
                                    scrape worker_ip:{{port}}/metrics without

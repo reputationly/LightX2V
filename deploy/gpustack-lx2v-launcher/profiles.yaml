@@ -22,10 +22,29 @@ z_image:
       # Z-Image experiment report §5.1 and commit a169c04a. z_image VRAM is
       # ample (bf16 ~21.8G/40G), so int8/multi-card are unnecessary.
       config_json: /opt/LightX2V/configs/z_image/z_image_a100_sdpa.json
-      # Warmup: /ready stays 503 until this completes, so the first real request
-      # lands on a hot engine instead of paying cold-start. Measured on
-      # qwen-image-edit across 4 freshly restarted production instances, the
-      # penalty this removes is 10-16s (first 26.1-31.6s vs 16.0-16.5s warm).
+      # Warmup: the launcher fires this itself at startup so the first real
+      # request lands on a hot engine. What it absorbs is large and erratic —
+      # the cold first inference costs 22-78s and inflates BOTH the text
+      # encoder and the DiT (measured 2026-09-08: production replica 0004
+      # 23.8s, replica 0006 78.1s; reproduced on a debug box at 22.4s with a
+      # warm page cache and ~50s right after drop_caches). Steady state
+      # afterwards is flat — 12 requests across 6 output resolutions stayed at
+      # text encoder 0.199-0.218s / DiT 14.4-16.2s — so one 512x512 warmup is
+      # enough and other shapes need no warmup of their own.
+      #
+      # It does NOT gate traffic. GPUStack is not configured with
+      # health_check_path=/ready and never polls it, so the proxy binds
+      # {{PORT}} at startup and forwards generation requests through even
+      # while the warmup runs. That leaves an exposed window between
+      # port-open and warmup-done: 28s on replica 0005, 78s on 0006. A request
+      # arriving inside it QUEUES behind the warmup on the engine's processing
+      # lock and still succeeds, just slowly (worst case ~95s); it only fails
+      # once more than max_queue_size (10) pile up. To close the window, set
+      # health_check_path=/ready on the model in GPUStack — deployment config,
+      # not a code change. Do NOT instead make the proxy 503 generation
+      # requests while unready: GPUStack does not consult /ready, so it would
+      # likely not fail over to another replica, turning "slow but successful"
+      # into "failed".
       #
       # infer_steps is deliberately OMITTED: the deploy config's value is used,
       # which is the only step count guaranteed valid for that scheduler. Do NOT
