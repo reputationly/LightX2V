@@ -27,8 +27,10 @@ z_image:
       # the cold first inference costs 22-78s and inflates BOTH the text
       # encoder and the DiT (measured 2026-09-08: production replica 0004
       # 23.8s, replica 0006 78.1s; reproduced on a debug box at 22.4s with a
-      # warm page cache and ~50s right after drop_caches). Steady state
-      # afterwards is flat — 12 requests across 6 output resolutions stayed at
+      # warm page cache and ~50s right after drop_caches). Those are TOTALS,
+      # not deltas — the warm end-to-end baseline is 16-17s, so the cold
+      # overhead itself ranges from ~7s to ~62s. Steady state afterwards is
+      # flat — 12 requests across 6 output resolutions stayed at
       # text encoder 0.199-0.218s / DiT 14.4-16.2s — so one 512x512 warmup is
       # enough and other shapes need no warmup of their own.
       #
