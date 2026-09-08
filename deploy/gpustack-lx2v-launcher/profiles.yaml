@@ -32,19 +32,19 @@ z_image:
       # text encoder 0.199-0.218s / DiT 14.4-16.2s — so one 512x512 warmup is
       # enough and other shapes need no warmup of their own.
       #
-      # It does NOT gate traffic. GPUStack is not configured with
-      # health_check_path=/ready and never polls it, so the proxy binds
-      # {{PORT}} at startup and forwards generation requests through even
-      # while the warmup runs. That leaves an exposed window between
-      # port-open and warmup-done: 28s on replica 0005, 78s on 0006. A request
-      # arriving inside it QUEUES behind the warmup on the engine's processing
-      # lock and still succeeds, just slowly (worst case ~95s); it only fails
-      # once more than max_queue_size (10) pile up. To close the window, set
-      # health_check_path=/ready on the model in GPUStack — deployment config,
-      # not a code change. Do NOT instead make the proxy 503 generation
-      # requests while unready: GPUStack does not consult /ready, so it would
-      # likely not fail over to another replica, turning "slow but successful"
-      # into "failed".
+      # This DOES gate traffic: the LightX2V backend row sets
+      # health_check_path=/ready, and the launcher keeps /ready at 503 until
+      # the warmup returns, so GPUStack never flips the instance to RUNNING
+      # (and never routes to it) while the cold cost is still being paid.
+      #
+      # Do not "verify" that by looking for /ready in `docker logs` or in a
+      # steady-state tcpdump — both are silent by design, and reading that as
+      # "GPUStack never polls /ready" is a trap (it cost a wrong conclusion on
+      # 2026-09-08). The proxy answers /ready itself and never forwards it to
+      # the engine, and its log_message() is a no-op, so probes never reach any
+      # log; and GPUStack stops probing once the instance is RUNNING
+      # (serve_manager.py returns early before is_ready() for RUNNING
+      # instances), so a running instance legitimately sees zero probes.
       #
       # infer_steps is deliberately OMITTED: the deploy config's value is used,
       # which is the only step count guaranteed valid for that scheduler. Do NOT
