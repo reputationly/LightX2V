@@ -83,12 +83,18 @@ class SRInputInfo(InputInfo):
     resized_shape: list = field(default_factory=list)
     latent_shape: list = field(default_factory=list)
     size: list = field(default_factory=list)
+    # 目标**短边**:只给一个数字,输出按源的真实画幅等比放大 —— 网关手里没有源尺寸,
+    # 照比例标签算 size 会带约 1.6% 的横向拉伸。优先级 size > target_short_edge > sr_ratio。
+    target_short_edge: int = 0
     output_fps: Optional[float] = field(default=None, repr=False)
 
 
 @dataclass
 class SeedVRInputInfo(SRInputInfo):
     match_target_size: bool = True
+    # 请求是否显式点名了 size。启动配置里的同名键也会灌进 InputInfo,单看
+    # ``size`` 分不清"网关点了尺寸"和"部署档位",朝向配对只在后者生效。
+    size_from_request: bool = field(default=False, repr=False)
 
 
 @dataclass

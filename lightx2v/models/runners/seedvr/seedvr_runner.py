@@ -27,6 +27,7 @@ from torch import Tensor
 
 from lightx2v.models.runners.base_runner import TaskStopped
 from lightx2v.models.runners.default_runner import DefaultRunner
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.schedulers.seedvr.scheduler import SeedVRScheduler
 from lightx2v.models.video_encoders.hf.seedvr import attn_video_vae_v3_s8_c16_t4_inflation_sd3_init
 from lightx2v.models.video_encoders.hf.seedvr.color_fix import wavelet_reconstruction
@@ -34,6 +35,7 @@ from lightx2v.models.video_encoders.hf.seedvr.common.distributed.advanced import
 from lightx2v.models.video_encoders.hf.seedvr.common.distributed.ops import set_sequence_parallel_a2a_backend
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
+from lightx2v.utils.input_info import SeedVRInputInfo
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import mux_audio_from_video, save_to_video, wan_vae_to_comfy
@@ -148,6 +150,30 @@ def _get_read_video():
 class SeedVRRunner(DefaultRunner):
     """Runner for SeedVR video super-resolution model."""
 
+    input_info_cls_by_task = {"sr": SeedVRInputInfo}
+    supported_request_fields_by_task = {
+        "sr": COMMON_REQUEST_FIELDS | {"image_path", "match_target_size", "size", "sr_ratio", "video_path"},
+    }
+
+    def create_input_info(self, request_data):
+        input_info = super().create_input_info(request_data)
+        # 请求里点名了 size 就是精确尺寸；只有来自启动配置的 size 才当作档位，按源朝向配对
+        # （见 _oriented_target）。上游没有这个区分，靠 match_target_size 单独表达「别改尺寸」。
+        input_info.size_from_request = "size" in request_data
+        if "size" in request_data or "size" in self.config:
+            size = input_info.size
+            if not isinstance(size, (list, tuple)) or len(size) != 2 or any(type(dim) is not int or dim <= 0 for dim in size):
+                raise ValueError("SeedVR size must contain two positive integers: [height, width]")
+        if not isinstance(input_info.match_target_size, bool):
+            raise ValueError("SeedVR match_target_size must be a boolean")
+        return input_info
+
+    def get_supported_request_fields(self, task):
+        supported_request_fields = super().get_supported_request_fields(task)
+        if self.config.get("seq_parallel", False):
+            supported_request_fields -= {"image_path"}
+        return supported_request_fields
+
     def __init__(self, config):
         super().__init__(config)
         self.run_input_encoder = self._run_input_encoder_local_sr
@@ -195,21 +221,22 @@ class SeedVRRunner(DefaultRunner):
             self.model_path = os.path.join(model_path_base, f"seedvr2_ema_{model_size}.pth")
         self.vae_path = os.path.join(model_path_base, "ema_vae.pth")
         self.pos_emb_path = os.path.join(model_path_base, "pos_emb.pt")
-        self.neg_emb_path = os.path.join(model_path_base, "neg_emb.pt")
 
     def _oriented_target(self):
         """The config target, handed out by the source's own orientation.
 
-        The config states a *tier* ("1080p" = 1920x1080) and writes it landscape;
-        that is a notation, not a demand for landscape output. NaResize preserves
-        the source aspect ratio, so a portrait clip is still portrait downstream.
-        Pair the two numbers as long/short edge instead: landscape keeps them as
-        written, portrait mirrors them, square collapses to the short edge (no
-        swap can rescue square -- either way one edge falls short).
+        A ``size`` named by the request is exact and comes back untouched. The
+        startup config instead states a *tier* ("1080p" = 1920x1080) and writes
+        it landscape; that is a notation, not a demand for landscape output.
+        AreaResize preserves the source aspect ratio, so a portrait clip is
+        still portrait downstream. Pair the two numbers as long/short edge
+        instead: landscape keeps them as written, portrait mirrors them, square
+        collapses to the short edge (no swap can rescue square -- either way one
+        edge falls short).
 
         Both :meth:`_build_video_transform` and :meth:`_restore_target_size` must
         read this same value. Computing it twice is what broke square sources:
-        the transform sized NaResize off the *config* target's area
+        the transform sized AreaResize off the *config* target's area
         (sqrt(1080*1920) = 1440) while the restore cropped to the *oriented*
         target (1080x1080), so a 768x768 clip was scaled up to 1440x1440 and then
         centre-cropped to 1080x1080 -- 180px off every edge, 44% of the frame
@@ -217,8 +244,12 @@ class SeedVRRunner(DefaultRunner):
         only because the two areas happen to agree there (1920x1104 -> 1920x1080
         loses 2%).
         """
-        target_height = int(self.config.get("target_height", 720) or 720)
-        target_width = int(self.config.get("target_width", 1280) or 1280)
+        target_height, target_width = self.input_info.size or (720, 1280)
+        if self.input_info.size_from_request:
+            # 请求点名即精确尺寸：朝向由调用方决定，这里不再配对。
+            return int(target_height), int(target_width)
+        target_height = int(target_height or 720)
+        target_width = int(target_width or 1280)
         if target_height <= 0 or target_width <= 0:
             return target_height, target_width
         long_side, short_side = max(target_height, target_width), min(target_height, target_width)
@@ -231,10 +262,12 @@ class SeedVRRunner(DefaultRunner):
     def _build_video_transform(self, img):
         from torchvision.transforms import Normalize
 
+        from lightx2v.models.video_encoders.hf.seedvr.data.image.transforms.area_resize import AreaResize
         from lightx2v.models.video_encoders.hf.seedvr.data.image.transforms.divisible_crop import DivisibleCrop
-        from lightx2v.models.video_encoders.hf.seedvr.data.image.transforms.na_resize import NaResize
         from lightx2v.models.video_encoders.hf.seedvr.data.video.transforms.rearrange import Rearrange
 
+        # 源朝向必须在变换之前取：AreaResize 会改分辨率，之后再读就是变换后的尺寸了。
+        self.ori_h, self.ori_w = img.shape[-2:]
         # Size the upscale off the *oriented* target so the restore step below has
         # nothing left to crop beyond the 16-alignment padding.
         target_height, target_width = self._oriented_target()
@@ -255,11 +288,7 @@ class SeedVRRunner(DefaultRunner):
         # ``self._input`` straight off it instead of re-uploading per segment.
         img = img.to(AI_DEVICE, non_blocking=True)
 
-        img = NaResize(
-            resolution=resolution,
-            mode="area",
-            downsample_only=False,
-        )(img)
+        img = AreaResize(max_area=resolution**2)(img)
 
         img.clamp_(0.0, 1.0)
 
@@ -288,17 +317,16 @@ class SeedVRRunner(DefaultRunner):
             logger.warning(f"[SeedVRRunner] sr_overlap={overlap} is too small to cross-fade; segment boundaries may still jump. Use >= 2 (8 recommended).")
         return seg_len, overlap
 
-    def _set_output_fps(self, fps):
+    def set_output_fps(self, fps):
         if fps is None:
             return
         try:
             fps = float(fps)
-        except Exception:
+        except (TypeError, ValueError):
             return
         if fps <= 0:
             return
-        with self.config.temporarily_unlocked():
-            self.config["fps"] = fps
+        self.input_info.output_fps = fps
 
     def _probe_video_torchcodec(self, video_path):
         from torchcodec.decoders import VideoDecoder
@@ -312,10 +340,10 @@ class SeedVRRunner(DefaultRunner):
 
         fps = metadata.average_fps
         if fps is None or fps <= 0:
-            fps = float(self.config.get("fps", 16))
+            fps = float(self.get_output_fps())
         else:
             fps = float(fps)
-            self._set_output_fps(fps)
+            self.set_output_fps(fps)
 
         return int(total_frames), fps, []
 
@@ -350,9 +378,9 @@ class SeedVRRunner(DefaultRunner):
         total_frames = len(pts) if pts is not None else 0
         fps_for_seek = fps
         if fps_for_seek is None or fps_for_seek == 0:
-            fps_for_seek = float(self.config.get("fps", 16))
+            fps_for_seek = float(self.get_output_fps())
         if fps is not None and fps != 0:
-            self._set_output_fps(fps)
+            self.set_output_fps(fps)
         return total_frames, fps_for_seek, pts
 
     def _build_sr_segments(self, total_frames, seg_len, overlap):
@@ -471,15 +499,13 @@ class SeedVRRunner(DefaultRunner):
         point-to-point send instead of a self-send special case."""
         return idx % world
 
-    def _sr_seg_parallel_info(self, num_segments, file_output, vfi_target):
+    def _sr_seg_parallel_info(self, num_segments, file_output):
         """``(rank, world)`` for segment parallel, or ``(0, 1)`` when it is off.
 
         Off unless every one of these holds:
         - ``seg_p_size > 1`` was configured and the process group is up;
         - output goes to a file -- returning one stitched tensor would need a
           variable-size gather, and the caller only ever consumes rank 0's;
-        - RIFE interpolation is off -- it threads a global target-frame grid
-          through the segment loop, which is a real sequential dependency;
         - VAE sequence parallel is off -- the two are different parallel axes
           over the same ranks (segment-per-rank vs. one segment split across
           ranks). Running both would have every rank own a segment AND expect
@@ -493,8 +519,6 @@ class SeedVRRunner(DefaultRunner):
         reason = None
         if not file_output:
             reason = "tensor output needs a variable-size gather"
-        elif vfi_target:
-            reason = "frame interpolation carries a global frame grid across segments"
         elif self._seedvr_sp_size > 1:
             reason = f"VAE sequence parallel is on (sp_size={self._seedvr_sp_size}); the two parallel axes are mutually exclusive"
         if reason is not None:
@@ -687,7 +711,7 @@ class SeedVRRunner(DefaultRunner):
         and the peers are parked in a barrier, so a world all-reduce has no
         counterpart. A plain assignment there silently undid it and rank 0 sat
         in ``check_stop`` until NCCL's watchdog aborted the server 600 s later,
-        which is exactly what a 4-card RIFE request did on the box.
+        which is exactly what a 4-card single-segment request did on the box.
         """
         previous = getattr(self, "_rank_local_collectives", False)
         self._rank_local_collectives = previous or seg_world > 1
@@ -809,26 +833,11 @@ class SeedVRRunner(DefaultRunner):
         os.remove(path)
         return payload
 
-    def _sr_vfi_target(self, save_fps):
-        """RIFE 目标帧率，未启用插帧时为 None。
-
-        SR 插帧：config 配了 video_frame_interpolation 且请求 target_fps 高于源
-        帧率才启用（不降帧）。分段文件路径逐段插帧，避免整段拼接的显存峰值。
-        跨段用「全局目标帧栅格」保证节奏连续：每段带上一段末帧（prepend）作插值
-        锚点，并传入本段的全局源帧偏移 + 全局目标帧区间，使非整数倍率下段边界也
-        不重启相位、不与源音频错位——这条全局栅格是段间真实的顺序依赖，也是
-        seg_parallel 遇到插帧必须退回串行的原因。
-        """
-        if self.vfi_model is None:
-            return None
-        target = (self.config.get("video_frame_interpolation") or {}).get("target_fps")
-        return target if target and target > save_fps else None
-
     def _sr_run_on_rank0(self, fn):
         """Run ``fn`` on rank 0 only, with everyone meeting afterwards.
 
         Used for the requests segment parallel cannot take (single segment,
-        tensor output, RIFE). Without this every rank would run the same job and
+        tensor output). Without this every rank would run the same job and
         race to write the same output file. The rendezvous is in a ``finally``
         so a failure on rank 0 does not strand the others until the timeout.
 
@@ -889,7 +898,7 @@ class SeedVRRunner(DefaultRunner):
         )
         if info is not None and self._sr_fps in [None, 0]:
             self._sr_fps = info.get("video_fps", self._sr_fps)
-            self._set_output_fps(self._sr_fps)
+            self.set_output_fps(self._sr_fps)
 
         if video.shape[0] > total_len:
             video = video[:total_len]
@@ -975,6 +984,10 @@ class SeedVRRunner(DefaultRunner):
 
         self.gen_video_final = raw_video
         return self.process_images_after_vae_decoder()
+
+    def end_run(self):
+        self._input = None
+        super().end_run()
 
     def _save_sr_segment_video(self, raw_video, output_path, fps):
         # Deliberately not ``wan_vae_to_comfy``: that helper permutes and then
@@ -1087,8 +1100,8 @@ class SeedVRRunner(DefaultRunner):
     def load_text_encoder(self):
         """Load text encoder for SeedVR.
 
-        SeedVR uses pre-computed text embeddings (pos_emb.pt, neg_emb.pt).
-        We load them from disk and cache them.
+        SeedVR uses pre-computed positive text embeddings (pos_emb.pt).
+        They are loaded and cached by run_text_encoder.
         """
         # For SeedVR, text embeddings are pre-computed
         # Load them during run_text_encoder
@@ -1147,7 +1160,7 @@ class SeedVRRunner(DefaultRunner):
         return vae_encoder, vae_decoder
 
     def _restore_target_size(self, sample):
-        if self.config.get("resize_mode") == "adaptive":
+        if not self.input_info.match_target_size:
             return sample
         # Same oriented target the upscale was sized against -- see
         # :meth:`_oriented_target` for why it must not be recomputed here.
@@ -1167,7 +1180,7 @@ class SeedVRRunner(DefaultRunner):
 
         # Neither edge reaches the target -- a source wider than the target ratio
         # (21:9, or any custom "W:H" the console lets operators add) comes out of
-        # NaResize short in height, because that step fits the frame to the
+        # AreaResize short in height, because that step fits the frame to the
         # target *area*. Resizing straight to (target_h, target_w) here is what
         # squashed those clips; scale until the short edge is satisfied instead
         # and let the long edge overshoot. Not cropping it back is deliberate:
@@ -1239,36 +1252,9 @@ class SeedVRRunner(DefaultRunner):
         """
         if self.text_encoder_output is not None:
             return self.text_encoder_output
-        # Load positive embeddings
-        if self.pos_emb_path:
-            try:
-                pos_emb = torch.load(self.pos_emb_path, map_location="cpu")
-                pos_emb = pos_emb.to(self.init_device)
-            except Exception as e:
-                logger.warning(f"[SeedVRRunner] Failed to load pos_emb: {e}")
-                pos_emb = None
-        else:
-            pos_emb = None
-
-        # Load negative embeddings
-        if self.neg_emb_path:
-            try:
-                neg_emb = torch.load(self.neg_emb_path, map_location="cpu")
-                neg_emb = neg_emb.to(self.init_device)
-            except Exception as e:
-                logger.warning(f"[SeedVRRunner] Failed to load neg_emb: {e}")
-                neg_emb = None
-        else:
-            neg_emb = None
-
-        # Return text encoder output
-        text_encoder_output = {
-            "texts_pos": [pos_emb],
-            "texts_neg": [neg_emb],
-        }
-        self.text_encoder_output = text_encoder_output
-
-        return text_encoder_output
+        pos_emb = torch.load(self.pos_emb_path, map_location="cpu").to(self.init_device)
+        self.text_encoder_output = {"texts_pos": [pos_emb]}
+        return self.text_encoder_output
 
     @ProfilingContext4DebugL1(
         "Run VAE Encoder",
@@ -1353,7 +1339,7 @@ class SeedVRRunner(DefaultRunner):
                 read_video = _get_read_video()
                 video, _, info = read_video(video_path, output_format="TCHW")
                 if info is not None:
-                    self._set_output_fps(info.get("video_fps", None))
+                    self.set_output_fps(info.get("video_fps", None))
             if video.numel() == 0:
                 raise ValueError(f"Failed to read video from {video_path}")
 
@@ -1374,7 +1360,6 @@ class SeedVRRunner(DefaultRunner):
             raise ValueError("SR task requires image_path or video_path")
 
         input_shape = tuple(img.shape)
-        _, _, self.ori_h, self.ori_w = img.shape
         img = self._build_video_transform(img)
         if self._seedvr_sp_size > 1:
             img = img.to(dtype=GET_DTYPE())
@@ -1455,12 +1440,7 @@ class SeedVRRunner(DefaultRunner):
 
         original_save_path = self.input_info.save_result_path
         file_output = bool(original_save_path) and not bool(self.input_info.return_result_tensor)
-        save_fps = self.config.get("fps", 16)
-        vfi_target = self._sr_vfi_target(save_fps)
-        if vfi_target:
-            logger.info(f"[SeedVRRunner] SR VFI enabled: {save_fps} -> {vfi_target} fps (per-segment, global-grid stitched)")
-
-        seg_rank, seg_world = self._sr_seg_parallel_info(len(segments), file_output, vfi_target)
+        seg_rank, seg_world = self._sr_seg_parallel_info(len(segments), file_output)
         if seg_world > 1:
             return self._run_sr_segments(segments, seg_rank, seg_world)
         # world==1 runs inline; world>1 with segment parallel ruled out has to be
@@ -1483,11 +1463,6 @@ class SeedVRRunner(DefaultRunner):
         segment_paths = []
         tmp_dir = None
         video_recorder = None
-        save_fps = self.config.get("fps", 16)
-        vfi_target = self._sr_vfi_target(save_fps)
-        vfi_prev_tail = None
-        vfi_src_offset = 0.0  # 当前段 images[0] 的全局源帧索引
-        vfi_next_g = 0  # 下一个待发的全局目标帧索引（跨段累进，不重启）
         outer_rank_local = self._sr_enter_rank_local(seg_world)
         # Tail hand-offs never block on the peer; see _sr_send_tail. Both of
         # these are set for real below, once seg_world > 1 has a scratch dir.
@@ -1504,11 +1479,9 @@ class SeedVRRunner(DefaultRunner):
         # path checks it, so the count of rendezvous per request stays equal
         # across ranks however the request ends.
         agreed = False
-        # 上游的流式落盘(直接喂 ffmpeg)与两件事互斥:
-        #   段并行 —— 各 rank 的段是乱序完成的,没法按播放顺序往管道里灌;
-        #   VFI    —— 插帧改变帧率与段边界,由下面的 VFI 分支自己落盘。
-        # 两者都不在时才启用,行为与上游一致。
-        stream_file_output = stream_file_output and seg_world == 1 and not vfi_target
+        # 上游的流式落盘(直接喂 ffmpeg)与段并行互斥:各 rank 的段是乱序完成的,
+        # 没法按播放顺序往管道里灌。段并行不在时才启用,行为与上游一致。
+        stream_file_output = stream_file_output and seg_world == 1
         try:
             if file_output and is_sp_root:
                 output_dir = os.path.dirname(original_save_path) or "."
@@ -1552,7 +1525,7 @@ class SeedVRRunner(DefaultRunner):
                 elif stream_file_output:
                     video_recorder = SeedVRVideoRecorder(
                         livestream_url=original_save_path,
-                        fps=float(self.config.get("fps", 16)),
+                        fps=float(self.get_output_fps()),
                     )
                     video_recorder.config_crf = int(self.config.get("video_crf", 16))
                     video_recorder.config_preset = str(self.config.get("video_preset", "medium"))
@@ -1626,39 +1599,7 @@ class SeedVRRunner(DefaultRunner):
                                 self._stream_sr_segment_video(raw, video_recorder, idx, len(segments))
                             else:
                                 segment_path = os.path.join(tmp_dir, f"segment_{idx:05d}.mp4")
-                                if vfi_target:
-                                    comfy = wan_vae_to_comfy(raw).float().clamp(0.0, 1.0)
-                                    del raw
-                                    raw = None
-                                    # images[0] 为上一段末帧(首段为本段首帧),供 RIFE 补齐段
-                                    # 边界间的中间帧。全局目标栅格从 vfi_next_g 累进,边界帧只由
-                                    # 上一段发出一次,本段从其后继续——无重发、无遗漏、无相位重启。
-                                    tail = comfy[-1:].clone()
-                                    if vfi_prev_tail is None:
-                                        frames = comfy
-                                    else:
-                                        frames = torch.cat([vfi_prev_tail, comfy], dim=0)
-                                    del comfy
-                                    n_local = frames.shape[0]
-                                    # 本段负责的最后一个全局目标帧(其全局源位落在本段范围内)
-                                    g_end = int((vfi_src_offset + n_local - 1) * vfi_target / save_fps + 1e-6)
-                                    out = self.vfi_model.interpolate_frames(
-                                        frames,
-                                        source_fps=save_fps,
-                                        target_fps=vfi_target,
-                                        source_frame_offset=vfi_src_offset,
-                                        target_idx_start=vfi_next_g,
-                                        target_idx_end=g_end,
-                                    )
-                                    del frames
-                                    vfi_next_g = g_end + 1
-                                    # 下一段 images[0] = 本段末帧,其全局源索引 = 本段末帧全局索引
-                                    vfi_src_offset = vfi_src_offset + (n_local - 1)
-                                    vfi_prev_tail = tail
-                                    save_to_video(out, segment_path, fps=vfi_target, method="ffmpeg")
-                                    del out
-                                else:
-                                    self._save_sr_segment_video(raw, segment_path, fps=save_fps)
+                                self._save_sr_segment_video(raw, segment_path, fps=self.get_output_fps())
                                 segment_paths.append(segment_path)
                         if raw is not None:
                             del raw
