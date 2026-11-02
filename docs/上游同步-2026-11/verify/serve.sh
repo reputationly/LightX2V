@@ -44,9 +44,10 @@ for i in $(seq 1 90); do
   if [ "$code" = "200" ]; then READY=1; echo "[serve] ready after $((i * 5))s"; break; fi
   if ! docker ps --format '{{.Names}}' | grep -q "^${CT}$"; then echo "[serve] !! container exited"; break; fi
 done
-docker logs "$CT" > "$LOGD/serve.$MODE.$PROFILE.log" 2>&1
+SAFE=$(printf '%s' "$PROFILE" | tr '/' '_')
+docker logs "$CT" > "$LOGD/serve.$MODE.$SAFE.log" 2>&1
 if [ "$READY" != 1 ]; then
-  echo "[serve] !! not ready; see $LOGD/serve.$MODE.$PROFILE.log"
-  tail -40 "$LOGD/serve.$MODE.$PROFILE.log"
+  echo "[serve] !! not ready; see $LOGD/serve.$MODE.$SAFE.log"
+  tail -40 "$LOGD/serve.$MODE.$SAFE.log"
   exit 1
 fi
