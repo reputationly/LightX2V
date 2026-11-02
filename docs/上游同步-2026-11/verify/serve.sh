@@ -38,7 +38,8 @@ docker run -d --name "$CT" --gpus all --ipc=host --shm-size=32g --network host \
 
 echo "[serve] $MODE profile=$PROFILE gpus=$GPUS port=$PORT container=$CT"
 READY=0
-for i in $(seq 1 90); do
+# 冷启动实测最长约 570s(13.6G 权重从 NFS 读 + VAE 初始化),给足 15 分钟
+for i in $(seq 1 180); do
   sleep 5
   code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/ready" 2>/dev/null)
   if [ "$code" = "200" ]; then READY=1; echo "[serve] ready after $((i * 5))s"; break; fi
