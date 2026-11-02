@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import os
 import time
 from pathlib import Path
@@ -7,11 +8,28 @@ from typing import Any, Dict
 import torch
 from loguru import logger
 
+from lightx2v.models.runners.base_runner import TaskStopped
 from lightx2v.models.runners.runner_factory import build_runner
 from lightx2v.utils.set_config import build_startup_config, init_parallel
 
+from ...legacy_request_compat import normalize_worker_request
+from ...task_manager import task_manager
 from ..distributed_utils import DistributedManager
 from .pipeline_image_encode import encode_pipeline_return_to_png_bytes
+
+
+class _EventFlag:
+    """Adapter for check_stop(), which tests ``runner.stop_signal`` for plain
+    truthiness on every denoise step. A bare threading.Event defines no
+    __bool__, so it would read as permanently set — delegate to is_set()."""
+
+    __slots__ = ("_event",)
+
+    def __init__(self, event):
+        self._event = event
+
+    def __bool__(self) -> bool:
+        return self._event.is_set()
 
 
 class TorchrunInferenceWorker:
@@ -70,14 +88,55 @@ class TorchrunInferenceWorker:
             logger.exception(f"Rank {self.rank} initialization failed: {str(e)}")
             return False
 
-    async def process_request(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _attach_progress_callback(self, task_id: Any) -> None:
+        """Feed the runner's per-step progress into the task manager so
+        /v1/tasks/{id}/status can report it (the GPUStack facade folds phase +
+        phase_progress into a global percentage).
+
+        Re-attached per request so a callback can never write into a previous
+        task's row. Only rank 0 serves the status API; other ranks would be
+        writing to a task manager nobody reads.
+        """
+        setter = getattr(self.runner, "set_progress_callback", None)
+        if setter is None:
+            return
+        if not task_id or self.rank != 0:
+            setter(None)
+            return
+
+        def _report(current: float, total: float) -> None:
+            # The runner reports (percent, 100) across all segments; that whole
+            # span is the denoise phase as far as the contract is concerned.
+            task_manager.update_progress(task_id, "denoise", (current * 100.0 / total) if total else 0.0)
+
+        setter(_report)
+
+    def _attach_stop_signal(self, stop_event: Any) -> None:
+        """Wire the task's cancellation flag into the runner so check_stop()
+        can abort the denoise loop.
+
+        Only rank 0 has the task's stop_event; check_stop() all-reduces the flag
+        so every rank breaks out on the same step — a rank aborting unilaterally
+        would hang the others on the next collective.
+
+        Re-attached per request, and cleared when there is no event, so a stale
+        flag can never abort the following task.
+        """
+        self.runner.stop_signal = _EventFlag(stop_event) if stop_event is not None else None
+
+    async def process_request(self, task_data: Dict[str, Any], stop_event: Any = None) -> Dict[str, Any]:
         has_error = False
+        was_stopped = False
         error_msg = ""
         error_type = ""
         pipeline_return = None
         task_id = task_data.get("task_id", "unknown")
 
         try:
+            # Attached before anything else can raise: leaving a previous task's
+            # (already set) flag on the runner would abort this one instantly.
+            self._attach_stop_signal(stop_event)
+
             if self.world_size > 1 and self.rank == 0:
                 task_data = self.dist_manager.broadcast_task_data(task_data)
 
@@ -89,25 +148,70 @@ class TorchrunInferenceWorker:
             reuse = task_data.pop("reuse", False)
             reuse_prefix_segments = task_data.pop("reuse_prefix_segments", 0)
 
+            # HTTP 兼容层:网关透传过来的旧字段/杂字段在这里被丢掉并 warning,
+            # 而不是让 runner 的严格白名单抛 4xx。
+            task_data = normalize_worker_request(self.runner, task_data)
+
             input_info = self.runner.prepare_request(task_data)
             if self.lora_dir:
                 self.switch_lora(lora_name, lora_strength)
 
             self.runner.set_reuse(reuse, reuse_prefix_segments)
+            self._attach_progress_callback(task_id)
             pipeline_return = self.runner.run_request(input_info)
 
             await asyncio.sleep(0)
+
+        except TaskStopped as e:
+            # Expected path, not a failure: the user cancelled and every rank
+            # agreed to break out on the same step. check_stop() already ran
+            # end_run(), so skip that here — but still hand the allocator its
+            # memory back, or the next task inherits a half-full GPU.
+            was_stopped = True
+            logger.info(f"Rank {self.rank} inference stopped: {e}")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
 
         except Exception as e:
             has_error = True
             error_msg = str(e)
             error_type = type(e).__name__
             logger.exception(f"Rank {self.rank} inference failed: {error_msg}")
+            # A failed task (e.g. CUDA OOM) leaves scheduler latents, text-encoder
+            # outputs and reserved allocator memory on the GPU because run_main's
+            # end_run() is skipped on exception. In a persistent worker that
+            # "poisons" the process — every subsequent task then OOMs. Run the same
+            # teardown end_run() does so the GPU returns to idle after any failure.
+            try:
+                self.runner.end_run()
+            except Exception as cleanup_err:
+                logger.warning(f"Rank {self.rank} post-failure end_run cleanup raised: {cleanup_err}")
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+            except Exception:
+                pass
+
+        finally:
+            # Never let this request's flag outlive it — the next task gets a
+            # fresh one, and an already-set leftover would abort it on step 1.
+            self.runner.stop_signal = None
 
         if self.world_size > 1:
             self.dist_manager.barrier()
 
         if self.rank == 0:
+            if was_stopped:
+                return {
+                    "task_id": task_id,
+                    "status": "cancelled",
+                    "message": "Inference cancelled by user",
+                }
             if has_error:
                 return {
                     "task_id": task_id,

@@ -1,8 +1,9 @@
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from ..utils.generate_task_id import generate_task_id
+from .legacy_request_compat import normalize_request_payload
 
 
 def hide_request_defaults(schema, *, keep_defaults=()):
@@ -61,6 +62,12 @@ class BaseTaskRequest(BaseModel):
     lora_name: Optional[str] = Field(None, description="LoRA filename to load from lora_dir, None to disable LoRA")
     lora_strength: float = Field(1.0, description="LoRA strength")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_payload(cls, data):
+        """网关兼容层:旧键改名、未知键丢弃,见 legacy_request_compat。"""
+        return normalize_request_payload(data, set(cls.model_fields))
+
     def get(self, key, default=None):
         return getattr(self, key, default)
 
@@ -82,6 +89,11 @@ class VideoTaskRequest(BaseTaskRequest):
     video_path: str = Field("", description="Server-local input video path; comma-separated paths for multiple references")
     sr_ratio: float = Field(2.0, gt=0, description="Super-resolution scale factor (SeedVR: capped by size area; SwiftVR: used when size is not set)")
     match_target_size: Optional[bool] = Field(None, description="Crop or resize output to size (SeedVR SR only)")
+    target_short_edge: int = Field(
+        0,
+        ge=0,
+        description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset",
+    )
     audio_path: str = Field("", description="Input audio path (Wan-Audio)")
     video_duration: float = Field(5, description="Video duration in seconds (Wan-Audio)")
     resize_mode: Optional[str] = Field(None, description="Image and mask resize mode for seko_talk s2v/rs2v; defaults to the startup config")
@@ -118,6 +130,11 @@ class ImageTaskRequest(BaseTaskRequest):
     inpaint_blur_size: Optional[int] = Field(None, description="Flux2 inpainting mask blur kernel size")
     sr_ratio: float = Field(2.0, gt=0, description="Super-resolution scale factor (SeedVR: capped by size area; SwiftVR: used when size is not set)")
     match_target_size: Optional[bool] = Field(None, description="Crop or resize output to size (SeedVR SR only)")
+    target_short_edge: int = Field(
+        0,
+        ge=0,
+        description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset",
+    )
     keep_aspect_ratio: Optional[bool] = Field(None, description="Preserve a single HiDream reference image's aspect ratio")
     layout_bboxes: Optional[str] = Field(None, description="HiDream layout boxes as a JSON string or server-local JSON file path")
     align_image_size: Optional[bool] = Field(None, description="Align HunyuanImage3 reference image sizes during inference")

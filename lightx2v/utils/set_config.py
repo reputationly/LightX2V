@@ -464,54 +464,69 @@ def init_parallel(config):
         # SwiftVR owns its chunk group and validates its parallel settings in the runner.
         return
 
-    tensor_p_size = int(parallel.get("tensor_p_size", 1))
-    cfg_p_size = int(parallel.get("cfg_p_size", 1))
-    seq_p_size = int(parallel.get("seq_p_size", 1))
-    pp_size = int(parallel.get("pp_size", 1))
-    if cfg_p_size > 1 and not config.get("enable_cfg", False):
-        raise ValueError("parallel.cfg_p_size > 1 requires enable_cfg=true")
-    world_size = dist.get_world_size()
-    expected_world_size = tensor_p_size * cfg_p_size * seq_p_size * pp_size
-    if expected_world_size != world_size:
-        raise ValueError(
-            f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) * pp_size ({pp_size}) != world_size ({world_size})."
-        )
-
-    if config.get("model_cls") == "hunyuan_image3" and parallel.get("phase_aware", False):
-        from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
-
-        initialize_hunyuan_image3_parallel_runtime(config)
-        config["pipefusion_parallel"] = False
-    elif pp_size > 1:
-        if tensor_p_size > 1:
-            raise ValueError("PipeFusion pipeline parallelism cannot be combined with tensor parallelism")
-        # PipeFusion pipeline parallelism: 3D mesh (cfg_p, pp, seq_p).
-        config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, pp_size, seq_p_size), mesh_dim_names=("cfg_p", "pp", "seq_p"))
-        config["tensor_parallel"] = False
-        config["seq_parallel"] = seq_p_size > 1
-        config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
-        config["pipefusion_parallel"] = True
-        _validate_pipefusion_config(config)
-        from lightx2v.models.networks.flux2.infer.pipefusion import init_pipeline_parallel_state
-
-        pp_group = config["device_mesh"].get_group(mesh_dim="pp")
-        init_pipeline_parallel_state(pp_group)
+    seg_p_size = int(parallel.get("seg_p_size", 1))
+    if seg_p_size > 1:
+        # 段并行(SeedVR SR):并行轴是「整段」,模型是复制的,不经过任何 mesh-aware 的层
+        # —— runner 直接和进程组打交道。与 tensor/cfg/seq/pp mesh 互斥,而且是断言而非
+        # 假定:这个分支根本不读那些尺寸,若从混合 profile 拷来的配置仍写着 2D mesh,
+        # 它会照样启动成纯段并行 —— 实际拓扑和签入的配置悄悄不一致。
+        if any(int(parallel.get(k, 1)) != 1 for k in ("tensor_p_size", "cfg_p_size", "seq_p_size", "pp_size")):
+            raise ValueError(f"seg_p_size ({seg_p_size}) is exclusive with tensor/cfg/seq/pp parallelism: {parallel}")
+        if seg_p_size != dist.get_world_size():
+            raise ValueError(f"seg_p_size ({seg_p_size}) must equal world_size ({dist.get_world_size()})")
+        config["tensor_parallel"] = config["seq_parallel"] = config["cfg_parallel"] = config["pipefusion_parallel"] = False
+        config["seg_parallel"] = True
     else:
-        # Keep the original CFG/SP dimensions without TP. With TP, omit unit
-        # dimensions and place TP last so its ranks form contiguous groups.
-        mesh_dims = [("cfg_p", cfg_p_size), ("seq_p", seq_p_size)]
-        if tensor_p_size > 1:
-            mesh_dims = [(name, size) for name, size in mesh_dims if size > 1]
-            mesh_dims.append(("tensor_p", tensor_p_size))
-        config["device_mesh"] = init_device_mesh(
-            AI_DEVICE,
-            tuple(size for _, size in mesh_dims),
-            mesh_dim_names=tuple(name for name, _ in mesh_dims),
-        )
-        config["tensor_parallel"] = tensor_p_size > 1
-        config["seq_parallel"] = seq_p_size > 1
-        config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
-        config["pipefusion_parallel"] = False
+        # 上游的 mesh 分支整体下移一级。世界大小校验必须留在这个 else 里:段并行下
+        # tensor*cfg*seq 恒为 1,而 world_size 是卡数,放在外面必炸。
+        tensor_p_size = int(parallel.get("tensor_p_size", 1))
+        cfg_p_size = int(parallel.get("cfg_p_size", 1))
+        seq_p_size = int(parallel.get("seq_p_size", 1))
+        pp_size = int(parallel.get("pp_size", 1))
+        if cfg_p_size > 1 and not config.get("enable_cfg", False):
+            raise ValueError("parallel.cfg_p_size > 1 requires enable_cfg=true")
+        world_size = dist.get_world_size()
+        expected_world_size = tensor_p_size * cfg_p_size * seq_p_size * pp_size
+        if expected_world_size != world_size:
+            raise ValueError(
+                f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) * pp_size ({pp_size}) != world_size ({world_size})."
+            )
+
+        if config.get("model_cls") == "hunyuan_image3" and parallel.get("phase_aware", False):
+            from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
+
+            initialize_hunyuan_image3_parallel_runtime(config)
+            config["pipefusion_parallel"] = False
+        elif pp_size > 1:
+            if tensor_p_size > 1:
+                raise ValueError("PipeFusion pipeline parallelism cannot be combined with tensor parallelism")
+            # PipeFusion pipeline parallelism: 3D mesh (cfg_p, pp, seq_p).
+            config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, pp_size, seq_p_size), mesh_dim_names=("cfg_p", "pp", "seq_p"))
+            config["tensor_parallel"] = False
+            config["seq_parallel"] = seq_p_size > 1
+            config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+            config["pipefusion_parallel"] = True
+            _validate_pipefusion_config(config)
+            from lightx2v.models.networks.flux2.infer.pipefusion import init_pipeline_parallel_state
+
+            pp_group = config["device_mesh"].get_group(mesh_dim="pp")
+            init_pipeline_parallel_state(pp_group)
+        else:
+            # Keep the original CFG/SP dimensions without TP. With TP, omit unit
+            # dimensions and place TP last so its ranks form contiguous groups.
+            mesh_dims = [("cfg_p", cfg_p_size), ("seq_p", seq_p_size)]
+            if tensor_p_size > 1:
+                mesh_dims = [(name, size) for name, size in mesh_dims if size > 1]
+                mesh_dims.append(("tensor_p", tensor_p_size))
+            config["device_mesh"] = init_device_mesh(
+                AI_DEVICE,
+                tuple(size for _, size in mesh_dims),
+                mesh_dim_names=tuple(name for name, _ in mesh_dims),
+            )
+            config["tensor_parallel"] = tensor_p_size > 1
+            config["seq_parallel"] = seq_p_size > 1
+            config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+            config["pipefusion_parallel"] = False
 
     warmup_device = f"cuda:{torch.cuda.current_device()}" if AI_DEVICE == "cuda" else AI_DEVICE
     warmup_tensor = torch.zeros([1], device=warmup_device)
