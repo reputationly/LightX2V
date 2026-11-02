@@ -43,6 +43,20 @@ from lightx2v.utils.video_recorder import VideoRecorder
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 
+class _SrAbort:
+    """段边界上的 abort 标记:发送方已离开段循环,它欠的这条边界帧不会来了。
+
+    用独立类型而不是 ``None``:``None`` 在协议里已经表示"这一段没有产出帧"(可以继续),
+    把两种语义混在一起,接收方就分不清"继续算"和"别再等了"。
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - 只用于日志
+        return "<SR_TAIL_ABORT>"
+
+
+_SR_ABORT = _SrAbort()
+
+
 class SeedVRVideoRecorder(VideoRecorder):
     """High-quality local-file recorder for SeedVR super-resolution output."""
 
@@ -483,7 +497,7 @@ class SeedVRRunner(DefaultRunner):
     # a 10% end-to-end win, while segment parallel scales the whole 82s.
     # Speedup ceiling is the segment count, not the card count.
 
-    _SR_TAIL_META = 5  # [n_frames, B, C, H, W]; n_frames == 0 means "no tail"
+    _SR_TAIL_META = 5  # [n_frames, B, C, H, W]; 0 = "no tail", -1 = "abort"
     # Sized for the straggler, not the average: a rank's whole segment (read,
     # diffuse, decode, encode) has to fit inside one rendezvous wait.
     _SR_CTRL_TIMEOUT = datetime.timedelta(hours=2)
@@ -717,7 +731,7 @@ class SeedVRRunner(DefaultRunner):
         self._rank_local_collectives = previous or seg_world > 1
         return previous
 
-    def _sr_send_tail(self, tail, dst, idx):
+    def _sr_send_tail(self, tail, dst, idx, abort=False):
         """Hand segment ``idx``'s held-back boundary frames to the next owner.
 
         Never blocks on the peer, because only some of these hand-offs are in
@@ -734,10 +748,16 @@ class SeedVRRunner(DefaultRunner):
         Sent as fp32 from CPU: the tail is already parked there between
         segments to stay out of the VRAM peak, and ``_blend_sr_overlap`` moves
         and casts it on arrival. ~200 MiB for an 8-frame 1920x1104 tail.
+
+        ``abort=True`` sends the abort marker instead: this rank is leaving the
+        segment loop early (cancel or error) and will never produce segment
+        ``idx``'s boundary frames. Without it the peer sits in ``_sr_recv_tail``
+        until ``_SR_TAIL_TIMEOUT`` (15 min) -- and every rank behind it does the
+        same -- which is what turned one cancellation into a service-wide stall.
         """
         group = None if self._sr_tail_transport() == "file" else self._sr_tail_group()
         if group is None:
-            self._sr_write_tail_file(tail, idx)
+            self._sr_write_tail_file(tail, idx, abort=abort)
             return
         # Drain the previous hand-off before posting this one. A whole wave has
         # gone by, so it has long since been matched and the wait is free, and
@@ -745,6 +765,11 @@ class SeedVRRunner(DefaultRunner):
         # rather than letting it grow with the segment count.
         self._sr_drain_tail_sends()
         # A fixed-size meta tensor goes first so the receiver can allocate.
+        if abort:
+            meta = torch.zeros(self._SR_TAIL_META, dtype=torch.int64)
+            meta[0] = -1
+            self._sr_tail_sends.append((dist.isend(meta, dst=dst, group=group), meta))
+            return
         if tail is None:
             meta = torch.zeros(self._SR_TAIL_META, dtype=torch.int64)
             self._sr_tail_sends.append((dist.isend(meta, dst=dst, group=group), meta))
@@ -782,7 +807,10 @@ class SeedVRRunner(DefaultRunner):
         meta = torch.empty(self._SR_TAIL_META, dtype=torch.int64)
         dist.recv(meta, src=src, group=group)
         t = int(meta[0])
-        if t <= 0:
+        if t < 0:
+            # 对端已经离开段循环(cancel/报错),这条边界帧永远不会来
+            return _SR_ABORT
+        if t == 0:
             return None
         b, c, h, w = (int(v) for v in meta[1:])
         payload = torch.empty((b, c, t, h, w), dtype=torch.float32)
@@ -792,7 +820,7 @@ class SeedVRRunner(DefaultRunner):
     def _sr_tail_file(self, idx):
         return os.path.join(self._sr_tail_dir, f"tail_{idx:05d}.pt")
 
-    def _sr_write_tail_file(self, tail, idx):
+    def _sr_write_tail_file(self, tail, idx, abort=False):
         """Publish segment ``idx``'s tail into the shared scratch dir.
 
         No rendezvous at all: the sender writes and walks away, so it never
@@ -805,7 +833,10 @@ class SeedVRRunner(DefaultRunner):
         """
         path = self._sr_tail_file(idx)
         partial = f"{path}.part"
-        payload = None if tail is None else tail.detach().to(device="cpu", dtype=torch.float32).contiguous()
+        if abort:
+            payload = torch.tensor([-1], dtype=torch.int64)
+        else:
+            payload = None if tail is None else tail.detach().to(device="cpu", dtype=torch.float32).contiguous()
         with open(partial, "wb") as fh:
             torch.save(payload, fh)
             fh.flush()
@@ -831,7 +862,32 @@ class SeedVRRunner(DefaultRunner):
             time.sleep(0.25)
         payload = torch.load(path, map_location="cpu", weights_only=True)
         os.remove(path)
+        if isinstance(payload, torch.Tensor) and payload.numel() == 1 and int(payload.item()) == -1:
+            return _SR_ABORT
         return payload
+
+    def _sr_abort_owed_edges(self, my_indices, edge_sent, seg_world, num_segments):
+        """告诉下游"我欠的边界帧不会来了",并把这条链继续传下去。
+
+        每个 rank 只在**自己拥有**的段上欠一条边(``idx -> idx+1``)。提前离开段循环时,
+        凡是还没发过的边都要发 abort 标记:对端收到后会把自己还欠的边也发 abort,于是
+        整条链在"当前段算完"之内解开,而不是各自等满 15 分钟的 tail 超时。
+
+        传输层还没建好时直接返回:那种情况下对端根本还没开始等这条 tail。
+        """
+        if seg_world <= 1:
+            return
+        if not getattr(self, "_sr_tail_dir", None) and getattr(self, "_sr_tail_pg", None) is None:
+            return
+        for idx in my_indices:
+            if idx + 1 >= num_segments or idx in edge_sent:
+                continue
+            try:
+                self._sr_send_tail(None, self._sr_segment_owner(idx + 1, seg_world), idx, abort=True)
+                edge_sent.add(idx)
+            except Exception as e:  # 传输层自己坏了也不能盖住真正的异常
+                logger.warning(f"[SeedVRRunner] could not send the abort marker for segment {idx}: {e}")
+                return
 
     def _sr_run_on_rank0(self, fn):
         """Run ``fn`` on rank 0 only, with everyone meeting afterwards.
@@ -1479,6 +1535,12 @@ class SeedVRRunner(DefaultRunner):
         # path checks it, so the count of rendezvous per request stays equal
         # across ranks however the request ends.
         agreed = False
+        # 收到 abort 标记后为 True:本 rank 提前离开段循环,不产出成片。
+        aborted = False
+        # 本 rank 拥有的段(决定它欠哪些边界帧),以及已经正常发出去的边。
+        # 定义在 try 之前:异常可能发生在临时目录那次 rendezvous 之前,而处理器要用到它们。
+        my_indices = [i for i in range(len(segments)) if seg_world <= 1 or self._sr_segment_owner(i, seg_world) == seg_rank]
+        edge_sent = set()
         # 上游的流式落盘(直接喂 ffmpeg)与段并行互斥:各 rank 的段是乱序完成的,
         # 没法按播放顺序往管道里灌。段并行不在时才启用,行为与上游一致。
         stream_file_output = stream_file_output and seg_world == 1
@@ -1568,6 +1630,11 @@ class SeedVRRunner(DefaultRunner):
                         # meet: the previous segment's owner was computing in
                         # lockstep and hands off the moment it finishes.
                         pending_tail = self._sr_recv_tail(self._sr_segment_owner(idx - 1, seg_world), idx - 1)
+                        if pending_tail is _SR_ABORT:
+                            aborted = True
+                            logger.warning(f"[SeedVRRunner] rank {seg_rank}: segment {idx} got an abort marker from segment {idx - 1}; propagating to the edges this rank still owes")
+                            self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
+                            break
                     if raw is not None:
                         if pending_tail is not None:
                             raw = self._blend_sr_overlap(pending_tail, raw)
@@ -1591,6 +1658,7 @@ class SeedVRRunner(DefaultRunner):
                         # Unconditional: the receiver posts a matching recv either
                         # way, and a zero-length meta tells it there was no tail.
                         self._sr_send_tail(pending_tail, self._sr_segment_owner(idx + 1, seg_world), idx)
+                        edge_sent.add(idx)
                         pending_tail = None
 
                     if file_output:
@@ -1631,6 +1699,17 @@ class SeedVRRunner(DefaultRunner):
                 # the handler would leave this rank one collective ahead.
                 agreed = True
                 self._sr_seg_rendezvous(failed=False)
+                if aborted:
+                    # 正常情况下 rendezvous 已经把 stop/fail 传导给所有 rank 并抛出;
+                    # 这只是"全部 rank 一致地收到 abort"时的兜底:不出片,也不去拼片。
+                    if video_recorder is not None:
+                        try:
+                            video_recorder.stop(wait=False)
+                        except Exception:
+                            pass
+                        video_recorder = None
+                    logger.warning(f"[SeedVRRunner] rank {seg_rank}: aborted mid-segments, no output written")
+                    return {"video": None, "save_result_path": None}
                 if seg_rank != 0:
                     return {"video": None, "save_result_path": original_save_path}
                 # Segment files are zero-padded and named by global index, so
@@ -1666,11 +1745,17 @@ class SeedVRRunner(DefaultRunner):
         except TaskStopped:
             # Cancelled, not broken: the peers must learn of it, but this rank
             # did not leave a hole behind.
+            if seg_world > 1:
+                # 先把还欠着的边界帧标成 abort:否则对端会一直等这条 tail(15 分钟),
+                # 段并行的上游段也跟着等,一个取消就变成整机挂住。
+                self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
             if seg_world > 1 and not agreed:
                 agreed = True
                 self._sr_seg_rendezvous(failed=False)
             raise
         except Exception:
+            if seg_world > 1:
+                self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
             if seg_world > 1 and not agreed:
                 # The peers are waiting on a rendezvous only this rank can
                 # complete. Report the failure rather than let them sit out the
