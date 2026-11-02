@@ -1,6 +1,7 @@
 import os
 import random
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import imageio
@@ -32,7 +33,8 @@ def seed_all(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch_device_module.manual_seed(seed)
-    torch_device_module.manual_seed_all(seed)
+    if hasattr(torch_device_module, "manual_seed_all"):
+        torch_device_module.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
 
@@ -813,28 +815,6 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow2, oh2
 
 
-def get_optimal_patched_size_with_sp(patched_h, patched_w, sp_size):
-    assert sp_size > 0 and (sp_size & (sp_size - 1)) == 0, "sp_size must be a power of 2"
-
-    h_ratio, w_ratio = 1, 1
-    while sp_size != 1:
-        sp_size //= 2
-        if patched_h % 2 == 0:
-            patched_h //= 2
-            h_ratio *= 2
-        elif patched_w % 2 == 0:
-            patched_w //= 2
-            w_ratio *= 2
-        else:
-            if patched_h > patched_w:
-                patched_h //= 2
-                h_ratio *= 2
-            else:
-                patched_w //= 2
-                w_ratio *= 2
-    return patched_h * h_ratio, patched_w * w_ratio
-
-
 def get_crop_bbox(ori_h, ori_w, tgt_h, tgt_w):
     tgt_ar = tgt_h / tgt_w
     ori_ar = ori_h / ori_w
@@ -897,6 +877,55 @@ def fixed_shape_resize(img, target_height, target_width):
     return resized_img, h, w
 
 
+def resize_resampling_frames(frames, height, width, *, workers=4, parallel=True, device="cpu"):
+    """Lanczos-resize RGB frames, optionally sharing the work across ranks.
+
+    Each rank decodes the same source, but resizes only its contiguous frame
+    slice. Gather uint8 pixels before the existing CPU float conversion so
+    interpolation, frame order and normalization match serial execution.
+    All ranks in the default process group must participate when parallel.
+    """
+    if frames.ndim != 4 or frames.shape[-1] != 3 or frames.dtype != np.uint8 or not len(frames):
+        raise ValueError("Regeneration frames must be nonempty uint8 [F,H,W,3] RGB")
+    if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+        raise ValueError("resample_resize_workers must be a positive integer")
+    if height < 1 or width < 1:
+        raise ValueError("Regeneration target height and width must be positive")
+    if frames.shape[1:3] == (height, width):
+        return frames
+
+    distributed = parallel and dist.is_initialized() and dist.get_world_size() > 1
+    world_size = dist.get_world_size() if distributed else 1
+    rank = dist.get_rank() if distributed else 0
+    chunk_size = (len(frames) + world_size - 1) // world_size
+    start = rank * chunk_size
+    count = max(0, min(chunk_size, len(frames) - start))
+    resized = np.empty((chunk_size, height, width, 3), dtype=np.uint8)
+    resized[count:] = 0
+
+    def resize_one(index):
+        resized[index] = np.asarray(Image.fromarray(frames[start + index]).resize((width, height), Image.Resampling.LANCZOS))
+
+    if workers == 1 or count < 2:
+        for index in range(count):
+            resize_one(index)
+    else:
+        with ThreadPoolExecutor(max_workers=min(workers, count)) as pool:
+            # Iterating also propagates worker exceptions before returning.
+            for _ in pool.map(resize_one, range(count)):
+                pass
+
+    if not distributed:
+        return resized
+    # NCCL needs CUDA tensors; Gloo can gather directly on CPU (also useful
+    # for CPU tests). Only uint8 crosses the collective, never float pixels.
+    gather_device = "cpu" if dist.get_backend() == "gloo" else device
+    local = torch.from_numpy(resized).to(gather_device)
+    gathered = torch.empty((chunk_size * world_size, height, width, 3), dtype=torch.uint8, device=gather_device)
+    dist.all_gather_into_tensor(gathered, local)
+    return gathered[: len(frames)].cpu().numpy()
+
+
 def check_path_exists(path: str) -> None:
     """
     Check if a file path exists and raise an error if it doesn't.
@@ -938,10 +967,9 @@ def validate_config_paths(config: dict) -> None:
             "video_vae_original_ckpt",
             "audio_vae_original_ckpt",
         )
-        optional_components = (
-            "duration_head_original_ckpt",
-            "upsampler_original_ckpt",
-        )
+        optional_components = ("upsampler_original_ckpt",)
+        if config.get("auto_duration", True):
+            optional_components += ("duration_head_original_ckpt",)
         for key in required_components:
             value = config.get(key)
             if not value:

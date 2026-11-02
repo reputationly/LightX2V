@@ -28,7 +28,6 @@ class InfiniteTalkScheduler(BaseScheduler):
         self.rope_request_id = 0
 
     def seed_everything(self, seed):
-        seed = seed if seed >= 0 else random.randint(0, 99999999)
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         np.random.seed(seed)
@@ -38,6 +37,17 @@ class InfiniteTalkScheduler(BaseScheduler):
 
     def begin_request(self):
         self.rope_request_id += 1
+
+    def clear(self):
+        self.latents = None
+        self.latent_motion_frames = None
+        self.timesteps = None
+        self.timestep_input = None
+        self.noise_pred = None
+        self.noise_pred_cond = None
+        self.noise_pred_uncond = None
+        self.noise_pred_drop_text = None
+        self.noise_pred_guided = None
 
     def prepare(self, seed, latent_shape, latent_motion_frames=None, is_first_clip=True, cur_motion_frames_latent_num=1):
         if is_first_clip:
@@ -89,13 +99,3 @@ class InfiniteTalkScheduler(BaseScheduler):
         if not self.is_first_clip and self.latent_motion_frames is not None:
             self._consume_motion_noise(self.timesteps[self.step_index + 1])
         self._apply_clean_motion_prefix()
-
-    def clear(self):
-        # BaseScheduler.clear() is intentionally a no-op. InfiniteTalk keeps these
-        # request-sized tensors on its persistent scheduler, so release them once
-        # the request has finished (or failed).
-        self.latents = None
-        self.noise_pred = None
-        self.latent_motion_frames = None
-        self.timestep_input = None
-        self.timesteps = None

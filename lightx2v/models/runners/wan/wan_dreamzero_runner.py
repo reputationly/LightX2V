@@ -15,13 +15,16 @@ from safetensors import safe_open
 from lightx2v.models.input_encoders.hf.wan.t5.model import T5EncoderModel
 from lightx2v.models.input_encoders.hf.wan.xlm_roberta.model import CLIPModel
 from lightx2v.models.networks.wan.dreamzero_model import DreamZeroModel
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
+from lightx2v.models.runners.wan.streaming_vae import WanStreamingVAERunnerMixin
 from lightx2v.models.runners.wan.wan_runner import WanRunner
 from lightx2v.models.schedulers.wan.dreamzero.scheduler import DreamZeroFlowUniPCScheduler
 from lightx2v.models.video_encoders.hf.wan.vae import WanVAE
 from lightx2v.models.video_encoders.hf.wan.vae_tiny import WanVAE_tiny
 from lightx2v.server.metrics import monitor_cli
+from lightx2v.utils.async_vae import AsyncVAEChunkDecoder
 from lightx2v.utils.envs import GET_DTYPE, GET_RECORDER_MODE
-from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
+from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2, no_sync_profiling
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import find_torch_model_path, save_to_video
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -30,7 +33,11 @@ torch_device_module = getattr(torch, AI_DEVICE)
 
 
 @RUNNER_REGISTER("dreamzero")
-class WanDreamZeroRunner(WanRunner):
+class WanDreamZeroRunner(WanStreamingVAERunnerMixin, WanRunner):
+    supported_request_fields_by_task = {
+        "i2va": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"image_path", "save_action_path", "state_path"},
+    }
+
     def __init__(self, config):
         config["enable_cfg"] = config.get("enable_cfg", config.get("sample_guide_scale", 1.0) > 1)
         super().__init__(config)
@@ -41,6 +48,8 @@ class WanDreamZeroRunner(WanRunner):
         self.cache_name = "pos"
 
     def init_scheduler(self):
+        if self.config["infer_steps"] != self.config["action_infer_steps"]:
+            raise ValueError("DreamZero requires infer_steps to equal action_infer_steps")
         self.scheduler = DreamZeroFlowUniPCScheduler(self.config, shift_key="sample_shift", infer_steps_key="infer_steps")
         self.action_scheduler = DreamZeroFlowUniPCScheduler(self.config, shift_key="action_sample_shift", infer_steps_key="action_infer_steps")
 
@@ -147,6 +156,7 @@ class WanDreamZeroRunner(WanRunner):
             tokenizer_path=tokenizer_path,
             shard_fn=None,
             cpu_offload=t5_offload,
+            rms_norm_type=self.config.get("t5_rms_norm_type", "sgl-kernel"),
             t5_quantized=False,
             t5_quantized_ckpt=None,
             quant_scheme=None,
@@ -177,7 +187,13 @@ class WanDreamZeroRunner(WanRunner):
             self._overlay_dreamzero_component(vae_encoder.model, "action_head.vae.model.", "vae", strict=True)
         return vae_encoder
 
+    def load_vae(self):
+        self.vae_encoder = self.load_vae_encoder()
+        return self.vae_encoder, self.load_vae_decoder()
+
     def load_vae_decoder(self):
+        if self.config.get("lightvae_path"):
+            return WanStreamingVAERunnerMixin.load_vae_decoder(self)
         if self.config["task"] not in ["i2va"]:
             return super().load_vae_decoder()
         vae_offload = self.config.get("vae_cpu_offload", self.config.get("cpu_offload"))
@@ -209,13 +225,9 @@ class WanDreamZeroRunner(WanRunner):
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_i2va(self):
         original_prompt = self.input_info.prompt
-        original_negative_prompt = self.input_info.negative_prompt
         self.input_info.prompt = self._format_droid_prompt(original_prompt)
-        if not original_negative_prompt:
-            self.input_info.negative_prompt = self.config.get("negative_prompt", "")
         text_encoder_output = self.run_text_encoder(self.input_info)
         self.input_info.prompt = original_prompt
-        self.input_info.negative_prompt = original_negative_prompt
         torch_device_module.empty_cache()
         gc.collect()
         return {"text_encoder_output": text_encoder_output, "image_encoder_output": None}
@@ -371,8 +383,8 @@ class WanDreamZeroRunner(WanRunner):
         return (tensor * 255.0).to(torch.uint8).permute(0, 2, 3, 1).numpy()
 
     def _compose_droid_video(self, camera_sequences, frame_indices):
-        view_height = int(self.config.get("view_height", self.config["target_height"] // 2))
-        view_width = int(self.config.get("view_width", self.config["target_width"] // 2))
+        view_height = int(self.config.get("view_height", self.config["size"][0] // 2))
+        view_width = int(self.config.get("view_width", self.config["size"][1] // 2))
         selected = []
         for seq in camera_sequences:
             idx = np.clip(np.asarray(frame_indices, dtype=np.int64), 0, seq.shape[0] - 1)
@@ -397,7 +409,7 @@ class WanDreamZeroRunner(WanRunner):
         image_zeros = torch.zeros(
             videos.shape[0],
             3,
-            self.config["target_video_length"] - 1,
+            self.get_num_frames() - 1,
             height,
             width,
             dtype=videos.dtype,
@@ -497,9 +509,6 @@ class WanDreamZeroRunner(WanRunner):
         return action_np.astype(np.float32)
 
     def init_run(self):
-        self.pred_latent_lst = []
-        self.pred_latent_segments = []
-        self._current_latent_segment = []
         self.pred_action_lst = []
         self.gen_video = None
         self.gen_video_final = None
@@ -638,59 +647,47 @@ class WanDreamZeroRunner(WanRunner):
         self.current_start_frame += self.num_frame_per_block
         return self._postprocess_action(self.action_scheduler.latents), latents
 
-    def run_vae_decoder(self, pred_latent):
-        decoded = self.vae_decoder.decode(pred_latent.squeeze(0).to(GET_DTYPE()))
-        return decoded[0].permute(1, 2, 3, 0).add(1.0).mul(0.5).clamp(0, 1)
-
-    def run_vae_decoder_segments(self, latent_segments):
-        decoded_segments = []
-        for segment in latent_segments:
-            if not segment:
-                continue
-            pred_latent = torch.cat(segment, dim=2)
-            decoded_segments.append(self.run_vae_decoder(pred_latent))
-        if not decoded_segments:
-            raise RuntimeError("DreamZero produced no latent segments to decode.")
-        return torch.cat(decoded_segments, dim=0)
+    def decode_policy_chunk(self, latents, first, last):
+        return self.vae_decoder.cached_decode_withflag(latents[0].to(GET_DTYPE()), first, last)[0].permute(1, 2, 3, 0).add(1).mul(0.5).clamp(0, 1)
 
     @ProfilingContext4DebugL2("Run DiT")
     def run_main(self):
         self.init_run()
         schedule = self._frame_schedule()
-        for chunk_id, frame_indices in enumerate(schedule):
-            logger.info(f"DreamZero chunk {chunk_id + 1}/{len(schedule)} frames={frame_indices}")
-            with ProfilingContext4DebugL1(f"DreamZero chunk {chunk_id + 1}/{len(schedule)}"):
-                self.check_stop()
-                actions, latents = self.run_chunk(frame_indices)
-                self.pred_action_lst.append(torch.from_numpy(actions))
-                self.pred_latent_lst.append(latents)
-                if self.last_chunk_started_new_segment and self._current_latent_segment:
-                    self.pred_latent_segments.append(self._current_latent_segment)
-                    self._current_latent_segment = []
-                self._current_latent_segment.append(latents)
-
-        if self._current_latent_segment:
-            self.pred_latent_segments.append(self._current_latent_segment)
-            self._current_latent_segment = []
+        decoder = AsyncVAEChunkDecoder.from_config(self.config, device=AI_DEVICE, vae_decoder=self.vae_decoder, dispatch_in_worker=True)
+        try:
+            with no_sync_profiling(enabled=decoder.is_async):
+                for chunk_id, frame_indices in enumerate(schedule):
+                    logger.info(f"DreamZero chunk {chunk_id + 1}/{len(schedule)} frames={frame_indices}")
+                    with ProfilingContext4DebugL1(f"DreamZero chunk {chunk_id + 1}/{len(schedule)}"):
+                        self.check_stop()
+                        actions, latents = self.run_chunk(frame_indices)
+                        self.pred_action_lst.append(torch.from_numpy(actions))
+                    first = chunk_id == 0 or (self.config.get("decode_segments", False) and self.last_chunk_started_new_segment)
+                    decoder.submit(self.decode_policy_chunk, latents, first, chunk_id == len(schedule) - 1)
+                self.gen_video = torch.cat(decoder.finish(), dim=0)
+        finally:
+            try:
+                decoder.finish()
+            finally:
+                self.vae_decoder.reset_decode_state()
         self.pred_action = torch.cat(self.pred_action_lst, dim=0)
-        if self.config.get("decode_segments", False):
-            self.gen_video = self.run_vae_decoder_segments(self.pred_latent_segments)
-        else:
-            self.gen_video = self.run_vae_decoder(torch.cat(self.pred_latent_lst, dim=2))
-        gen_video_final = self.process_images_after_vae_decoder()
+        result = self.process_images_after_vae_decoder()
         self.end_run()
-        return gen_video_final
+        return result
 
     def process_images_after_vae_decoder(self):
         self.gen_video_final = self.gen_video
-        video_path = getattr(self.input_info, "save_result_path", None)
+        video_path = self.input_info.save_result_path
         if not video_path:
             raise ValueError("DreamZero requires save_result_path from input_info.")
         video_path = str(video_path)
-        action_path = getattr(self.input_info, "save_action_path", "") or str(Path(video_path).with_suffix(".actions.npy"))
-        if not os.path.isabs(str(action_path)):
-            action_path = os.path.join(os.path.dirname(video_path) or ".", str(action_path))
-        save_to_video(self.gen_video_final, video_path, fps=self.config.get("target_fps", 10), method=self.config.get("save_video_method", "imageio"))
+        action_path = self.input_info.save_action_path
+        if not action_path:
+            action_path = str(Path(video_path).with_suffix(".actions.npy"))
+        elif not os.path.isabs(action_path):
+            action_path = os.path.join(os.path.dirname(video_path), action_path)
+        save_to_video(self.gen_video_final, video_path, fps=self.config.get("fps", 10), method=self.config.get("save_video_method", "imageio"))
         os.makedirs(os.path.dirname(action_path) or ".", exist_ok=True)
         np.save(action_path, self.pred_action.numpy())
         logger.info("Saved DreamZero video to {}", video_path)

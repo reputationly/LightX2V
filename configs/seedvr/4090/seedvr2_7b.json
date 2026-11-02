@@ -1,7 +1,6 @@
 {
-    "target_video_length": 81,
-    "target_height": 1440,
-    "target_width": 2560,
+    "sr_segment_length": 81,
+    "size": [1440, 2560],
     "infer_steps": 1,
     "fps": 16,
     "model_size": "7b",
@@ -14,17 +13,15 @@
     "vae_sp_color_chunk_size": 4,
     "stream_save_video": true,
     "cpu_offload": true,
-    "resize_mode": "adaptive",
+    "match_target_size": false,
     "color_fix": "gpu",
     "load_from_rank0": true,
     "dit_quantized_ckpt": "/path/to/seedvr2_ema_7b_fp8.safetensors",
     "dit_quant_scheme": "fp8-q8f",
     "dit_quantized": true,
     "parallel": {
-        "seq_p_size": 8,
-        "seq_p_attn_type": "ulysses-4090",
-        "vae_parallel": true
-    },
-    "video_crf": 12,
-    "video_preset": "slow"
+      "seq_p_size": 8,
+      "seq_p_attn_type": "ulysses-4090",
+      "vae_parallel": true
+    }
 }

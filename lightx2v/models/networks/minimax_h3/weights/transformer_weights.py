@@ -1,20 +1,25 @@
-import torch
 import torch.distributed as dist
 
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList
+from lightx2v.common.ops.mm.mm_weight import unwrap_tp_weight
 from lightx2v.models.networks.minimax_h3.infer.triton_ops import MiniMaxH3TritonRope  # noqa: F401
+from lightx2v.models.networks.minimax_h3.weights.fused_qkv import FusedQKVStorage
+from lightx2v.utils.envs import DTYPE_MAP
+from lightx2v.utils.fp8_f16_accum_checkpoint import ACTIVATION_QMAX, H3_PROJECTION_SUFFIXES
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGISTER, RMS_WEIGHT_REGISTER, ROPE_REGISTER
+from lightx2v_platform.base.global_var import AI_DEVICE
 
 
 def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
     lora_prefix = "transformer_blocks"
+    quant_scheme = config.get("dit_quant_scheme", "Default")
     if config.get("tensor_parallel", False) and tp_split is not None:
         tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
         tp_mm_type = config.get("tp_mm_type", "TensorParallel")
-        return MM_WEIGHT_REGISTER[tp_mm_type](
+        linear = MM_WEIGHT_REGISTER[tp_mm_type](
             weight_name=f"{name}.weight",
             bias_name=f"{name}.bias" if bias else None,
-            mm_type=config.get("dit_quant_scheme", "Default"),
+            mm_type=quant_scheme,
             tp_group=tp_group,
             tp_rank=dist.get_rank(tp_group),
             tp_size=dist.get_world_size(tp_group),
@@ -23,12 +28,19 @@ def _linear(config, name, bias=False, create_cuda_buffer=False, tp_split=None):
             create_cuda_buffer=create_cuda_buffer,
             lora_prefix=lora_prefix,
         )
-    return MM_WEIGHT_REGISTER[config.get("dit_quant_scheme", "Default")](
+        if quant_scheme in ("fp8-f16-accum", "fp8-f32-accum") and name.endswith(H3_PROJECTION_SUFFIXES):
+            unwrap_tp_weight(linear).enable_fp8_f16_accum(ACTIVATION_QMAX)
+        return linear
+
+    linear = MM_WEIGHT_REGISTER[quant_scheme](
         f"{name}.weight",
         f"{name}.bias" if bias else None,
         create_cuda_buffer=create_cuda_buffer,
         lora_prefix=lora_prefix,
     )
+    if quant_scheme in ("fp8-f16-accum", "fp8-f32-accum") and name.endswith(H3_PROJECTION_SUFFIXES):
+        linear.enable_fp8_f16_accum(ACTIVATION_QMAX)
+    return linear
 
 
 def _rms(config, name, eps, create_cuda_buffer=False):
@@ -42,9 +54,15 @@ def _rms(config, name, eps, create_cuda_buffer=False):
 class MiniMaxH3AttentionWeights(WeightModule):
     def __init__(self, prefix, config, create_cuda_buffer=False):
         super().__init__()
+        self.use_fused_qkv = bool(config.get("use_fused_qkv", False))
         self.add_module("to_q", _linear(config, f"{prefix}.to_q", create_cuda_buffer=create_cuda_buffer, tp_split="col"))
         self.add_module("to_k", _linear(config, f"{prefix}.to_k", create_cuda_buffer=create_cuda_buffer, tp_split="col"))
         self.add_module("to_v", _linear(config, f"{prefix}.to_v", create_cuda_buffer=create_cuda_buffer, tp_split="col"))
+        # This is deliberately not registered as a child module: there is no
+        # fused tensor in the released checkpoint. The checkpoint-backed
+        # projections become views of its shared storage after loading.
+        self.to_qkv = _linear(config, f"{prefix}.to_qkv", create_cuda_buffer=create_cuda_buffer, tp_split="col") if self.use_fused_qkv else None
+        self._qkv_storage = FusedQKVStorage(tuple(unwrap_tp_weight(module) for module in (self.to_q, self.to_k, self.to_v)), unwrap_tp_weight(self.to_qkv)) if self.to_qkv is not None else None
         qk_eps = float(config.get("qk_norm_eps", 1e-5))
         self.add_module(
             "norm_q",
@@ -68,13 +86,15 @@ class MiniMaxH3AttentionWeights(WeightModule):
             "rope",
             ROPE_REGISTER[config.get("rope_type", "torch_real_rope")](
                 layout="split_half",
-                compute_dtype=torch.float32,
+                compute_dtype=DTYPE_MAP[config.get("rope_compute_dtype", "fp32")],
             ),
         )
         attn_type = config.get("attn_type", "flash_attn3")
         attention_cls = ATTN_WEIGHT_REGISTER[attn_type]
         if attn_type == "dynamic_sparse_attn":
             calculate = attention_cls(config.get("dynamic_sparse_attn_setting", {}))
+        elif attn_type == "torch_sdpa_mps":
+            calculate = attention_cls(query_chunk_size=config.get("mps_sdpa_query_chunk_size", 0))
         else:
             calculate = attention_cls()
         if attn_type == "sol_attn":
@@ -87,6 +107,60 @@ class MiniMaxH3AttentionWeights(WeightModule):
                 ATTN_WEIGHT_REGISTER[parallel.get("seq_p_attn_type", "ulysses")](a2a_backend=parallel.get("seq_p_a2a_backend", "torch")),
             )
         self.add_module("to_out", _linear(config, f"{prefix}.to_out.0", create_cuda_buffer=create_cuda_buffer, tp_split="row"))
+
+    def load(self, weight_dict):
+        super().load(weight_dict)
+        self._build_fused_qkv()
+
+    def to_cuda(self, non_blocking=False):
+        self._move_weights(AI_DEVICE, non_blocking)
+
+    def to_cpu(self, non_blocking=False):
+        self._move_weights("cpu", non_blocking)
+
+    def _move_weights(self, device, non_blocking):
+        shared = self._qkv_storage is not None and self._qkv_storage.can_move
+        if shared:
+            self._qkv_storage.move(device, non_blocking)
+        method = "to_cpu" if device == "cpu" else "to_cuda"
+        for name, module in self._modules.items():
+            if shared and name in ("to_q", "to_k", "to_v"):
+                continue
+            if hasattr(module, method):
+                getattr(module, method)(non_blocking=non_blocking)
+        if not shared:
+            self._build_fused_qkv()
+
+    def to_cuda_async(self, non_blocking=True):
+        self.to_cuda(non_blocking=non_blocking)
+
+    def to_cpu_async(self, non_blocking=True):
+        self.to_cpu(non_blocking=non_blocking)
+
+    def load_state_dict(self, destination, block_index, adapter_block_index=None):
+        result = super().load_state_dict(destination, block_index, adapter_block_index)
+        self._build_fused_qkv()
+        return result
+
+    def load_state_dict_from_disk(self, block_index, adapter_block_index=None):
+        result = super().load_state_dict_from_disk(block_index, adapter_block_index)
+        self._build_fused_qkv()
+        return result
+
+    def _build_fused_qkv(self):
+        if self._qkv_storage is not None:
+            self._qkv_storage.refresh()
+
+    @property
+    def has_fused_qkv(self):
+        if self.to_qkv is None or getattr(unwrap_tp_weight(self.to_qkv), "weight", None) is None:
+            return False
+        return not any(getattr(unwrap_tp_weight(module), "has_diff", False) for module in (self.to_q, self.to_k, self.to_v))
+
+    def project_fused_qkv(self, hidden_states):
+        base = self.to_qkv.apply(hidden_states).chunk(3, dim=-1)
+        projections = tuple(unwrap_tp_weight(module) for module in (self.to_q, self.to_k, self.to_v))
+        return tuple(output + projection.apply_lora(hidden_states) if projection.has_lora_branch else output for output, projection in zip(base, projections))
 
 
 class MiniMaxH3FeedForwardWeights(WeightModule):
@@ -121,9 +195,12 @@ class MiniMaxH3TransformerBlockWeights(WeightModule):
             ),
         )
         self.add_module("ff", MiniMaxH3FeedForwardWeights(f"{prefix}.ff", config, create_cuda_buffer))
-        # AdaLN is the largest per-block projection in H3.  Its output is
-        # column-sharded here and gathered once per block before modulation.
-        self.add_module("adaln", _linear(config, f"{prefix}.adaln_proj.linear", bias=True, create_cuda_buffer=create_cuda_buffer, tp_split="col"))
+        if not config.get("use_adaln_cache", False):
+            # ADALN CACHE SYNC: The offline builder reads this key and mirrors
+            # the unquantized projection; update the offline builder if it changes.
+            # AdaLN is the largest per-block projection in H3. Its output is
+            # column-sharded here and gathered once per block before modulation.
+            self.add_module("adaln", _linear(config, f"{prefix}.adaln_proj.linear", bias=True, create_cuda_buffer=create_cuda_buffer, tp_split="col"))
 
 
 class MiniMaxH3TransformerWeights(WeightModule):
@@ -140,4 +217,5 @@ class MiniMaxH3TransformerWeights(WeightModule):
             # needs checkpoint metadata that normal CPU loading consumes.
             self.add_module("offload_block_cuda_buffers", self.offload_block_cuda_buffers)
             self.offload_phase_cuda_buffers = None
+            self.register_offload_group(self.blocks, self.offload_block_cuda_buffers, (f"transformer_blocks.{i}." for i in range(len(self.blocks))))
         self.add_module("blocks", self.blocks)

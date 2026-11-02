@@ -123,11 +123,9 @@ class ApiServer:
                 task_manager.fail_task(task_id, "Task cancelled")
                 return
 
-            from ..schema import ImageTaskRequest, SenseNovaVisionTaskRequest
+            from ..schema import ImageTaskRequest
 
-            if isinstance(message, SenseNovaVisionTaskRequest):
-                generation_service = services.sensenova_vision_service
-            elif isinstance(message, ImageTaskRequest):
+            if isinstance(message, ImageTaskRequest):
                 generation_service = services.image_service
             else:
                 generation_service = services.video_service
@@ -137,23 +135,21 @@ class ApiServer:
 
             result = await generation_service.generate_with_stop_event(message, task_info.stop_event)
 
-            if task_info.stop_event.is_set():
-                # The denoise loop never observes stop_event, so a cancelled task
-                # runs to the end and still hands back a usable result. Drop it —
-                # cancel_task() already put the task in its terminal state.
-                logger.info(f"Task {task_id} finished after cancellation, discarding result")
-            elif result:
+            if result is not None:
                 task_manager.complete_task(
                     task_id,
                     save_result_path=result.save_result_path or None,
-                    result_png=getattr(result, "result_png", None),
-                    usage=getattr(result, "usage", None),
-                    result_data=getattr(result, "result_data", None),
+                    result_png=result.result_png,
+                    usage=result.usage,
                 )
                 logger.info(f"Task {task_id} completed successfully")
             else:
-                task_manager.fail_task(task_id, "Generation failed")
-                logger.error(f"Task {task_id} generation failed")
+                if task_info.stop_event.is_set():
+                    task_manager.fail_task(task_id, "Task cancelled during processing")
+                    logger.info(f"Task {task_id} cancelled during processing")
+                else:
+                    task_manager.fail_task(task_id, "Generation failed")
+                    logger.error(f"Task {task_id} generation failed")
 
         except Exception as e:
             logger.exception(f"Task {task_id} processing failed: {str(e)}")

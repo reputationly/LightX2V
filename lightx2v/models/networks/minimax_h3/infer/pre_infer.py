@@ -26,7 +26,7 @@ class MiniMaxH3PreInfer:
     def __init__(self, config):
         self.config = config
         global_num_heads = int(config.get("num_attention_heads", 56))
-        if config.get("tensor_parallel", False):
+        if config.get("tensor_parallel", False) and config.get("text_refiner_tensor_parallel", True):
             tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
             tp_size = dist.get_world_size(tp_group)
         else:
@@ -37,6 +37,7 @@ class MiniMaxH3PreInfer:
         self.rope_freq_dim = int(config.get("rope_freq_dim", 16))
         self.rope_theta = float(config.get("rope_theta", 10000.0))
         self.freq_dim = int(config.get("freq_dim", 256))
+        self.use_adaln_cache = bool(config.get("use_adaln_cache", False))
 
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
@@ -72,6 +73,7 @@ class MiniMaxH3PreInfer:
             text_embeds = text_embeds + self._ff(block.ff, block.norm2.apply(text_embeds))
         return weights.refiner_final_norm.apply(text_embeds)
 
+    @torch.inference_mode(False)
     def _rotary_embedding(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         position_ids = position_ids.to(torch.float32)
         inv_freq = 1.0 / (
@@ -93,22 +95,31 @@ class MiniMaxH3PreInfer:
         freqs = torch.cat((freqs, freqs), dim=-1)
         return freqs.cos(), freqs.sin()
 
-    def infer(self, weights, prompt_embeds):
+    def prepare_inputs(self, weights, prompt_embeds):
         layout = self.scheduler.layout
         bulk_dtype = GET_DTYPE()
 
         video_embeds = weights.proj_in.apply(self.scheduler.video_latents.float()).to(bulk_dtype)
         audio_embeds = weights.audio_proj_in.apply(self.scheduler.audio_latents.float()).to(bulk_dtype)
-        text_embeds = weights.context_embedder.apply(prompt_embeds.to(bulk_dtype))
-        text_embeds = self._refine_text(weights, text_embeds)
-
-        hidden_states = text_embeds.new_zeros((layout.sequence_length, self.hidden_size))
-        hidden_states.index_copy_(0, layout.text_indices, text_embeds)
+        hidden_states = video_embeds.new_zeros((layout.sequence_length, self.hidden_size))
+        if layout.text_indices.numel():
+            text_embeds = weights.context_embedder.apply(prompt_embeds.to(bulk_dtype))
+            text_embeds = self._refine_text(weights, text_embeds)
+            hidden_states.index_copy_(0, layout.text_indices, text_embeds)
         hidden_states.index_copy_(0, layout.audio_indices, audio_embeds)
         hidden_states.index_copy_(0, layout.video_indices, video_embeds)
+        return hidden_states, self._rotary_embedding(layout.position_ids)
 
-        temb = timestep_embedding(self.scheduler.unique_timesteps, self.freq_dim)
-        temb = weights.time_linear_2.apply(F.silu(weights.time_linear_1.apply(temb.float())))
+    def infer(self, weights, prompt_embeds):
+        layout = self.scheduler.layout
+        hidden_states, rotary_emb = self.prepare_inputs(weights, prompt_embeds)
+        temb = None
+        if not self.use_adaln_cache:
+            # ADALN CACHE SYNC: Any change to this time-MLP sequence, activation,
+            # or dtype must also be made in the offline AdaLN cache builder and
+            # followed by regenerating the cache when cached values can change.
+            temb = timestep_embedding(self.scheduler.unique_timesteps, self.freq_dim)
+            temb = weights.time_linear_2.apply(F.silu(weights.time_linear_1.apply(temb.float())))
         timestep_indices = self.scheduler.timestep_indices
         adaln_indices = timestep_indices * 3 + layout.token_tags.clamp(min=0)
 
@@ -117,7 +128,7 @@ class MiniMaxH3PreInfer:
             temb=temb,
             timestep_indices=timestep_indices,
             adaln_indices=adaln_indices,
-            rotary_emb=self._rotary_embedding(layout.position_ids),
+            rotary_emb=rotary_emb,
             video_indices=layout.video_indices,
             audio_indices=layout.audio_indices,
             text_indices=layout.text_indices,

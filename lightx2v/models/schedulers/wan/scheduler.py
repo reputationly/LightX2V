@@ -13,7 +13,6 @@ class WanScheduler(BaseScheduler):
     def __init__(self, config):
         super().__init__(config)
         self.infer_steps = self.config["infer_steps"]
-        self.target_video_length = self.config["target_video_length"]
         self.sample_shift = self.config["sample_shift"]
         if self.config["seq_parallel"]:
             self.seq_p_group = self.config.get("device_mesh").get_group(mesh_dim="seq_p")
@@ -35,7 +34,6 @@ class WanScheduler(BaseScheduler):
     def refresh_from_config(self, config):
         self.config = config
         self.infer_steps = int(self.config["infer_steps"])
-        self.target_video_length = int(self.config["target_video_length"])
         self.sample_shift = float(self.config["sample_shift"])
         self.sample_guide_scale = self.config.get("sample_guide_scale")
         self.caching_records = [True] * self.infer_steps
@@ -71,17 +69,12 @@ class WanScheduler(BaseScheduler):
             self.changing_resolution_index = 0
 
     def _uses_conditioned_latent_prefix(self):
-        """Whether this Wan variant keeps a fixed latent prefix during diffusion.
-
-        Vanilla Wan2.2 i2v/s2v already does this for the first encoded frames. MG3
-        reuses the same mechanism, but the carried prefix can be longer on later
-        segments because previous latent tails are stitched back in as conditioning.
-        """
+        """Whether this Wan variant keeps a fixed latent prefix during diffusion."""
         task = self.config.get("task")
         model_cls = str(self.config.get("model_cls", ""))
         if task not in ["i2v", "s2v", "rs2v"]:
             return False
-        return model_cls in {"wan2.2", "wan2.2_matrix_game3"}
+        return model_cls == "wan2.2"
 
     def prepare(self, seed, latent_shape, image_encoder_output=None):
         self.rope_request_id += 1
@@ -227,6 +220,7 @@ class WanScheduler(BaseScheduler):
 
         h = lambda_t - lambda_s0
         device = sample.device
+        coefficient_device = self.config.get("scheduler_coefficient_device", device)
 
         rks = []
         D1s = []
@@ -240,7 +234,7 @@ class WanScheduler(BaseScheduler):
             D1s.append((mi - m0) / rk)
 
         rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks = torch.tensor(rks, device=coefficient_device)
 
         R = []
         b = []
@@ -260,7 +254,7 @@ class WanScheduler(BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.tensor(b, device=coefficient_device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)  # (B, K)
@@ -326,6 +320,7 @@ class WanScheduler(BaseScheduler):
 
         h = lambda_t - lambda_s0
         device = this_sample.device
+        coefficient_device = self.config.get("scheduler_coefficient_device", device)
 
         rks = []
         D1s = []
@@ -339,7 +334,7 @@ class WanScheduler(BaseScheduler):
             D1s.append((mi - m0) / rk)
 
         rks.append(1.0)
-        rks = torch.tensor(rks, device=device)
+        rks = torch.tensor(rks, device=coefficient_device)
 
         R = []
         b = []
@@ -359,7 +354,7 @@ class WanScheduler(BaseScheduler):
             h_phi_k = h_phi_k / hh - 1 / factorial_i
 
         R = torch.stack(R)
-        b = torch.tensor(b, device=device)
+        b = torch.tensor(b, device=coefficient_device)
 
         if len(D1s) > 0:
             D1s = torch.stack(D1s, dim=1)

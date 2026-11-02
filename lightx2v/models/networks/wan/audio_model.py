@@ -5,6 +5,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from loguru import logger
 
+from lightx2v.models.networks.wan.autoregressive_model import WanAutoregressiveModel
 from lightx2v.models.networks.wan.infer.audio.post_infer import WanAudioPostInfer
 from lightx2v.models.networks.wan.infer.audio.pre_infer import WanAudioARPreInfer, WanAudioPreInfer
 from lightx2v.models.networks.wan.infer.audio.transformer_infer import WanAudioARTransformerInfer, WanAudioTransformerInfer
@@ -96,18 +97,17 @@ class WanAudioModel(WanModel):
         if person_mask_latens is not None:
             pre_infer_out.adapter_args["person_mask_latens"] = torch.chunk(person_mask_latens, world_size, dim=1)[cur_rank]
 
-        if self.config["model_cls"] in ["wan2.2", "wan2.2_audio"] and self.config["task"] in ["i2v", "s2v", "rs2v"]:
-            embed, embed0 = pre_infer_out.embed, pre_infer_out.embed0
-            padding_size = (world_size - (embed.shape[0] % world_size)) % world_size
-            if padding_size > 0:
-                embed = F.pad(embed, (0, 0, 0, padding_size))
-                embed0 = F.pad(embed0, (0, 0, 0, 0, 0, padding_size))
-            pre_infer_out.embed = torch.chunk(embed, world_size, dim=0)[cur_rank]
-            pre_infer_out.embed0 = torch.chunk(embed0, world_size, dim=0)[cur_rank]
         return pre_infer_out
 
 
-class WanAudioARModel(WanAudioModel):
+class WanAudioARModel(WanAudioModel, WanAutoregressiveModel):
+    @torch.no_grad()
+    def _seq_parallel_pre_process(self, pre_infer_out):
+        # Audio owns its mask-aware SP split, while the shared AR gather needs
+        # the true length to discard any padding after attention.
+        self._sequence_parallel_tokens = pre_infer_out.x.shape[0]
+        return super()._seq_parallel_pre_process(pre_infer_out)
+
     def _init_infer_class(self):
         super()._init_infer_class()
         self.pre_infer_class = WanAudioARPreInfer
@@ -116,6 +116,10 @@ class WanAudioARModel(WanAudioModel):
 
     @torch.no_grad()
     def infer(self, inputs):
+        text_key = "context" if self.scheduler.infer_condition else "context_null"
+        self.transformer_infer.set_cross_attn_context(inputs["text_encoder_output"][text_key], branch=self.scheduler.infer_condition)
+        if self.transformer_infer.has_image_context:
+            self.transformer_infer.set_cross_attn_context(inputs["image_encoder_output"]["clip_encoder_out"], branch=self.scheduler.infer_condition, kind="image")
         if self.cpu_offload:
             if self.offload_granularity == "model" and self.scheduler.step_index == 0:
                 self.to_cuda()

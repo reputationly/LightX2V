@@ -7,7 +7,10 @@ from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER, MM_WEIGHT_REGI
 def _linear(name, bias=False, force_fp32=False, config=None, tp_split=None):
     kind = "Default-ForceFp32" if force_fp32 else "Default"
     lora_kwargs = {"lora_prefix": "token_refiner"} if name.startswith("token_refiner.") else {}
-    if config is not None and config.get("tensor_parallel", False) and tp_split is not None:
+    use_tp = config is not None and config.get("tensor_parallel", False) and tp_split is not None
+    if name.startswith("token_refiner.") and config is not None:
+        use_tp = use_tp and config.get("text_refiner_tensor_parallel", True)
+    if use_tp:
         tp_group = config["device_mesh"].get_group(mesh_dim="tensor_p")
         tp_mm_type = config.get("tp_mm_type", "TensorParallel")
         return MM_WEIGHT_REGISTER[tp_mm_type](
@@ -84,8 +87,11 @@ class MiniMaxH3PreWeights(WeightModule):
         self.add_module("proj_in", _linear("proj_in", bias=True, force_fp32=True))
         self.add_module("audio_proj_in", _linear("audio_proj_in", bias=True, force_fp32=True))
         self.add_module("context_embedder", _linear("context_embedder", bias=True))
-        self.add_module("time_linear_1", _linear("time_embedder.linear_1", bias=True, force_fp32=True))
-        self.add_module("time_linear_2", _linear("time_embedder.linear_2", bias=True, force_fp32=True))
+        if not config.get("use_adaln_cache", False):
+            # ADALN CACHE SYNC: The offline builder reads these keys and mirrors
+            # their FP32 semantics; update the offline builder if either changes.
+            self.add_module("time_linear_1", _linear("time_embedder.linear_1", bias=True, force_fp32=True))
+            self.add_module("time_linear_2", _linear("time_embedder.linear_2", bias=True, force_fp32=True))
         self.add_module(
             "refiner_blocks",
             WeightModuleList([MiniMaxH3TokenRefinerBlockWeights(i, config) for i in range(int(config.get("num_refiner_layers", 2)))]),

@@ -11,17 +11,14 @@ from torchvision.transforms import InterpolationMode
 
 from lightx2v.models.input_encoders.hf.wan.wan_dancer.wan_dancer import extract_music_features, split_music_features
 from lightx2v.models.networks.wan.dancer_model import WanDancerModel
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
 from lightx2v.models.runners.wan.wan_runner import WanRunner
 from lightx2v.models.schedulers.wan.dancer import WanDancerScheduler, WanDancerStepDistillScheduler
 from lightx2v.models.video_encoders.hf.wan.dancer_vae import WanDancerVAE
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
-from lightx2v.utils.utils import find_torch_model_path, mux_audio_from_video, save_to_video
+from lightx2v.utils.utils import find_torch_model_path, is_main_process, mux_audio_from_video, save_to_video
 from lightx2v_platform.base.global_var import AI_DEVICE
-
-
-def _is_main_process():
-    return not dist.is_initialized() or dist.get_rank() == 0
 
 
 def _barrier():
@@ -31,7 +28,20 @@ def _barrier():
 
 @RUNNER_REGISTER("wan_dancer")
 class WanDancerRunner(WanRunner):
+    supported_request_fields_by_task = {
+        "s2v": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"audio_path", "image_path"},
+    }
+
+    def get_supported_request_fields(self, task):
+        supported_request_fields = super().get_supported_request_fields(task)
+        if self.config.get("dancer_stage") == "local":
+            return supported_request_fields | {"video_path"}
+        return supported_request_fields
+
     def __init__(self, config):
+        config.setdefault("fps", 30 if config.get("dancer_stage") == "local" else 8)
+        if config.get("dancer_stage") == "local" and config["fps"] != 30:
+            raise ValueError("Wan-Dancer local stage requires fps=30.")
         super().__init__(config)
         self.vae_cls = WanDancerVAE
         self.vae_name = "Wan2.1_VAE.pth"
@@ -105,7 +115,7 @@ class WanDancerRunner(WanRunner):
         return mask.view(1, mask.shape[1] // 4, 4, latent_height, latent_width).transpose(1, 2)[0]
 
     def _encode_keyframes(self, keyframes, mask):
-        height, width = self.config["target_height"], self.config["target_width"]
+        height, width = self.config["size"][0], self.config["size"][1]
         video = torch.full((1, 3, 149, height, width), -1, dtype=GET_DTYPE())
         for frame_index, image in keyframes.items():
             video[0, :, frame_index].copy_(TF.to_tensor(image).mul_(2).sub_(1).to(GET_DTYPE()))
@@ -129,7 +139,7 @@ class WanDancerRunner(WanRunner):
         }
 
     def _denoise(self, inputs, seed, segment_index=0, segment_count=1):
-        latent_shape = [16, 38, self.config["target_height"] // 8, self.config["target_width"] // 8]
+        latent_shape = [16, 38, self.config["size"][0] // 8, self.config["size"][1] // 8]
         self.inputs = inputs
         self.video_segment_num = segment_count
         self.scheduler.reset(seed, latent_shape)
@@ -142,7 +152,7 @@ class WanDancerRunner(WanRunner):
         return video.permute(1, 2, 3, 0).float().add_(1).mul_(0.5).clamp_(0, 1).cpu()
 
     def _global_pipeline(self):
-        width, height = self.config["target_width"], self.config["target_height"]
+        width, height = self.config["size"][1], self.config["size"][0]
         reference, crop_box = self._crop_and_resize(Image.open(self.input_info.image_path), width, height)
         music_feature = extract_music_features(self.input_info.audio_path)
         divisor = max(1, int(music_feature.shape[0] / 149.0 + 0.5))
@@ -159,7 +169,7 @@ class WanDancerRunner(WanRunner):
         latents = self._denoise(inputs, self.input_info.seed)
 
         result = None
-        if _is_main_process():
+        if is_main_process():
             decoded = self.vae_decoder.decode_framewise(latents.to(GET_DTYPE()))
             result = self._to_comfy(decoded, crop_box)
             if self.input_info.save_result_path:
@@ -167,9 +177,9 @@ class WanDancerRunner(WanRunner):
                 logger.info(f"Wan-Dancer global video saved to {self.input_info.save_result_path}")
         _barrier()
         self.scheduler.clear()
-        return {"video": result if self.input_info.return_result_tensor and _is_main_process() else None}
+        return {"video": result if self.input_info.return_result_tensor and is_main_process() else None}
 
-    def _read_global_plan(self, total_frames):
+    def _read_global_plan(self, total_frames, segment_count):
         capture = cv2.VideoCapture(self.input_info.video_path)
         frames = []
         while True:
@@ -181,7 +191,6 @@ class WanDancerRunner(WanRunner):
         if not frames:
             raise ValueError(f"No frames found in global plan: {self.input_info.video_path}")
 
-        segment_count = math.ceil(total_frames / 149)
         interval = total_frames / len(frames)
         masks = []
         for segment_index in range(segment_count):
@@ -192,7 +201,8 @@ class WanDancerRunner(WanRunner):
                     mask[int(math.ceil(interval * count))] = 1
                     count += 1
             else:
-                end_index = total_frames - 149 * segment_index - 1
+                mask[0] = 1
+                end_index = min(148, total_frames - 149 * segment_index - 1)
                 mask[end_index] = 1
                 count = 0
                 while count * interval < end_index - interval:
@@ -200,7 +210,7 @@ class WanDancerRunner(WanRunner):
                     count += 1
             masks.append(mask)
 
-        width, height = self.config["target_width"], self.config["target_height"]
+        width, height = self.config["size"][1], self.config["size"][0]
         keyframes, source_index = [], 0
         for mask in masks:
             mapping = {}
@@ -216,13 +226,13 @@ class WanDancerRunner(WanRunner):
 
     def _local_pipeline(self):
         music_features, duration = split_music_features(self.input_info.audio_path)
+        if not music_features:
+            raise ValueError("Wan-Dancer local stage requires audio longer than 0.2 seconds.")
         fps = float(self.config["fps"])
         total_frames = int(duration * fps)
-        keyframes, masks = self._read_global_plan(total_frames)
-        if len(music_features) != len(keyframes):
-            raise ValueError(f"Audio/global-plan segment mismatch: {len(music_features)} vs {len(keyframes)}")
+        keyframes, masks = self._read_global_plan(total_frames, len(music_features))
 
-        width, height = self.config["target_width"], self.config["target_height"]
+        width, height = self.config["size"][1], self.config["size"][0]
         reference, crop_box = self._crop_and_resize(Image.open(self.input_info.image_path), width, height)
         first = keyframes[0][0]
         if min(first.size) < 512:
@@ -239,12 +249,12 @@ class WanDancerRunner(WanRunner):
             vae_output = self._encode_keyframes(mapping, mask)
             inputs = self._make_inputs(text_output, mapping[0], reference, vae_output, music_feature, fps)
             latents = self._denoise(inputs, self.input_info.seed + index * 10, index, len(keyframes))
-            if _is_main_process():
+            if is_main_process():
                 decoded_segments.append(self.vae_decoder.decode(latents.to(GET_DTYPE())))
             _barrier()
 
         result = None
-        if _is_main_process():
+        if is_main_process():
             decoded = torch.cat(decoded_segments, dim=2)
             keep_frames = max(1, int((duration - 0.2) * fps))
             decoded = decoded[:, :, :keep_frames]
@@ -255,7 +265,7 @@ class WanDancerRunner(WanRunner):
                 logger.info(f"Wan-Dancer final video saved to {self.input_info.save_result_path}")
         _barrier()
         self.scheduler.clear()
-        return {"video": result if self.input_info.return_result_tensor and _is_main_process() else None}
+        return {"video": result if self.input_info.return_result_tensor and is_main_process() else None}
 
     def run_pipeline(self, input_info):
         self.input_info = input_info

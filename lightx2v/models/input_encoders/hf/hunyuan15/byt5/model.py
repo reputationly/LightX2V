@@ -13,9 +13,12 @@ try:
 except ImportError:
     T5ForConditionalGeneration = None
 
+from lightx2v.common.ops.utils import create_pin_tensor
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 from .format_prompt import MultilingualPromptFormat
+
+torch_device_module = getattr(torch, AI_DEVICE)
 
 
 def add_special_token(
@@ -201,6 +204,13 @@ class ByT5TextEncoder:
         self.byt5_mapper.load_state_dict(byt5_mapper_state_dict)
         self.byt5_mapper.to(device=device)
 
+        self.cpu_weights = {}
+        if self.cpu_offload:
+            for model_name in ("byt5_model", "byt5_mapper"):
+                for name, parameter in getattr(self, model_name).named_parameters():
+                    parameter.data = create_pin_tensor(parameter.data)
+                    self.cpu_weights[f"{model_name}.{name}"] = parameter.data
+
     def create_byt5(self, args, device):
         """
         Create ByT5 tokenizer and encoder, load weights if provided.
@@ -315,7 +325,7 @@ class ByT5TextEncoder:
 
         return byt5_embeddings, byt5_mask
 
-    def _prepare_byt5_embeddings(self, prompts):
+    def _prepare_byt5_embeddings(self, prompts, enable_cfg):
         if isinstance(prompts, str):
             prompt_list = [prompts]
         elif isinstance(prompts, list):
@@ -333,7 +343,7 @@ class ByT5TextEncoder:
             positive_embeddings.append(pos_emb)
             positive_masks.append(pos_mask)
 
-            if self.enable_cfg:  # TODO: 把cfg拆出去，更适合并行
+            if enable_cfg:  # TODO: 把cfg拆出去，更适合并行
                 neg_emb, neg_mask = self._process_single_byt5_prompt("", AI_DEVICE)
                 negative_embeddings.append(neg_emb)
                 negative_masks.append(neg_mask)
@@ -341,7 +351,7 @@ class ByT5TextEncoder:
         byt5_positive = torch.cat(positive_embeddings, dim=0)
         byt5_positive_mask = torch.cat(positive_masks, dim=0)
 
-        if self.enable_cfg:  # TODO: 把cfg拆出去，更适合并行
+        if enable_cfg:  # TODO: 把cfg拆出去，更适合并行
             byt5_negative = torch.cat(negative_embeddings, dim=0)
             byt5_negative_mask = torch.cat(negative_masks, dim=0)
 
@@ -354,13 +364,18 @@ class ByT5TextEncoder:
         return byt5_embeddings, byt5_masks
 
     @torch.no_grad()
-    def infer(self, prompts):
+    def infer(self, prompts, enable_cfg=None):
         if self.cpu_offload:
-            self.byt5_model = self.byt5_model.to(AI_DEVICE)
-            self.byt5_mapper = self.byt5_mapper.to(AI_DEVICE)
-        byt5_embeddings, byt5_masks = self._prepare_byt5_embeddings(prompts)
+            self.byt5_model = self.byt5_model.to(AI_DEVICE, non_blocking=bool(self.cpu_weights))
+            self.byt5_mapper = self.byt5_mapper.to(AI_DEVICE, non_blocking=bool(self.cpu_weights))
+        byt5_embeddings, byt5_masks = self._prepare_byt5_embeddings(prompts, self.enable_cfg if enable_cfg is None else enable_cfg)
         byt5_features = self.byt5_mapper(byt5_embeddings.to(torch.bfloat16))
         if self.cpu_offload:
+            if self.cpu_weights:
+                torch_device_module.synchronize()
+                for model_name in ("byt5_model", "byt5_mapper"):
+                    for name, parameter in getattr(self, model_name).named_parameters():
+                        parameter.data = self.cpu_weights[f"{model_name}.{name}"]
             self.byt5_model = self.byt5_model.to("cpu")
             self.byt5_mapper = self.byt5_mapper.to("cpu")
         return byt5_features, byt5_masks
@@ -432,6 +447,13 @@ class ByT5TextEncoderForBI(ByT5TextEncoder):
             self.byt5_mapper.load_state_dict(byt5_mapper_state_dict)
 
         self.byt5_mapper.to(device=device)
+
+        self.cpu_weights = {}
+        if self.cpu_offload:
+            for model_name in ("byt5_model", "byt5_mapper"):
+                for name, parameter in getattr(self, model_name).named_parameters():
+                    parameter.data = create_pin_tensor(parameter.data)
+                    self.cpu_weights[f"{model_name}.{name}"] = parameter.data
 
 
 if __name__ == "__main__":

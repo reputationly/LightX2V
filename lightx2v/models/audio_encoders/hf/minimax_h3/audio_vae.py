@@ -32,7 +32,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils import weight_norm
+from torch.nn.utils.parametrizations import weight_norm
 
 from lightx2v.models.video_encoders.hf.minimax_h3.weights import (
     SafetensorsSubsetReport,
@@ -58,7 +58,6 @@ def _component_dir(model_path: str | Path, component: str) -> Path:
 
 
 def _wn_conv1d(*args, **kwargs) -> nn.Module:
-    # The original checkpoint uses the legacy weight_g/weight_v spelling.
     return weight_norm(nn.Conv1d(*args, **kwargs))
 
 
@@ -150,6 +149,43 @@ class MiniMaxH3AudioEncoder(nn.Module):
 
     def forward(self, hidden_states):
         return self.block(hidden_states)
+
+
+class MiniMaxH3AudioEncoderPrefixCache:
+    """Reuse convolution features for one append-only waveform request.
+
+    The encoder has symmetric convolutions: its right boundary changes as
+    samples arrive. Cache only features whose receptive field is complete,
+    and recompute the boundary with hop-aligned left context. The attention
+    projection still sees the complete, current-prefix feature sequence.
+    ``encode()`` supplies FP32 prefixes under no_grad; the runner creates a
+    fresh cache for each request using the same encoder and waveform batch.
+    """
+
+    def __init__(self, encoder: MiniMaxH3AudioEncoder):
+        self.encoder = encoder
+        self.hop_length = 1
+        self.left_context = self.right_context = 0
+        # Residual units have a pointwise skip and a wider convolution branch;
+        # traversing their convolutions gives the enclosing receptive field.
+        for module in encoder.modules():
+            if isinstance(module, nn.Conv1d):
+                self.left_context += module.padding[0] * self.hop_length
+                self.right_context += (module.dilation[0] * (module.kernel_size[0] - 1) - module.padding[0]) * self.hop_length
+                self.hop_length *= module.stride[0]
+        self.stable_features = None
+
+    def __call__(self, waveform: torch.Tensor, *, valid_samples: int) -> torch.Tensor:
+        stable = 0 if self.stable_features is None else self.stable_features.shape[-1]
+        start = max(0, stable * self.hop_length - self.left_context) // self.hop_length * self.hop_length
+        tail = self.encoder(waveform[..., start:])
+        tail = tail[..., stable - start // self.hop_length :]
+        features = tail if self.stable_features is None else torch.cat((self.stable_features, tail), dim=-1)
+        # j * hop + right_context < valid_samples makes output j independent of
+        # any future samples and of this prefix's right-side convolution pads.
+        count = max(0, min(features.shape[-1], (valid_samples - self.right_context + self.hop_length - 1) // self.hop_length))
+        self.stable_features = features[..., :count].clone()
+        return features
 
 
 class MiniMaxH3AudioGeGluMlp(nn.Module):
@@ -446,7 +482,14 @@ class MiniMaxH3AudioVAE(nn.Module):
         with torch.device("meta"):
             model = cls(config, device=device, cpu_offload=cpu_offload)
         model._reset_runtime_buffers()
-        model.load_report = load_safetensors_subset(model, vae_dir)
+        # The released checkpoint uses the legacy weight_g/weight_v names.
+        key_mapping = {}
+        for name in model.state_dict():
+            if name.endswith(".parametrizations.weight.original0"):
+                key_mapping[name.removesuffix("parametrizations.weight.original0") + "weight_g"] = name
+            elif name.endswith(".parametrizations.weight.original1"):
+                key_mapping[name.removesuffix("parametrizations.weight.original1") + "weight_v"] = name
+        model.load_report = load_safetensors_subset(model, vae_dir, key_mapping=key_mapping)
         model.eval().requires_grad_(False)
         if not cpu_offload:
             model.to(model.execution_device)
@@ -462,7 +505,7 @@ class MiniMaxH3AudioVAE(nn.Module):
         std = self.latents_std.to(device=latents.device).view(1, -1, 1)
         return (latents.float() - mean) / std
 
-    def encode(self, waveform: torch.Tensor, *, return_cpu: bool = True) -> torch.Tensor:
+    def encode(self, waveform: torch.Tensor, *, return_cpu: bool = True, encoder_cache: MiniMaxH3AudioEncoderPrefixCache | None = None) -> torch.Tensor:
         """Encode stereo as two mono batch items and return normalized posterior means."""
         try:
             if waveform.ndim == 2:
@@ -471,11 +514,12 @@ class MiniMaxH3AudioVAE(nn.Module):
                 raise ValueError(f"audio waveform must be [batch,1,samples] or [batch,samples], got {tuple(waveform.shape)}")
             device = self._activate()
             waveform = waveform.to(device=device, dtype=torch.float32)
+            valid_samples = waveform.shape[-1]
             right_pad = math.ceil(waveform.shape[-1] / self.hop_length) * self.hop_length - waveform.shape[-1]
             if right_pad:
                 waveform = F.pad(waveform, (0, right_pad))
             with torch.no_grad():
-                hidden_states = self.encoder(waveform)
+                hidden_states = self.encoder(waveform) if encoder_cache is None else encoder_cache(waveform, valid_samples=valid_samples)
                 hidden_states = self.pre_block(hidden_states.transpose(1, 2)).transpose(1, 2)
                 mean = self.mean_proj(hidden_states).float()
                 # The released Ref2AV path consumes posterior.mode(); logs_proj

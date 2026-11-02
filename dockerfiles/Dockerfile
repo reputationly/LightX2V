@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y vim tmux zip unzip bzip2 wget git git-l
 
 RUN conda install conda-forge::ffmpeg=8.0.0 -y && conda clean -all -y
 
-RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn python-multipart requests -U
+RUN pip install --no-cache-dir packaging ninja cmake scikit-build-core uv meson ruff pre-commit fastapi uvicorn requests -U
 
 RUN git clone https://github.com/vllm-project/vllm.git && cd vllm \
     && python use_existing_torch.py && pip install --no-cache-dir -r requirements/build.txt \
@@ -52,9 +52,9 @@ RUN git clone https://github.com/ModelTC/FlashVSR.git --depth 1
 
 RUN cd FlashVSR && pip install --no-cache-dir -v -e .
 
-COPY lightx2v_kernel /app/lightx2v_kernel
+COPY lightx2v_kernel/nvidia /app/lightx2v_kernel/nvidia
 
-RUN git clone https://github.com/NVIDIA/cutlass.git --depth 1 && cd /app/lightx2v_kernel && MAX_JOBS=32 && CMAKE_BUILD_PARALLEL_LEVEL=4 \
+RUN git clone https://github.com/NVIDIA/cutlass.git --depth 1 && cd /app/lightx2v_kernel/nvidia && MAX_JOBS=32 && CMAKE_BUILD_PARALLEL_LEVEL=4 \
     uv build --wheel \
         -Cbuild-dir=build . \
         -Ccmake.define.CUTLASS_PATH=/app/cutlass \

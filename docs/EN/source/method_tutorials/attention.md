@@ -31,28 +31,50 @@ For example, for radial_attn, the configuration is as follows:
 
 To switch to other types, simply replace the corresponding values with the type names from the table above.
 
+For Wan, `cross_attn_2_type` selects image cross-attention. Keep it in Wan2.1 I2V/FLF2V and Wan2.2 Animate/Animate2 configs; T2V/VACE and Wan2.2 MoE, TI2V, and S2V configs with the image encoder disabled do not need it.
+
 Tips: radial_attn can only be used in self attention due to the limitations of its sparse algorithm principle.
 
 For further customization of attention mechanism behavior, please refer to the official documentation or implementation code of each attention library.
 
 ### Sol-Attn on Wan2.1
 
-Sol-Attn is a forward-only, non-causal self-attention backend. The released kernels require contiguous BF16 tensors with head dimension 128, which matches Wan2.1 self-attention. On H100/H200 (SM90) or RTX 5090 (SM120), install the pinned, architecture-specific Sol-Attn and CUTLASS DSL versions with `scripts/install_sol_attn.sh`, then run:
+Sol-Attn is a forward-only, non-causal self-attention backend requiring contiguous BF16 tensors and head dimension 128. For RTX 5090 (SM120), use the repository's pinned environment:
 
 ```bash
-MODEL_PATH=/path/to/Wan2.1-I2V-14B-480P \
-    bash scripts/wan/run_wan_i2v_sol_attn.sh
+docker build -f dockerfiles/Dockerfile_5090_cu130_sol_attn -t lightx2v-sol-attn:sm120 .
 ```
 
-The example config is `configs/attentions/wan_i2v_sol_attn.json`. It enables Morton3D token ordering and strict mode so an invalid installation fails instead of silently using dense SDPA. Wan applies Morton ordering once around the full transformer block stack and keeps RoPE aligned, instead of moving Q/K/V/output in every attention layer. Following the paper's quality guard, the first 8 denoising steps in the 40-step I2V schedule and transformer layer 0 use FlashAttention 3; all remaining calls use Sol-Attn. Because the paper does not directly evaluate portrait I2V, the example uses a conservative `tau=0.5`; increasing `tau` improves sparsity and speed but may reduce visual quality. `sample_shift=3` matches the standard Wan2.1 I2V configuration so color or exposure changes from the sampling noise schedule are not misattributed to attention. `dense_steps` and `dense_layers` are configurable under `sol_attn_setting`; `dense_layers` accepts both `[0, 1]` and `"0-1"`, while `dense_backend` accepts `flash_attn3`, `sage_attn2`, or `torch_sdpa`. On RTX 5090, set `dense_backend` to `sage_attn2` or `torch_sdpa`, and replace Wan cross-attention `flash_attn3` selections with a supported implementation such as `flash_attn2`. SM120 uses `kv_splits=1` (`"auto"` resolves to 1). The first Sol-Attn call compiles the shape-specific kernel and should be excluded from timing.
+Follow [Quick Start](../getting_started/quickstart.md) to run a container, replacing the image with `lightx2v-sol-attn:sm120`. For H100/H200 (SM90), install the backend using the [upstream Sol-Attn instructions](https://github.com/NVlabs/Sana/tree/sol-engine/techniques/sparse_backends).
+
+Before running, set `lightx2v_path`, `model_path`, and `CUDA_VISIBLE_DEVICES` in `scripts/wan/inference/run_wan_i2v_sol_attn.sh`. Then edit `configs/attentions/wan_i2v_sol_attn.json` to match your GPU:
+
+| GPU | `sol_attn_setting.dense_backend` | `cross_attn_1_type` / `cross_attn_2_type` |
+| --- | --- | --- |
+| H100/H200 | `flash_attn3` (default) | `flash_attn3` (default) |
+| RTX 5090 | Change to `sage_attn2` or `torch_sdpa` | Change to an installed, supported backend such as `flash_attn2` |
+
+```bash
+bash scripts/wan/inference/run_wan_i2v_sol_attn.sh
+```
+
+The first call compiles the shape-specific kernel; exclude it from performance timing.
+
+#### Tuning and implementation
+
+- In the default 40-step config, the first 8 steps and Transformer layer 0 use the dense backend; other calls use Sol-Attn. Adjust `dense_steps` and `dense_layers`; the latter accepts `[0, 1]` or `"0-1"`.
+- The example uses `tau=0.8`. Lower it for more conservative sparsity; increasing it may reduce visual quality. `sample_shift=3` matches the standard Wan2.1 I2V config.
+- Morton3D ordering is applied once around the entire Transformer block stack, with RoPE kept aligned. Strict mode fails on an invalid installation.
+- SM120 uses `kv_splits=1`; `"auto"` also resolves to 1.
 
 ### Sol-Attn on MiniMax-H3
 
 The MiniMax-H3 example retains the 15-second, 768p, block CPU-offload setup:
 
+Set `lightx2v_path` and `model_path` in `scripts/minimax_h3/run_minimax_h3_t2av.sh` to your local directories, and change its `--config_json` argument to `"${lightx2v_path}/configs/minimax_h3/minimax_h3_sol_block_offload.json"` before running.
+
 ```bash
-MODEL_PATH=/path/to/MiniMax-H3 \
-    bash scripts/minimax_h3/run_minimax_h3_t2av_sol_attn_offload.sh
+bash scripts/minimax_h3/run_minimax_h3_t2av.sh
 ```
 
-Its config is `configs/minimax_h3/minimax_h3_t2av_sol_attn_block_offload.json`. Sol-Attn is used only by the 50-layer main transformer; the short text refiner uses dense Torch SDPA. The first six denoising steps and transformer layer 0 use SageAttention2 through `dense_backend=sage_attn2`. H3 attention uses a mixed `[text | audio | video]` packed sequence rather than one 3D video grid, so this config uses `reorder=none`; Wan's Morton3D reorder must not be enabled directly.
+Its config is `configs/minimax_h3/minimax_h3_sol_block_offload.json`. Sol-Attn is used only by the 50-layer main transformer; the short text refiner uses dense Torch SDPA. The first six denoising steps and transformer layer 0 use SageAttention2 through `dense_backend=sage_attn2`. H3 attention uses a mixed `[text | audio | video]` packed sequence rather than one 3D video grid, so this config uses `reorder=none`; Wan's Morton3D reorder must not be enabled directly.

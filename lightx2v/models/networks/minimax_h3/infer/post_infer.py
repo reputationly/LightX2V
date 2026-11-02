@@ -11,16 +11,28 @@ class MiniMaxH3PostInfer:
     def set_scheduler(self, scheduler):
         self.scheduler = scheduler
 
-    def infer(self, weights, hidden_states, pre_infer_out):
-        shift, scale = weights.norm_out_linear.apply(F.silu(pre_infer_out.temb).to(GET_DTYPE())).chunk(2, dim=-1)
+    def _project_audio(self, weights, hidden_states, pre_infer_out):
+        return weights.audio_proj_out.apply(hidden_states).index_select(0, pre_infer_out.audio_indices)
+
+    def norm_out(self, weights, hidden_states, pre_infer_out):
+        modulation = pre_infer_out.norm_out_modulation
+        if modulation is None:
+            # ADALN CACHE SYNC: The offline builder persists this exact
+            # norm_out.linear result. Mirror changes there and regenerate caches.
+            if pre_infer_out.temb is None:
+                raise RuntimeError("MiniMax-H3 final-norm modulation is missing")
+            modulation = weights.norm_out_linear.apply(F.silu(pre_infer_out.temb).to(GET_DTYPE()))
+        shift, scale = modulation.chunk(2, dim=-1)
         indices = pre_infer_out.timestep_indices
         hidden_states = weights.norm_out.apply(hidden_states)
         hidden_states = hidden_states * (1.0 + scale.index_select(0, indices))
         hidden_states = hidden_states + shift.index_select(0, indices)
+        return hidden_states.float()
 
+    def infer(self, weights, hidden_states, pre_infer_out):
         # Both released output heads are fp32 and run over all packed rows
         # before modality selection.
-        hidden_states = hidden_states.float()
+        hidden_states = self.norm_out(weights, hidden_states, pre_infer_out)
         video = weights.proj_out.apply(hidden_states).index_select(0, pre_infer_out.video_indices)
-        audio = weights.audio_proj_out.apply(hidden_states).index_select(0, pre_infer_out.audio_indices)
+        audio = self._project_audio(weights, hidden_states, pre_infer_out)
         return MiniMaxH3VelocityOutput(video=video, audio=audio)

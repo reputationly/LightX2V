@@ -6,16 +6,10 @@ try:
 except ImportError:
     magi_register_custom_op = None
 
+from lightx2v.utils import workload_stats
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
 from .template import AttnWeightTemplate
-from .utils.sla_util import get_block_map, get_cuda_arch
-from .utils.sparge_util import (
-    block_map_incremental_lut_triton,
-    block_map_ordinal_lut_triton,
-    get_block_map_meansim,
-    sage2_block_sparse_attn,
-)
 
 try:
     from sageattn3_sparse import sage3_block_sparse_attn
@@ -71,6 +65,16 @@ except ImportError:
     logger.info("sageattention not found, please install sageattention first")
 
 
+@torch.library.custom_op("lightx2v::sage_attn2_compiled", mutates_args=(), device_types="cuda")
+def sage_attn2_compiled(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return sageattn(q, k, v, tensor_layout="NHD").contiguous()
+
+
+@sage_attn2_compiled.register_fake
+def sage_attn2_compiled_fake(q, k, v):
+    return torch.empty_like(q)
+
+
 @ATTN_WEIGHT_REGISTER("sage_attn2")
 class SageAttn2Weight(AttnWeightTemplate):
     def __init__(self):
@@ -99,6 +103,8 @@ class SageAttn2Weight(AttnWeightTemplate):
             max_seqlen_kv = k.shape[-3]
         if magi_register_custom_op is not None and sageattn is not None:
             x = torch.ops.lightx2v.sage_attn2(q, k, v).view(bs * max_seqlen_q, -1)
+        elif torch.compiler.is_compiling():
+            x = sage_attn2_compiled(q, k, v).view(bs * max_seqlen_q, -1)
         else:
             x = sageattn(q, k, v, tensor_layout="NHD").view(bs * max_seqlen_q, -1)
         return x
@@ -164,6 +170,13 @@ class SparseSageAttn2Weight(AttnWeightTemplate):
     sparse_mode = "sla_mode"
 
     def __init__(self):
+        from .utils.sla_util import get_block_map, get_cuda_arch
+        from .utils.sparge_util import block_map_incremental_lut_triton, get_block_map_meansim, sage2_block_sparse_attn
+
+        self._block_map_incremental_lut_triton = block_map_incremental_lut_triton
+        self._get_block_map = get_block_map
+        self._get_block_map_meansim = get_block_map_meansim
+        self._sage2_block_sparse_attn = sage2_block_sparse_attn
         self.config = {}
         self.topk = 1 - self.sparsity_ratio
 
@@ -191,10 +204,10 @@ class SparseSageAttn2Weight(AttnWeightTemplate):
         bs = q.shape[0]
 
         if self.sparse_mode == "sla_mode":
-            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            sparse_map, lut, real_topk = self._get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
         elif self.sparse_mode == "sparge_mode":
             smooth_k = k - k.mean(dim=-2, keepdim=True)
-            sparse_map = get_block_map_meansim(
+            sparse_map = self._get_block_map_meansim(
                 q,
                 smooth_k,
                 cdfthreshd=None,
@@ -206,8 +219,10 @@ class SparseSageAttn2Weight(AttnWeightTemplate):
         else:
             logger.info(f"spas_sage_attn2 sparse_mode only support sla_mode and sparge_mode now.")
 
-        lut, valid_block_num = block_map_incremental_lut_triton(sparse_map)
-        x = sage2_block_sparse_attn(q, k, v, lut, valid_block_num, self.BLKQ, self.BLKK, self.arch)
+        lut, valid_block_num = self._block_map_incremental_lut_triton(sparse_map)
+        x = self._sage2_block_sparse_attn(q, k, v, lut, valid_block_num, self.BLKQ, self.BLKK, self.arch)
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q, k, v, sparse_map, self.BLKQ, self.BLKK, operator="spas_sage_attn2")
         x = x.transpose(1, 2).reshape(bs * max_seqlen_q, -1)
         return x
 
@@ -219,6 +234,12 @@ class SparseSageAttn3Weight(AttnWeightTemplate):
     per_block_mean = False
 
     def __init__(self):
+        from .utils.sla_util import get_block_map
+        from .utils.sparge_util import block_map_ordinal_lut_triton, get_block_map_meansim
+
+        self._block_map_ordinal_lut_triton = block_map_ordinal_lut_triton
+        self._get_block_map = get_block_map
+        self._get_block_map_meansim = get_block_map_meansim
         self.config = {}
         self.topk = 1 - self.sparsity_ratio
         self.BLKQ, self.BLKK = 128, 128
@@ -241,10 +262,10 @@ class SparseSageAttn3Weight(AttnWeightTemplate):
         bs = q.shape[0]
 
         if self.sparse_mode == "sla_mode":
-            sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            sparse_map, lut, real_topk = self._get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
         elif self.sparse_mode == "sparge_mode":
             smooth_k = k - k.mean(dim=-2, keepdim=True)
-            sparse_map = get_block_map_meansim(
+            sparse_map = self._get_block_map_meansim(
                 q,
                 smooth_k,
                 cdfthreshd=None,
@@ -256,8 +277,10 @@ class SparseSageAttn3Weight(AttnWeightTemplate):
         else:
             logger.info(f"spas_sage_attn3 sparse_mode only support sla_mode and sparge_mode now.")
 
-        lut, valid_block_num = block_map_ordinal_lut_triton(sparse_map)
+        lut, valid_block_num = self._block_map_ordinal_lut_triton(sparse_map)
         x = sage3_block_sparse_attn(q, k, v, lut, valid_block_num, per_block_mean=self.per_block_mean)
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q, k, v, sparse_map, self.BLKQ, self.BLKK, operator="spas_sage_attn3")
         x = x.transpose(1, 2).reshape(bs * max_seqlen_q, -1)
         return x
 

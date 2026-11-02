@@ -18,7 +18,9 @@ if str(project_root) not in sys.path:
 from lightx2v.common.modules.weight_module import WeightModule, WeightModuleList  # noqa E402
 from lightx2v.common.offload.manager import WeightAsyncStreamManager  # noqa E402
 from lightx2v.common.ops import *  # noqa E402
+from lightx2v.common.ops.mm.fp8_f16_accum import fp8_f16_accum_mm_unavailable_reason  # noqa E402
 from lightx2v.models.input_encoders.hf.q_linear import (  # noqa E402
+    F16AccumQuantLinearFp8,  # noqa E402
     Q8FQuantLinearFp8,  # noqa E402
     Q8FQuantLinearInt8,  # noqa E402
     SglQuantLinearFp8,  # noqa E402
@@ -29,8 +31,8 @@ from lightx2v.models.input_encoders.hf.q_linear import (  # noqa E402
     TritonQuantLinearInt8,  # noqa E402,
     TritonQuantLinearFp8,  # noqa E402
 )
+from lightx2v.utils.fp8_f16_accum_checkpoint import ACTIVATION_QMAX, T5_QUANTIZATION_PROFILE, validate_checkpoint  # noqa E402
 from lightx2v_platform.ops.mm.cambricon_mlu.q_linear import MluQuantLinearInt8  # noqa E402
-from lightx2v_platform.ops.mm.ascend_npu.npu_q_linear import NpuQuantLinearInt8  # noqa E402
 from lightx2v_platform.ops.mm.iluvatar_cuda.q_linear import IluvatarQuantLinearInt8  # noqa E402
 
 from lightx2v.models.input_encoders.hf.wan.t5.tokenizer import HuggingfaceTokenizer  # noqa E402
@@ -52,26 +54,32 @@ __all__ = [
 
 
 class T5OffloadBlocksWeights(WeightModule):
-    def __init__(self, block_nums, mm_type, lazy_load=False, lazy_load_path=None):
+    def __init__(self, block_nums, mm_type, lazy_load=False, lazy_load_path=None, rms_norm_type="sgl-kernel"):
         super().__init__()
         self.block_nums = block_nums
         self.offload_block_buffers = WeightModuleList(
-            [T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=True, create_cpu_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(1)]
+            [T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=True, create_cpu_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path, rms_norm_type=rms_norm_type) for i in range(1)]
         )
         if lazy_load:
             self.offload_block_cpu_buffers = WeightModuleList(
-                [T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=False, create_cpu_buffer=True, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(1)]
+                [
+                    T5OffloadSelfAttention(i, mm_type, create_cuda_buffer=False, create_cpu_buffer=True, lazy_load=lazy_load, lazy_load_path=lazy_load_path, rms_norm_type=rms_norm_type)
+                    for i in range(1)
+                ]
             )
             self.add_module("offload_block_cpu_buffers", self.offload_block_cpu_buffers)
         self.blocks = WeightModuleList(
-            [T5OffloadSelfAttention(i, mm_type, create_cpu_buffer=False, create_cuda_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path) for i in range(block_nums)]
+            [
+                T5OffloadSelfAttention(i, mm_type, create_cpu_buffer=False, create_cuda_buffer=False, lazy_load=lazy_load, lazy_load_path=lazy_load_path, rms_norm_type=rms_norm_type)
+                for i in range(block_nums)
+            ]
         )
         self.add_module("offload_block_buffers", self.offload_block_buffers)
         self.add_module("blocks", self.blocks)
 
 
 class T5OffloadSelfAttention(WeightModule):
-    def __init__(self, block_index, mm_type, block_prefix="blocks", create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_path=None):
+    def __init__(self, block_index, mm_type, block_prefix="blocks", create_cuda_buffer=False, create_cpu_buffer=False, lazy_load=False, lazy_load_path=None, rms_norm_type="sgl-kernel"):
         super().__init__()
         self.block_index = block_index
         if mm_type is None:
@@ -79,11 +87,11 @@ class T5OffloadSelfAttention(WeightModule):
         self.mm_type = mm_type
         self.add_module(
             "norm1",
-            RMS_WEIGHT_REGISTER["sgl-kernel"](f"{block_prefix}.{self.block_index}.norm1.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+            RMS_WEIGHT_REGISTER[rms_norm_type](f"{block_prefix}.{self.block_index}.norm1.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
         )
         self.add_module(
             "norm2",
-            RMS_WEIGHT_REGISTER["sgl-kernel"](f"{block_prefix}.{self.block_index}.norm2.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
+            RMS_WEIGHT_REGISTER[rms_norm_type](f"{block_prefix}.{self.block_index}.norm2.weight", create_cuda_buffer, create_cpu_buffer, lazy_load, lazy_load_path),
         )
         self.add_module(
             "pos_embedding",
@@ -210,6 +218,8 @@ class T5Attention(nn.Module):
                 linear_cls = VllmQuantLinearInt8
             elif quant_scheme in ["fp8", "fp8-sgl"]:
                 linear_cls = SglQuantLinearFp8
+            elif quant_scheme == "fp8-f16-accum":
+                linear_cls = F16AccumQuantLinearFp8
             elif quant_scheme == "fp8-vllm":
                 linear_cls = VllmQuantLinearFp8
             elif quant_scheme == "int8-torchao":
@@ -227,6 +237,8 @@ class T5Attention(nn.Module):
             elif quant_scheme == "int8-tmo":
                 linear_cls = MluQuantLinearInt8
             elif quant_scheme == "int8-npu":
+                from lightx2v_platform.ops.mm.ascend_npu.npu_q_linear import NpuQuantLinearInt8
+
                 linear_cls = NpuQuantLinearInt8
             elif quant_scheme == "int8-iluvatar":
                 linear_cls = IluvatarQuantLinearInt8
@@ -295,6 +307,8 @@ class T5FeedForward(nn.Module):
                 linear_cls = VllmQuantLinearInt8
             elif quant_scheme in ["fp8", "fp8-sgl"]:
                 linear_cls = SglQuantLinearFp8
+            elif quant_scheme == "fp8-f16-accum":
+                linear_cls = F16AccumQuantLinearFp8
             elif quant_scheme == "fp8-vllm":
                 linear_cls = VllmQuantLinearFp8
             elif quant_scheme == "int8-torchao":
@@ -312,6 +326,8 @@ class T5FeedForward(nn.Module):
             elif quant_scheme == "int8-tmo":
                 linear_cls = MluQuantLinearInt8
             elif quant_scheme == "int8-npu":
+                from lightx2v_platform.ops.mm.ascend_npu.npu_q_linear import NpuQuantLinearInt8
+
                 linear_cls = NpuQuantLinearInt8
             elif quant_scheme == "int8-iluvatar":
                 linear_cls = IluvatarQuantLinearInt8
@@ -467,6 +483,7 @@ class T5Encoder(nn.Module):
         quant_scheme=None,
         lazy_load=False,
         lazy_load_path=None,
+        rms_norm_type="sgl-kernel",
     ):
         super(T5Encoder, self).__init__()
         self.cpu_offload = cpu_offload
@@ -478,6 +495,12 @@ class T5Encoder(nn.Module):
         self.num_buckets = num_buckets
         self.shared_pos = shared_pos
         self.quant_scheme = quant_scheme
+        if quant_scheme == "fp8-f16-accum":
+            if not quantized:
+                raise ValueError("T5 fp8-f16-accum requires t5_quantized=true")
+            reason = fp8_f16_accum_mm_unavailable_reason()
+            if reason is not None:
+                raise RuntimeError(f"T5 fp8-f16-accum is unavailable: {reason}")
 
         # layers
         self.token_embedding = vocab.to(dtype) if isinstance(vocab, nn.Embedding) else nn.Embedding(vocab, dim, dtype=dtype)
@@ -486,7 +509,7 @@ class T5Encoder(nn.Module):
 
         if cpu_offload:
             self.offload_manager = WeightAsyncStreamManager(offload_granularity="block")
-            self.blocks_weights = T5OffloadBlocksWeights(num_layers, quant_scheme, lazy_load, lazy_load_path)
+            self.blocks_weights = T5OffloadBlocksWeights(num_layers, quant_scheme, lazy_load, lazy_load_path, rms_norm_type=rms_norm_type)
             self.offload_manager.init_cuda_buffer(self.blocks_weights.offload_block_buffers, None)
             if lazy_load:
                 self.offload_manager.init_cpu_buffer(self.blocks_weights.offload_block_cpu_buffers)
@@ -511,6 +534,15 @@ class T5Encoder(nn.Module):
             )
 
         self.norm = T5LayerNorm(dim, dtype=dtype)
+        if quant_scheme == "fp8-f16-accum":
+            if cpu_offload:
+                for _, linear in self.blocks_weights.named_weight_leaves():
+                    if hasattr(linear, "enable_fp8_f16_accum"):
+                        linear.enable_fp8_f16_accum(ACTIVATION_QMAX)
+            else:
+                for linear in self.modules():
+                    if isinstance(linear, F16AccumQuantLinearFp8):
+                        linear.enable_fp8_f16_accum(ACTIVATION_QMAX)
 
     def forward_without_offload(self, ids, mask=None):
         x = self.token_embedding(ids)
@@ -575,10 +607,11 @@ class T5Encoder(nn.Module):
         return x
 
     def forward_with_offload(self, ids, mask=None):
-        self.token_embedding = self.token_embedding.to(AI_DEVICE)
+        # Keep the vocabulary on CPU and transfer only the selected tokens.
+        # Moving the entire read-only table would retain about 2 GiB on GPU.
+        self.token_embedding = self.token_embedding.to("cpu")
+        x = self.token_embedding(ids.to("cpu")).to(AI_DEVICE)
         self.pos_embedding = self.pos_embedding.to(AI_DEVICE) if self.pos_embedding is not None else None
-
-        x = self.token_embedding(ids)
         x = self.dropout(x)
         e = self.pos_embedding(x.size(1), x.size(1)) if self.shared_pos else None
         self.norm = self.norm.to(AI_DEVICE)
@@ -799,6 +832,7 @@ class T5EncoderModel:
         lazy_load=False,
         load_from_rank0=False,
         dummy_model=False,
+        rms_norm_type="sgl-kernel",
     ):
         self.text_len = text_len
         self.dtype = dtype
@@ -808,6 +842,8 @@ class T5EncoderModel:
         else:
             self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
+        if t5_quantized and quant_scheme == "fp8-f16-accum" and not dummy_model:
+            validate_checkpoint(self.checkpoint_path, profile=T5_QUANTIZATION_PROFILE)
 
         # sync cpu offload
         self.cpu_offload = cpu_offload
@@ -823,6 +859,7 @@ class T5EncoderModel:
                 quant_scheme=quant_scheme,
                 lazy_load=lazy_load,
                 lazy_load_path=self.checkpoint_path,
+                rms_norm_type=rms_norm_type,
             )
             .eval()
             .requires_grad_(False)
@@ -860,7 +897,7 @@ class T5EncoderModel:
 
     def infer(self, texts):
         ids, mask = self.tokenizer(texts, return_mask=True, add_special_tokens=True)
-        ids = ids.to(AI_DEVICE)
+        ids = ids.to("cpu" if self.cpu_offload else AI_DEVICE)
         mask = mask.to(AI_DEVICE)
         seq_lens = mask.gt(0).sum(dim=1).long()
 

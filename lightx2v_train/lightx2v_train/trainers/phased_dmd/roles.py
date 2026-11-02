@@ -125,6 +125,8 @@ class PhasedRoleRegistry(DmdRoleRegistry):
             override.pop("share_with_teacher", None)
         role_config = copy.deepcopy(self.config)
         role_config["model"] = base_model_config
+        if role == "teacher_2":
+            role_config["model"]["transformer_param_dtype"] = self.model_config["running_dtype"]
         role_config["model"].update(override)
         return role_config
 
@@ -471,8 +473,8 @@ class PhasedRoleRegistry(DmdRoleRegistry):
             self.enable_fake_low_high,
         )
         logger.info(
-            "[train] phased_dmd schedule={} boundary={} updates=1G+{}F fake_real_high={} fake_real_low={}",
-            list(self.denoising_step_list),
+            "[train] phased_dmd steps={} boundary={} updates=1G+{}F fake_real_high={} fake_real_low={}",
+            self.num_inference_steps,
             self.match_timestep,
             self.fake_update_ratio,
             self.real_data_fake_trick.enabled_for("high"),

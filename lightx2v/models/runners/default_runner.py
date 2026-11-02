@@ -1,10 +1,8 @@
-import copy
 import gc
 import json
 import os
 import shutil
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torchvision.transforms.functional as TF
@@ -16,71 +14,10 @@ from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
 from lightx2v.utils.global_paras import CALIB
 from lightx2v.utils.profiler import *
-from lightx2v.utils.utils import fixed_shape_resize, get_optimal_patched_size_with_sp, is_main_process, isotropic_crop_resize, mux_audio_from_video, save_to_image, save_to_video, wan_vae_to_comfy
+from lightx2v.utils.utils import is_main_process, mux_audio_from_video, save_to_image, save_to_video, wan_vae_to_comfy
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
-
-
-def resize_image(img, resize_mode="adaptive", resolution="480p", bucket_shape=None, fixed_area=None, fixed_shape=None):
-    """Resize input image for i2v / flf2v.
-
-    Supports the same six modes as wan_audio_runner.resize_image (adaptive,
-    keep_ratio_fixed_area, fixed_min_area, fixed_max_area, fixed_shape,
-    fixed_min_side). Previously only `adaptive` was supported here, and any
-    other mode left `latent_shape` unpopulated downstream, blowing up
-    `WanRunner.run_vae_encoder` with an IndexError.
-    """
-    assert resize_mode in ("adaptive", "keep_ratio_fixed_area", "fixed_min_area", "fixed_max_area", "fixed_shape", "fixed_min_side")
-
-    if resize_mode == "fixed_shape":
-        assert fixed_shape is not None, "fixed_shape mode requires `fixed_shape` arg"
-        logger.info(f"fixed_shape_resize fixed_height: {fixed_shape[0]}, fixed_width: {fixed_shape[1]}")
-        return fixed_shape_resize(img, fixed_shape[0], fixed_shape[1])
-
-    if bucket_shape is None:
-        bucket_config = {
-            0.667: np.array([[480, 832], [544, 960], [720, 1280]], dtype=np.int64),
-            1.500: np.array([[832, 480], [960, 544], [1280, 720]], dtype=np.int64),
-            1.000: np.array([[480, 480], [576, 576], [960, 960]], dtype=np.int64),
-        }
-    else:
-        bucket_config = {float(ratio): np.array(resolutions, dtype=np.int64) for ratio, resolutions in bucket_shape.items()}
-
-    ori_height = img.shape[-2]
-    ori_weight = img.shape[-1]
-    ori_ratio = ori_height / ori_weight
-    aspect_ratios = np.array(list(bucket_config.keys()))
-    closet_aspect_idx = np.argmin(np.abs(aspect_ratios - ori_ratio))
-    closet_ratio = aspect_ratios[closet_aspect_idx]
-
-    if resize_mode == "adaptive":
-        # Default-runner historical behaviour: tier is chosen by config["resolution"].
-        assert resolution in ("480p", "540p", "720p"), f"adaptive mode requires resolution in 480p/540p/720p; got {resolution}"
-        tier_idx = {"480p": 0, "540p": 1, "720p": 2}[resolution]
-        target_h, target_w = bucket_config[closet_ratio][tier_idx]
-    elif resize_mode == "keep_ratio_fixed_area":
-        area_in_pixels = 720 * 1280 if fixed_area == "720p" else 480 * 832
-        target_h = max(1, round(np.sqrt(area_in_pixels * ori_ratio)))
-        target_w = max(1, round(np.sqrt(area_in_pixels / ori_ratio)))
-    elif resize_mode == "fixed_min_area":
-        target_h, target_w = bucket_config[closet_ratio][0]
-    elif resize_mode == "fixed_max_area":
-        target_h, target_w = bucket_config[closet_ratio][-1]
-    elif resize_mode == "fixed_min_side":
-        if fixed_area not in ("480p", "720p"):
-            logger.warning(f"fixed_min_side: fixed_area is not '480p' or '720p', using default 480p (got {fixed_area})")
-        min_side = 720 if fixed_area == "720p" else 480
-        if ori_ratio < 1.0:
-            target_h = min_side
-            target_w = round(target_h / ori_ratio)
-        else:
-            target_w = min_side
-            target_h = round(target_w * ori_ratio)
-
-    cropped_img = isotropic_crop_resize(img, (target_h, target_w))
-    logger.info(f"resize_image: {img.shape} -> {cropped_img.shape}, resize_mode: {resize_mode}, target_h: {target_h}, target_w: {target_w}")
-    return cropped_img, target_h, target_w
 
 
 class DefaultRunner(BaseRunner):
@@ -235,35 +172,26 @@ class DefaultRunner(BaseRunner):
             assert self.config.get("cpu_offload", False)
         if hasattr(self, "model") and self.model is not None:
             self.model.set_scheduler(self.scheduler)  # set scheduler to model
-        if self.config["task"] == "i2v":
+        task = self.config.get("task")
+        if task == "i2v":
             self.run_input_encoder = self._run_input_encoder_local_i2v
-        elif self.config["task"] == "flf2v":
+        elif task == "flf2v":
             self.run_input_encoder = self._run_input_encoder_local_flf2v
-        elif self.config["task"] == "t2v":
+        elif task == "t2v":
             self.run_input_encoder = self._run_input_encoder_local_t2v
-        elif self.config["task"] == "t2i":
-            # Wan/Bernini t2i = single-frame t2v (config target_video_length=1);
-            # reuse the text-only t2v encoder. Image-model runners (Qwen etc.)
-            # assign their own t2i encoder AFTER super().init_modules()
-            # (qwen_image_runner.py:185-193), so this branch only serves runners
-            # without a t2i override — previously `--task t2i` crashed with an
-            # AttributeError (run_input_encoder never assigned).
-            self.run_input_encoder = self._run_input_encoder_local_t2v
-        elif self.config["task"] == "vace":
+        elif task == "vace":
             self.run_input_encoder = self._run_input_encoder_local_vace
-        elif self.config["task"] == "v2v":
-            # bernini wan_diffusion.py:522 — in-context video editing (v2v guidance_mode)
-            self.run_input_encoder = self._run_input_encoder_local_v2v
-        elif self.config["task"] == "animate":
+        elif task == "animate":
             self.run_input_encoder = self._run_input_encoder_local_animate
-        elif self.config["task"] in ["s2v", "rs2v"]:
+        elif task in ["s2v", "rs2v"]:
             self.run_input_encoder = self._run_input_encoder_local_s2v
-        elif self.config["task"] == "t2av":
+        elif task == "t2av":
             self.run_input_encoder = self._run_input_encoder_local_t2av
-        elif self.config["task"] == "i2av":
+        elif task == "i2av":
             self.run_input_encoder = self._run_input_encoder_local_i2av
-        elif self.config["task"] == "sr":
+        elif task == "sr":
             self.run_input_encoder = self._run_input_encoder_local_sr
+
         self.config.lock()  # lock config to avoid modification
 
     def set_init_device(self):
@@ -271,15 +199,6 @@ class DefaultRunner(BaseRunner):
             self.init_device = torch.device("cpu")
         else:
             self.init_device = torch.device(AI_DEVICE)
-
-    def load_vfi_model(self):
-        if self.config["video_frame_interpolation"].get("algo", None) == "rife":
-            from lightx2v.models.vfi.rife.rife_comfyui_wrapper import RIFEWrapper
-
-            logger.info("Loading RIFE model...")
-            return RIFEWrapper(self.config["video_frame_interpolation"]["model_path"])
-        else:
-            raise ValueError(f"Unsupported VFI model: {self.config['video_frame_interpolation']['algo']}")
 
     def load_vsr_model(self):
         if "video_super_resolution" in self.config:
@@ -296,73 +215,17 @@ class DefaultRunner(BaseRunner):
         self.text_encoders = self.load_text_encoder()
         self.image_encoder = self.load_image_encoder()
         self.vae_encoder, self.vae_decoder = self.load_vae()
-        self.vfi_model = self.load_vfi_model() if "video_frame_interpolation" in self.config else None
         self.vsr_model = self.load_vsr_model() if "video_super_resolution" in self.config else None
 
-    def set_inputs(self, inputs):
-        self.input_info.seed = inputs.get("seed", 42)
-        self.input_info.prompt = inputs.get("prompt", "")
-        if "prompt_ref" in self.input_info.__dataclass_fields__:
-            self.input_info.prompt_ref = inputs.get("prompt_ref", self.input_info.prompt_ref)
-        self.input_info.negative_prompt = inputs.get("negative_prompt", "")
-        if "image_path" in self.input_info.__dataclass_fields__:
-            self.input_info.image_path = inputs.get("image_path", "")
-        if "state_path" in self.input_info.__dataclass_fields__:
-            self.input_info.state_path = inputs.get("state_path", "")
-        if "audio_path" in self.input_info.__dataclass_fields__:
-            self.input_info.audio_path = inputs.get("audio_path", "")
-        if "video_path" in self.input_info.__dataclass_fields__:
-            self.input_info.video_path = inputs.get("video_path", "")
-        if "src_video" in self.input_info.__dataclass_fields__:
-            self.input_info.src_video = inputs.get("src_video", "")
-        self.input_info.save_result_path = inputs.get("save_result_path", "")
-        if "save_action_path" in self.input_info.__dataclass_fields__:
-            self.input_info.save_action_path = inputs.get("save_action_path", "")
+    def get_num_frames(self):
+        value = getattr(self.input_info, "num_frames", None)
+        return int(self.config["num_frames"] if value is None else value)
 
-    def set_config(self, config_modify):
-        """Apply ONE request's config overrides, discarding the previous request's.
-
-        ``config.update()`` alone mutates a runner-lifetime object, so a field the
-        current request omits keeps whatever the PREVIOUS request set — the server
-        has no per-request reset. Measured on a production qwen_image deployment
-        whose config pins ``infer_steps: 8``:
-
-            explicit infer_steps=8  -> 21.0s
-            (omitted)               -> 15.5s   inherited 8
-            explicit infer_steps=40 -> 73.1s
-            (omitted)               -> 73.2s   inherited 40
-
-        i.e. an identical request took 4.7x longer purely because of what the
-        previous caller sent. This is the same defect already fixed one line up in
-        server/services/inference/worker.py for ``input_info`` (media paths and
-        sr_ratio leaked across requests; VACE/SR hit it in production).
-
-        Only the keys THIS mechanism injected are reverted, against a baseline
-        snapshotted on first use. A blanket reset would also undo deliberate
-        post-init mutations made elsewhere through ``temporarily_unlocked()``.
-        """
-        logger.info(f"modify config: {config_modify}")
-        if not hasattr(self, "_config_request_baseline"):
-            # Snapshot lazily: at __init__ time subclasses may still be filling
-            # the config in, whereas by the first request it is settled.
-            self._config_request_baseline = {}
-            self._config_request_keys = set()
-
-        with self.config.temporarily_unlocked():
-            for key in self._config_request_keys - set(config_modify):
-                if key in self._config_request_baseline:
-                    self.config[key] = self._config_request_baseline[key]
-                else:
-                    # The key did not exist before any request introduced it.
-                    self.config.pop(key, None)
-
-            for key in config_modify:
-                if key not in self._config_request_baseline and key not in self._config_request_keys:
-                    if key in self.config:
-                        self._config_request_baseline[key] = copy.deepcopy(self.config[key])
-                self._config_request_keys.add(key)
-
-            self.config.update(config_modify)
+    def get_target_size(self):
+        size = getattr(self.input_info, "size", None)
+        if size:
+            return int(size[0]), int(size[1])
+        return int(self.config["size"][0]), int(self.config["size"][1])
 
     def set_progress_callback(self, callback):
         self.progress_callback = callback
@@ -407,23 +270,33 @@ class DefaultRunner(BaseRunner):
         min_free_bytes = float(self.config.get("empty_cache_min_free_gib", 4)) * gib
         min_reclaimable_bytes = float(self.config.get("empty_cache_min_reclaimable_gib", 2)) * gib
 
-        free_bytes, _ = torch_device_module.mem_get_info()
+        if AI_DEVICE == "mps":
+            free_bytes = max(torch_device_module.recommended_max_memory() - torch_device_module.driver_allocated_memory(), 0)
+        else:
+            free_bytes, _ = torch_device_module.mem_get_info()
         check_cache = force or free_bytes < min_free_bytes
         if collect_garbage or check_cache:
             gc.collect()
         if not check_cache:
             return False
 
-        allocated_bytes = torch_device_module.memory_allocated()
-        reserved_bytes = torch_device_module.memory_reserved()
+        if AI_DEVICE == "mps":
+            allocated_bytes = torch_device_module.current_allocated_memory()
+            reserved_bytes = torch_device_module.driver_allocated_memory()
+            recommended_max_bytes = torch_device_module.recommended_max_memory()
+            free_bytes = max(recommended_max_bytes - reserved_bytes, 0)
+            memory_info = (
+                f"headroom={free_bytes / gib:.2f} GiB, current_allocated={allocated_bytes / gib:.2f} GiB, "
+                f"driver_allocated={reserved_bytes / gib:.2f} GiB, recommended_max={recommended_max_bytes / gib:.2f} GiB"
+            )
+        else:
+            allocated_bytes = torch_device_module.memory_allocated()
+            reserved_bytes = torch_device_module.memory_reserved()
+            memory_info = f"free={free_bytes / gib:.2f} GiB, allocated={allocated_bytes / gib:.2f} GiB, reserved={reserved_bytes / gib:.2f} GiB"
         reclaimable_bytes = max(reserved_bytes - allocated_bytes, 0)
 
         if force or reclaimable_bytes >= min_reclaimable_bytes:
-            logger.info(
-                f"[Memory] Emptying device cache: free={free_bytes / gib:.2f} GiB, "
-                f"allocated={allocated_bytes / gib:.2f} GiB, reserved={reserved_bytes / gib:.2f} GiB, "
-                f"reclaimable={reclaimable_bytes / gib:.2f} GiB, force={force}"
-            )
+            logger.info(f"[Memory] Emptying {AI_DEVICE} cache: {memory_info}, reclaimable={reclaimable_bytes / gib:.2f} GiB, force={force}")
             torch_device_module.empty_cache()
             return True
 
@@ -464,38 +337,6 @@ class DefaultRunner(BaseRunner):
         img = TF.to_tensor(img_ori).sub_(0.5).div_(0.5).unsqueeze(0).to(self.init_device)
         self.input_info.original_size = img_ori.size
 
-        resize_mode = self.config.get("resize_mode", None)
-        # Treat empty string the same as missing — InputInfo dataclasses default
-        # `resize_mode` to "", which used to silently skip the resize branch.
-        if resize_mode:
-            img, h, w = resize_image(
-                img,
-                resize_mode=resize_mode,
-                resolution=self.config.get("resolution", "480p"),
-                bucket_shape=self.config.get("bucket_shape", None),
-                fixed_area=self.config.get("fixed_area", None),
-                fixed_shape=self.config.get("fixed_shape", None),
-            )
-            logger.info(f"resize_image target_h: {h}, target_w: {w}")
-            patched_h = max(1, h // self.config["vae_stride"][1] // self.config["patch_size"][1])
-            patched_w = max(1, w // self.config["vae_stride"][2] // self.config["patch_size"][2])
-
-            patched_h, patched_w = get_optimal_patched_size_with_sp(patched_h, patched_w, 1)
-
-            latent_h = patched_h * self.config["patch_size"][1]
-            latent_w = patched_w * self.config["patch_size"][2]
-
-            latent_shape = self.get_latent_shape_with_lat_hw(latent_h, latent_w)
-            target_shape = [latent_h * self.config["vae_stride"][1], latent_w * self.config["vae_stride"][2]]
-
-            logger.info(f"target_h: {target_shape[0]}, target_w: {target_shape[1]}, latent_h: {latent_h}, latent_w: {latent_w}")
-
-            img = torch.nn.functional.interpolate(img, size=(target_shape[0], target_shape[1]), mode="bicubic")
-            # Must populate both before run_vae_encoder; its else-branch reads
-            # `input_info.latent_shape` unconditionally when resize_mode is set.
-            self.input_info.latent_shape = latent_shape
-            self.input_info.target_shape = target_shape
-
         return img, img_ori
 
     @ProfilingContext4DebugL2("Run Encoders")
@@ -531,16 +372,13 @@ class DefaultRunner(BaseRunner):
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_vace(self):
-        # server requests leave unset fields as "" (dataclass default) while the
-        # downstream vace path only checks `is None` — normalize before dispatch
-        src_video = self.input_info.src_video or None
-        src_mask = self.input_info.src_mask or None
-        src_ref_images = self.input_info.src_ref_images or None
+        ref_images = self.input_info.ref_image_paths
+        target_height, target_width = self.get_target_size()
         src_video, src_mask, src_ref_images = self.prepare_source(
-            [src_video],
-            [src_mask],
-            [None if src_ref_images is None else src_ref_images.split(",")],
-            (self.config["target_width"], self.config["target_height"]),
+            [self.input_info.video_path or None],
+            [self.input_info.mask_path or None],
+            [ref_images.split(",") if ref_images else None],
+            (target_width, target_height),
         )
         self.src_ref_images = src_ref_images
 
@@ -549,134 +387,6 @@ class DefaultRunner(BaseRunner):
         text_encoder_output = self.run_text_encoder(self.input_info)
         self.maybe_empty_cache()
         return self.get_encoder_output_i2v(None, vae_encoder_out, text_encoder_output)
-
-    # bernini v2v system prompt (bernini_template.py:113). The pure-t2v Bernini
-    # path uses the T5 text encoder; task_type only swaps this system-prompt
-    # prefix, so we prepend it to the prompt for v2v.
-    _V2V_SYSTEM_PROMPT = "You are a helpful assistant specialized in video editing."
-
-    @ProfilingContext4DebugL2("Run Encoders")
-    def _run_input_encoder_local_v2v(self):
-        # mv2v = comma-separated source videos (each own source_id). Only single
-        # source is fully supported now; multi is parsed but only first is used
-        # for the target-shape / context beyond a TODO. bernini wan_diffusion.py:430
-        raw = (self.input_info.src_video or "").strip()
-        if not raw:
-            raise ValueError("v2v task requires --src_video (source clip to edit).")
-        video_paths = [p.strip() for p in raw.split(",") if p.strip()]
-        if len(video_paths) > 1:
-            # TODO(bernini mv2v): support a LIST of sources; first joins V-combo,
-            # all join VI-combo. For now use every clip as VI context sources.
-            logger.warning(f"v2v: {len(video_paths)} source videos given; mv2v is future work, encoding all as VI context.")
-
-        # VAE-encode full source clip(s) into the normalized target latent space.
-        src_latents, latent_shape = self.run_vae_encoder_v2v(video_paths)
-        self.input_info.latent_shape = latent_shape  # Important: set latent_shape in input_info
-
-        # bernini wan_diffusion.py:416 _make_sids — context source ids 1..n, or
-        # linspace(1, max_trained=5, n) when n > 5. Target keeps id 0 (built in
-        # pre_infer). These ids drive the source-id RoPE (transformer_wan.py:274).
-        n = len(src_latents)
-        max_trained = int(self.config.get("max_trained_src_id", 5))
-        if self.config.get("interpolate_src_id", True) and n > max_trained:
-            src_ids = torch.linspace(1.0, float(max_trained), n).tolist()
-        else:
-            src_ids = [float(i) for i in range(1, n + 1)]
-
-        # v2v system-prompt prefix (video-editing task_type, bernini_template.py:113).
-        # Upstream applies the task system prompt to BOTH the cond and uncond text
-        # encodings (the template prepends it regardless of the user prompt), so we
-        # prefix the positive AND negative prompt for the CFG dual-forward.
-        base_prompt = self.input_info.prompt or ""
-        if not base_prompt.startswith(self._V2V_SYSTEM_PROMPT):
-            self.input_info.prompt = f"{self._V2V_SYSTEM_PROMPT} {base_prompt}".strip()
-        base_neg = self.input_info.negative_prompt or ""
-        if not base_neg.startswith(self._V2V_SYSTEM_PROMPT):
-            self.input_info.negative_prompt = f"{self._V2V_SYSTEM_PROMPT} {base_neg}".strip()
-
-        text_encoder_output = self.run_text_encoder(self.input_info)
-        torch_device_module.empty_cache()
-        gc.collect()
-
-        # Sanity log (single-GPU debuggability, M1 requirement).
-        for i, z in enumerate(src_latents):
-            logger.info(f"[v2v] src_latent[{i}] shape={tuple(z.shape)} mean={z.float().mean().item():.4f} std={z.float().std().item():.4f} src_id={src_ids[i]}")
-        logger.info(f"[v2v] latent_shape={latent_shape}, num_context_sources={n}")
-
-        return {
-            "text_encoder_output": text_encoder_output,
-            "image_encoder_output": None,
-            # v2v context: source latents + their source-ids for the pre_infer
-            # sequence-dim token concat + source-id RoPE (bernini wan_diffusion.py:479).
-            "v2v_context": {
-                "src_latents": src_latents,  # list of [C=16, T_lat, H_lat, W_lat]
-                "src_ids": src_ids,  # list[float], one per source (context ids 1..n)
-            },
-        }
-
-    # bernini v2v system prompt (bernini_template.py:113). The pure-t2v Bernini
-    # path uses the T5 text encoder; task_type only swaps this system-prompt
-    # prefix, so we prepend it to the prompt for v2v.
-    _V2V_SYSTEM_PROMPT = "You are a helpful assistant specialized in video editing."
-
-    @ProfilingContext4DebugL2("Run Encoders")
-    def _run_input_encoder_local_v2v(self):
-        # mv2v = comma-separated source videos (each own source_id). Only single
-        # source is fully supported now; multi is parsed but only first is used
-        # for the target-shape / context beyond a TODO. bernini wan_diffusion.py:430
-        raw = (self.input_info.src_video or "").strip()
-        if not raw:
-            raise ValueError("v2v task requires --src_video (source clip to edit).")
-        video_paths = [p.strip() for p in raw.split(",") if p.strip()]
-        if len(video_paths) > 1:
-            # TODO(bernini mv2v): support a LIST of sources; first joins V-combo,
-            # all join VI-combo. For now use every clip as VI context sources.
-            logger.warning(f"v2v: {len(video_paths)} source videos given; mv2v is future work, encoding all as VI context.")
-
-        # VAE-encode full source clip(s) into the normalized target latent space.
-        src_latents, latent_shape = self.run_vae_encoder_v2v(video_paths)
-        self.input_info.latent_shape = latent_shape  # Important: set latent_shape in input_info
-
-        # bernini wan_diffusion.py:416 _make_sids — context source ids 1..n, or
-        # linspace(1, max_trained=5, n) when n > 5. Target keeps id 0 (built in
-        # pre_infer). These ids drive the source-id RoPE (transformer_wan.py:274).
-        n = len(src_latents)
-        max_trained = int(self.config.get("max_trained_src_id", 5))
-        if self.config.get("interpolate_src_id", True) and n > max_trained:
-            src_ids = torch.linspace(1.0, float(max_trained), n).tolist()
-        else:
-            src_ids = [float(i) for i in range(1, n + 1)]
-
-        # v2v system-prompt prefix (video-editing task_type, bernini_template.py:113).
-        # Upstream applies the task system prompt to BOTH the cond and uncond text
-        # encodings (the template prepends it regardless of the user prompt), so we
-        # prefix the positive AND negative prompt for the CFG dual-forward.
-        base_prompt = self.input_info.prompt or ""
-        if not base_prompt.startswith(self._V2V_SYSTEM_PROMPT):
-            self.input_info.prompt = f"{self._V2V_SYSTEM_PROMPT} {base_prompt}".strip()
-        base_neg = self.input_info.negative_prompt or ""
-        if not base_neg.startswith(self._V2V_SYSTEM_PROMPT):
-            self.input_info.negative_prompt = f"{self._V2V_SYSTEM_PROMPT} {base_neg}".strip()
-
-        text_encoder_output = self.run_text_encoder(self.input_info)
-        torch_device_module.empty_cache()
-        gc.collect()
-
-        # Sanity log (single-GPU debuggability, M1 requirement).
-        for i, z in enumerate(src_latents):
-            logger.info(f"[v2v] src_latent[{i}] shape={tuple(z.shape)} mean={z.float().mean().item():.4f} std={z.float().std().item():.4f} src_id={src_ids[i]}")
-        logger.info(f"[v2v] latent_shape={latent_shape}, num_context_sources={n}")
-
-        return {
-            "text_encoder_output": text_encoder_output,
-            "image_encoder_output": None,
-            # v2v context: source latents + their source-ids for the pre_infer
-            # sequence-dim token concat + source-id RoPE (bernini wan_diffusion.py:479).
-            "v2v_context": {
-                "src_latents": src_latents,  # list of [C=16, T_lat, H_lat, W_lat]
-                "src_ids": src_ids,  # list[float], one per source (context ids 1..n)
-            },
-        }
 
     @ProfilingContext4DebugL2("Run Text Encoder")
     def _run_input_encoder_local_animate(self):
@@ -759,6 +469,9 @@ class DefaultRunner(BaseRunner):
             del self.vae_decoder
             self.maybe_empty_cache()
 
+    def get_output_fps(self):
+        return getattr(self.input_info, "output_fps", None) or self.config.get("fps", 16)
+
     def process_images_after_vae_decoder(self):
         return_result_tensor = self.input_info.return_result_tensor
         save_result = self.input_info.save_result_path is not None
@@ -772,33 +485,13 @@ class DefaultRunner(BaseRunner):
         with ProfilingContext4DebugL2("wan_vae_to_comfy"):
             self.gen_video_final = wan_vae_to_comfy(self.gen_video_final)
 
-        # 插帧与保存帧率必须共用同一判定：target_fps 高于源帧率才真的插帧、
-        # 才按 target_fps 编码。否则（如 SR 源 24fps + 请求默认 target_fps=16）
-        # wrapper 原样返回全部帧，若保存端仍切 target_fps 会产出慢动作视频。
-        source_fps = self.config.get("fps", 16)
-        vfi_target_fps = None
-        if "video_frame_interpolation" in self.config:
-            assert self.vfi_model is not None and self.config["video_frame_interpolation"].get("target_fps", None) is not None
-            target_fps = self.config["video_frame_interpolation"]["target_fps"]
-            if target_fps > source_fps:
-                vfi_target_fps = target_fps
-                logger.info(f"Interpolating frames from {source_fps} to {target_fps}")
-                self.gen_video_final = self.vfi_model.interpolate_frames(
-                    self.gen_video_final,
-                    source_fps=source_fps,
-                    target_fps=target_fps,
-                )
-
         if return_result_tensor:
             self.gen_video_final = self.gen_video_final.cpu()
             return {"video": self.gen_video_final}
 
         # Reaching here means should_process was true because this is the main
         # process and a save path was provided.
-        # 保存帧率要与「是否真的插了帧」共判,而不是「是否配置了插帧」。
-        # vfi_target_fps 只有在 target_fps > source_fps、插值确实跑了时才被设上;
-        # 配了插帧却没插(target <= source)还按 target_fps 存,出片就是慢动作。
-        fps = vfi_target_fps if vfi_target_fps else source_fps
+        fps = self.get_output_fps()
 
         out_path = self.input_info.save_result_path
         img_in = (getattr(self.input_info, "image_path", None) or "").strip()

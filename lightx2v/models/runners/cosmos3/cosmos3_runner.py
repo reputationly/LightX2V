@@ -24,9 +24,11 @@ from lightx2v.models.runners.cosmos3.policy_runtime import (
     normalize_policy_prompt_format,
 )
 from lightx2v.models.runners.default_runner import DefaultRunner
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS, VIDEO_REQUEST_FIELDS
 from lightx2v.models.schedulers.cosmos3.scheduler import Cosmos3Scheduler
 from lightx2v.models.video_encoders.hf.cosmos3.vae import Cosmos3WanVAE
 from lightx2v.utils.envs import *
+from lightx2v.utils.input_info import Cosmos3InputInfo
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import save_to_video
@@ -128,8 +130,53 @@ def compose_droid_policy_image(images):
 
 @RUNNER_REGISTER("cosmos3")
 class Cosmos3Runner(DefaultRunner):
+    input_info_cls_by_task = {task: Cosmos3InputInfo for task in ("t2i", "t2v", "i2v", "t2av", "i2av", "i2va", "v2av")}
+    supported_request_fields_by_task = {
+        "t2i": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"size"},
+        "t2v": VIDEO_REQUEST_FIELDS,
+        "i2v": VIDEO_REQUEST_FIELDS | {"image_path"},
+        "t2av": VIDEO_REQUEST_FIELDS,
+        "i2av": VIDEO_REQUEST_FIELDS | {"image_path"},
+        "i2va": COMMON_REQUEST_FIELDS
+        | PROMPT_FIELDS
+        | {
+            "action_mode",
+            "action_path",
+            "domain_name",
+            "image_path",
+            "policy_image",
+            "policy_state",
+            "save_action_path",
+            "state_path",
+            "size",
+            "video_path",
+            "view_point",
+        },
+        "v2av": COMMON_REQUEST_FIELDS
+        | PROMPT_FIELDS
+        | {
+            "action_mode",
+            "action_path",
+            "domain_name",
+            "image_path",
+            "save_action_path",
+            "size",
+            "video_path",
+            "view_point",
+        },
+    }
+
     model_cpu_offload_seq = "transformer->vae->sound_tokenizer"
     _callback_tensor_inputs = ["latents"]
+
+    def create_input_info(self, request_data):
+        input_info = super().create_input_info(request_data)
+        # Action metadata resolves explicit request values, then the action file, then config.
+        input_info.domain_name = request_data.get("domain_name", "")
+        input_info.view_point = request_data.get("view_point", "")
+        input_info.action_chunk_size = None
+        input_info.raw_action_dim = None
+        return input_info
 
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
@@ -169,9 +216,7 @@ class Cosmos3Runner(DefaultRunner):
             assert self.config.get("cpu_offload", False)
         if hasattr(self, "model") and self.model is not None:
             self.model.set_scheduler(self.scheduler)
-        if self.config["task"] not in ("t2i", "t2v", "i2v", "t2av", "i2av", "i2va", "v2av"):
-            raise NotImplementedError(f"Cosmos3Runner currently supports tasks t2i/t2v/i2v/t2av/i2av/i2va/v2av, got {self.config['task']}")
-        if (self.config.get("enable_sound", False) or self.config["task"] in ("t2av", "i2av")) and not self.config.get("sound_gen", False):
+        if self.config["task"] in ("t2av", "i2av") and not self.config.get("sound_gen", False):
             raise ValueError("Cosmos3 sound generation requires a checkpoint with sound_gen=True.")
         if (self.config.get("action_mode", "") or self.config["task"] in ("i2va", "v2av")) and not self.config.get("action_gen", False):
             raise ValueError("Cosmos3 action generation requires a checkpoint with action_gen=True.")
@@ -229,14 +274,6 @@ class Cosmos3Runner(DefaultRunner):
             return spec[key]
         return self.config.get(key, default)
 
-    def _get_target_video_length(self):
-        if self._get_action_mode():
-            return int(getattr(self.input_info, "target_video_length", 0) or self.config.get("target_video_length", 1))
-        input_frames = int(getattr(self.input_info, "target_video_length", 0) or 0)
-        if input_frames and input_frames != 81:
-            return input_frames
-        return int(self.config.get("target_video_length", input_frames or 1))
-
     def _prepare_action_context(self):
         if hasattr(self, "_action_spec"):
             del self._action_spec
@@ -245,11 +282,9 @@ class Cosmos3Runner(DefaultRunner):
         spec = self._load_action_spec()
         if not getattr(self.input_info, "prompt", "") and spec.get("prompt"):
             self.input_info.prompt = spec["prompt"]
-        chunk_size = int(self._get_action_value("action_chunk_size", self.config.get("action_chunk_size", 16)))
+        chunk_size = self._get_action_value("action_chunk_size", 16)
         self.input_info.action_chunk_size = chunk_size
-        self.input_info.target_video_length = chunk_size + 1
-        if spec.get("fps") and "target_fps" not in self.config:
-            self.input_info.target_fps = float(spec["fps"])
+        self.input_info.num_frames = chunk_size + 1
 
     @staticmethod
     def _build_action_json_prompt(description, view_point, num_frames, fps, height, width, additional_view_description=None):
@@ -311,13 +346,12 @@ class Cosmos3Runner(DefaultRunner):
 
     def tokenize_prompt(self, prompt, negative_prompt=None):
         prompt = self._resolve_prompt_text(prompt)
-        negative_prompt = self._resolve_prompt_text(negative_prompt) if negative_prompt is not None else None
-        height = int(self.input_info.auto_height)
-        width = int(self.input_info.auto_width)
-        num_frames = self._get_target_video_length()
-        fps = float(self.config.get("target_fps", 24.0))
+        enable_cfg = self.config.get("enable_cfg", False)
+        negative_prompt = self._resolve_prompt_text(negative_prompt) if enable_cfg else None
+        height, width = self.input_info.size
+        num_frames = self.get_num_frames()
+        fps = float(self.config.get("fps", 24.0))
         is_image = num_frames == 1
-        negative_prompt = "" if negative_prompt is None else negative_prompt
 
         action_mode = self._get_action_mode()
         cond_text = prompt
@@ -351,14 +385,17 @@ class Cosmos3Runner(DefaultRunner):
                 )
         elif not is_image and self.config.get("add_duration_template", True):
             cond_text = self._append_prompt_template(cond_text, f"The video is {num_frames / fps:.1f} seconds long and is of {fps:.0f} FPS.")
-            uncond_text = self._append_prompt_template(uncond_text, f"The video is not {num_frames / fps:.1f} seconds long and is not of {fps:.0f} FPS.")
+            if enable_cfg:
+                uncond_text = self._append_prompt_template(uncond_text, f"The video is not {num_frames / fps:.1f} seconds long and is not of {fps:.0f} FPS.")
         if not action_mode and self.config.get("add_resolution_template", True):
             if is_image:
                 cond_text = self._append_prompt_template(cond_text, f"This image is of {height}x{width} resolution.")
-                uncond_text = self._append_prompt_template(uncond_text, f"This image is not of {height}x{width} resolution.")
+                if enable_cfg:
+                    uncond_text = self._append_prompt_template(uncond_text, f"This image is not of {height}x{width} resolution.")
             else:
                 cond_text = self._append_prompt_template(cond_text, f"This video is of {height}x{width} resolution.")
-                uncond_text = self._append_prompt_template(uncond_text, f"This video is not of {height}x{width} resolution.")
+                if enable_cfg:
+                    uncond_text = self._append_prompt_template(uncond_text, f"This video is not of {height}x{width} resolution.")
 
         eos_token_id = self.text_tokenizer.eos_token_id
         vision_start_id = self.text_tokenizer.convert_tokens_to_ids("<|vision_start|>")
@@ -367,7 +404,9 @@ class Cosmos3Runner(DefaultRunner):
 
         use_system_prompt = self.config.get("use_system_prompt", not bool(action_mode))
         cond_input_ids = self._tokenize_chat(cond_text, is_image=is_image, use_system_prompt=use_system_prompt) + [eos_token_id, vision_start_id]
-        uncond_input_ids = self._tokenize_chat(uncond_text, is_image=is_image, use_system_prompt=use_system_prompt) + [eos_token_id, vision_start_id]
+        uncond_input_ids = None
+        if enable_cfg:
+            uncond_input_ids = self._tokenize_chat(uncond_text, is_image=is_image, use_system_prompt=use_system_prompt) + [eos_token_id, vision_start_id]
         return cond_input_ids, uncond_input_ids
 
     @ProfilingContext4DebugL2("Run Encoders")
@@ -378,7 +417,9 @@ class Cosmos3Runner(DefaultRunner):
             self.input_info.prompt,
             negative_prompt=self.input_info.negative_prompt,
         )
-        self.input_info.txt_seq_lens = [len(cond_input_ids), len(uncond_input_ids)]
+        self.input_info.txt_seq_lens = [len(cond_input_ids)]
+        if uncond_input_ids is not None:
+            self.input_info.txt_seq_lens.append(len(uncond_input_ids))
         return {
             "text_encoder_output": {
                 "cond_input_ids": cond_input_ids,
@@ -387,13 +428,12 @@ class Cosmos3Runner(DefaultRunner):
             "image_encoder_output": None,
         }
 
-    def set_target_shape(self):
-        if len(self.input_info.target_shape) == 2:
-            height, width = self.input_info.target_shape
+    def set_latent_shape(self):
+        if len(self.input_info.size) == 2:
+            height, width = self.input_info.size
             height, width = int(height), int(width)
         else:
-            height = int(self.config.get("target_height", 1024))
-            width = int(self.config.get("target_width", 1024))
+            height, width = map(int, self.config.get("size", (1024, 1024)))
 
         spatial_scale = int(self.config.get("vae_scale_factor_spatial", self.config.get("vae_scale_factor", 16)))
         temporal_scale = int(self.config.get("vae_scale_factor_temporal", 4))
@@ -406,13 +446,12 @@ class Cosmos3Runner(DefaultRunner):
             height, width = rounded_height, rounded_width
 
         latent_channels = int(self.config.get("latent_channel", 48))
-        pixel_frames = self._get_target_video_length()
+        pixel_frames = self.get_num_frames()
         latent_frames = (pixel_frames - 1) // temporal_scale + 1
-        self.input_info.auto_height = height
-        self.input_info.auto_width = width
-        self.input_info.target_shape = (1, latent_channels, latent_frames, height // spatial_scale, width // spatial_scale)
+        self.input_info.size = [height, width]
+        self.input_info.latent_shape = (1, latent_channels, latent_frames, height // spatial_scale, width // spatial_scale)
         self.input_info.image_shapes = [[(latent_frames, height // spatial_scale, width // spatial_scale)]]
-        logger.info(f"Cosmos3 Runner set target shape: {width}x{height}, latent: {self.input_info.target_shape}")
+        logger.info(f"Cosmos3 Runner set target shape: {width}x{height}, latent: {self.input_info.latent_shape}")
 
     def _load_i2v_condition_frame(self):
         image_path = getattr(self.input_info, "image_path", "")
@@ -420,8 +459,7 @@ class Cosmos3Runner(DefaultRunner):
             raise ValueError("Cosmos3 i2v requires --image_path.")
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"Cosmos3 i2v image_path does not exist: {image_path}")
-        height = int(self.input_info.auto_height)
-        width = int(self.input_info.auto_width)
+        height, width = self.input_info.size
         resample = getattr(Image, "Resampling", Image).BILINEAR
         with Image.open(image_path) as image:
             image = image.convert("RGB").resize((width, height), resample=resample)
@@ -433,13 +471,13 @@ class Cosmos3Runner(DefaultRunner):
     def _prepare_i2v_condition_latents(self):
         if self.config["task"] not in ("i2v", "i2av"):
             return
-        if hasattr(self.input_info, "vision_condition_latents") and self.input_info.vision_condition_latents is not None:
+        if self.input_info.vision_condition_latents is not None:
             return
         loaded_vae_here = not hasattr(self, "vae") or self.vae is None
         if loaded_vae_here:
             self.vae = self.load_vae()
         frame = self._load_i2v_condition_frame()
-        num_frames = self._get_target_video_length()
+        num_frames = self.get_num_frames()
         video = frame.unsqueeze(2).expand(-1, -1, num_frames, -1, -1).contiguous()
         condition_latents = self.vae.encode(video)
         self.input_info.vision_condition_latents = condition_latents
@@ -614,9 +652,9 @@ class Cosmos3Runner(DefaultRunner):
         action_mode = self._get_action_mode()
         if not action_mode:
             return
-        if hasattr(self.input_info, "action_latents") or hasattr(self.input_info, "action_latent_shape"):
+        if self.input_info.action_latents is not None or self.input_info.action_latent_shape is not None:
             return
-        chunk_size = int(getattr(self.input_info, "action_chunk_size", 0) or self._get_action_value("action_chunk_size", 16))
+        chunk_size = self.input_info.action_chunk_size
         action_dim = int(self.config.get("action_dim", self.config.get("max_action_dim", 64)))
         domain_name = self._get_action_value("domain_name", None)
         if not domain_name:
@@ -627,11 +665,10 @@ class Cosmos3Runner(DefaultRunner):
         if raw_action_dim > action_dim:
             raise ValueError(f"Cosmos3 raw_action_dim={raw_action_dim} exceeds model action_dim={action_dim}")
 
-        height = int(self.input_info.auto_height)
-        width = int(self.input_info.auto_width)
-        num_frames = chunk_size + 1
+        height, width = self.input_info.size
+        num_frames = self.input_info.num_frames
         image_path = getattr(self.input_info, "image_path", None) or self.config.get("image_path", "")
-        video_path = getattr(self.input_info, "video_path", None) or self.config.get("video_path", "")
+        video_path = self.input_info.video_path or self.config.get("video_path", "")
         policy_image = getattr(self.input_info, "policy_image", None)
 
         loaded_vae_here = not hasattr(self, "vae") or self.vae is None
@@ -711,10 +748,9 @@ class Cosmos3Runner(DefaultRunner):
             "action_condition_frame_indexes",
             "action_domain_id",
             "raw_action_dim",
-            "action_start_frame_offset",
         ):
-            if hasattr(self.input_info, name):
-                delattr(self.input_info, name)
+            setattr(self.input_info, name, None)
+        self.input_info.action_start_frame_offset = 1
 
     @ProfilingContext4DebugL2("Run DiT")
     def _run_dit_local(self, total_steps=None):
@@ -724,8 +760,7 @@ class Cosmos3Runner(DefaultRunner):
         self._prepare_i2v_condition_latents()
         self._prepare_action_condition_latents()
         self.model.scheduler.prepare(self.input_info)
-        if hasattr(self.input_info, "vision_condition_latents"):
-            self.input_info.vision_condition_latents = None
+        self.input_info.vision_condition_latents = None
         return self.run(total_steps)
 
     @ProfilingContext4DebugL1(
@@ -898,12 +933,12 @@ class Cosmos3Runner(DefaultRunner):
         save_dir = os.path.dirname(save_path)
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
-        if self._is_video_output():
+        if self._is_video_output(input_info):
             video = self._images_to_video_tensor(images)
             save_to_video(
                 video.clamp(0, 1),
                 save_path,
-                fps=float(self.config.get("target_fps", 24.0)),
+                fps=float(self.config.get("fps", 24.0)),
                 method=self.config.get("save_video_method", "ffmpeg"),
             )
             self._mux_generated_audio(save_path, sound)
@@ -928,15 +963,8 @@ class Cosmos3Runner(DefaultRunner):
             del generator
         torch_device_module.empty_cache()
         gc.collect()
-        output_key = "video" if self._is_video_output() else "images"
-        if input_info.return_result_tensor:
-            outputs = {output_key: images}
-            if sound is not None:
-                outputs["sound"] = sound
-            if action is not None:
-                outputs["action"] = action
-            return outputs
-        if input_info.save_result_path is not None:
+        output_key = "video" if self._is_video_output(input_info) else "images"
+        if not input_info.return_result_tensor and input_info.save_result_path is not None:
             outputs = {output_key: None}
             if action is not None:
                 outputs["action"] = None
@@ -948,8 +976,8 @@ class Cosmos3Runner(DefaultRunner):
             outputs["action"] = action
         return outputs
 
-    def _is_video_output(self):
-        return int(self.config.get("target_video_length", 1)) > 1
+    def _is_video_output(self, input_info):
+        return input_info.num_frames > 1
 
     def end_run(self):
         if hasattr(self, "model") and self.model is not None:
@@ -1019,7 +1047,7 @@ class Cosmos3Runner(DefaultRunner):
     def run_pipeline(self, input_info):
         self.input_info = input_info
         self._prepare_action_context()
-        self.set_target_shape()
+        self.set_latent_shape()
         self.inputs = self.run_input_encoder()
         logger.info(f"input_info: {self.input_info}")
         if self._is_action_forward_multichunk():
@@ -1054,15 +1082,12 @@ class Cosmos3Policy:
     """
 
     def __init__(self, config, *, actions_per_plan=None, binarize_gripper=True):
-        from lightx2v.utils.input_info import init_empty_input_info
-
         if str(config.get("action_mode", "")).strip().lower() != "policy":
             raise ValueError("Cosmos3Policy requires action_mode='policy'.")
         if str(config.get("domain_name", "")).strip().lower() != "droid_lerobot":
             raise ValueError("Cosmos3Policy requires domain_name='droid_lerobot'.")
 
         self.config = config
-        self._input_info_factory = lambda: init_empty_input_info("i2va")
         self.action_dim = int(config.get("raw_action_dim", 8))
         self.action_chunk_size = int(config.get("action_chunk_size", 32))
         requested = self.action_chunk_size if actions_per_plan is None else int(actions_per_plan)
@@ -1084,21 +1109,22 @@ class Cosmos3Policy:
         if state.size != self.action_dim:
             raise ValueError(f"Cosmos3 Policy-DROID state length {state.size} != {self.action_dim}")
 
-        input_info = self._input_info_factory()
-        input_info.seed = self._seed_sequence.next_seed()
-        input_info.prompt = str(task_description)
-        input_info.negative_prompt = ""
-        input_info.action_mode = "policy"
-        input_info.domain_name = "droid_lerobot"
-        input_info.view_point = str(self.config.get("view_point", "concat_view"))
-        input_info.return_result_tensor = True
-        input_info.policy_image = compose_droid_policy_image(images)
-        input_info.policy_state = state
+        request_data = {
+            "seed": self._seed_sequence.next_seed(),
+            "prompt": str(task_description),
+            "action_mode": "policy",
+            "domain_name": "droid_lerobot",
+            "view_point": str(self.config.get("view_point", "concat_view")),
+            "return_result_tensor": True,
+            "policy_image": compose_droid_policy_image(images),
+            "policy_state": state,
+        }
 
         if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info(f"Cosmos3 policy plan: seed={input_info.seed}, prompt_format={self.prompt_format}")
+            logger.info(f"Cosmos3 policy plan: seed={request_data['seed']}, prompt_format={self.prompt_format}")
 
-        result = self.runner.run_pipeline(input_info)
+        input_info = self.runner.prepare_request(request_data)
+        result = self.runner.run_request(input_info)
         chunk = result.get("action") if isinstance(result, dict) else None
         if chunk is None:
             raise RuntimeError("Cosmos3 Policy-DROID inference returned no action chunk")

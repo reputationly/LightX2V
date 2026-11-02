@@ -1,14 +1,20 @@
+from functools import partial
+
 import torch
 from loguru import logger
 
+from lightx2v.utils import workload_stats
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
-from .kernels.sla_kernel import _attention
-from .kernels.sla_kernel_ar import _attention_ar
 from .template import AttnWeightTemplate
-from .utils.sla_util import get_block_map, get_cuda_arch
-from .utils.sla_util_blhd import get_block_map_blhd
-from .utils.sparge_util import block_map_incremental_lut_triton, block_map_ordinal_lut_triton, sage2_block_sparse_attn
+
+try:
+    from .utils.sla_util import get_block_map
+    from .utils.sparge_util import block_map_incremental_lut_triton, sage2_block_sparse_attn
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    get_block_map = None
 
 try:
     from flash_attn.cute import flash_attn_func as flash_attn_func_v4
@@ -44,9 +50,15 @@ def dynamic_sparse_sage2(
     block_k: int,
     arch: str,
 ) -> torch.Tensor:
+    if get_block_map is None:
+        raise ModuleNotFoundError("Dynamic sparse SageAttention requires Triton", name="triton")
+
     sparse_map, _, _ = get_block_map(q, k, topk_ratio=topk_ratio, BLKQ=block_q, BLKK=block_k)
     lut, valid_block_num = block_map_incremental_lut_triton(sparse_map)
-    return sage2_block_sparse_attn(q, k, v, lut, valid_block_num, block_q, block_k, arch)
+    out = sage2_block_sparse_attn(q, k, v, lut, valid_block_num, block_q, block_k, arch)
+    if workload_stats.enabled("attention"):
+        workload_stats.record_sparse_attn(q, k, v, sparse_map, block_q, block_k, topk_ratio, arch)
+    return out
 
 
 @dynamic_sparse_sage2.register_fake
@@ -68,7 +80,24 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
     operator = "triton"
     per_block_mean = False
 
+    def compute_stats(self, arguments, output):
+        """SLA fixed top-k: shapes give scheduled work; tail-adjusted logical work may need the actual mask."""
+        if self.operator not in {"triton", "triton_ar", "sage2", "sage3", "fa4"}:
+            facts = super().compute_stats(arguments, output)
+            facts["sparse_schedule_gap"] = "this sparse backend has no audited SLA tile contract"
+            facts["note"] = "保留基类的稠密等价量；该backend的SLA精确调度量合同尚未核对。"
+            return facts
+        q, k, v = (arguments[name] for name in ("q", "k", "v"))
+        # Use the sparsity that initialized the production router; avoid a keep-to-sparsity-to-keep rounding cycle.
+        facts = self.compute_sparse_stats_from_sparsity(q, k, v, self.sparsity_ratio, self.BLKQ, self.BLKK, min_blocks=0 if self.operator == "triton_ar" else 1, layout="SHD")
+        facts["shape"] = {"q": list(q.shape), "k": list(k.shape), "v": list(v.shape), "layout": "SHD"}
+        facts["sparse"].update(method="SLA", backend=self.operator)
+        return facts
+
     def __init__(self, config=None):
+        from .utils.sla_util import get_block_map, get_cuda_arch
+
+        self._get_block_map = get_block_map
         self.config = dict(config or {})
         self.sparsity_ratio = float(self.config.get("sparsity_ratio", type(self).sparsity_ratio))
         self.operator = self.config.get("operator", type(self).operator)
@@ -77,12 +106,21 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         if not 0.0 <= self.sparsity_ratio < 1.0:
             raise ValueError(f"dynamic sparse attention sparsity_ratio must be in [0, 1), got {self.sparsity_ratio}")
 
-        self.arch = get_cuda_arch(torch.cuda.current_device())
         self.topk = 1 - self.sparsity_ratio
+        self.arch = get_cuda_arch(torch.cuda.current_device()) if torch.cuda.is_available() else None
+
         if self.operator == "triton":
+            from .kernels.sla_kernel import _attention
+
+            self._attention = _attention
             self.BLKQ, self.BLKK = 64, 64
             self.apply_func = self.apply_triton
         elif self.operator == "triton_ar":  # triton for AR models
+            from .kernels.sla_kernel_ar import _attention_ar
+            from .utils.sla_util_blhd import get_block_map_blhd
+
+            self._attention_ar = _attention_ar
+            self._get_block_map_blhd = get_block_map_blhd
             self.BLKQ, self.BLKK = 128, 128
             self.apply_func = self.apply_triton_ar
         elif self.operator == "sage2":
@@ -92,14 +130,30 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
                 self.BLKQ, self.BLKK = 128, 64
             self.apply_func = self.apply_sage2
         elif self.operator == "sage3":
+            from .utils.sparge_util import block_map_ordinal_lut_triton
+
+            self._block_map_ordinal_lut = block_map_ordinal_lut_triton
             self.BLKQ, self.BLKK = 128, 128
             self.apply_func = self.apply_sage3
         elif self.operator == "fa4":
+            from .utils.sparge_util import block_map_ordinal_lut_triton
+
+            self._block_map_ordinal_lut = block_map_ordinal_lut_triton
             self.BLKQ, self.BLKK = 128, 128
             self.apply_func = self.apply_fa4
         elif self.operator == "magi":
             self.BLKQ, self.BLKK = 128, 128
             self.apply_func = self.apply_magi
+        elif self.operator == "intel_xpu_cute_attn":
+            self.BLKQ, self.BLKK = 128, 128
+            from lightx2v_platform.ops.attn.intel_xpu.xpu_sla_attn import apply_intel_xpu_cute_attn
+
+            self.apply_func = partial(
+                apply_intel_xpu_cute_attn,
+                keep_ratio=self.topk,
+                block_q=self.BLKQ,
+                block_k=self.BLKK,
+            )
         else:
             raise NotImplementedError(f"Not supported SLA operator: {self.operator}.")
 
@@ -138,9 +192,11 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         k = k.unsqueeze(0).transpose(1, 2).contiguous()
         v = v.unsqueeze(0).transpose(1, 2).contiguous()
 
-        sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        sparse_map, lut, real_topk = self._get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
-        out = _attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        out = self._attention.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q, k, v, sparse_map, self.BLKQ, self.BLKK, self.topk, self.arch, operator="dynamic_sparse_triton")
         out = out.transpose(1, 2).reshape(max_seqlen_q, -1)
 
         return out
@@ -161,9 +217,11 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         k = k.unsqueeze(0)
         v = v.unsqueeze(0)
 
-        sparse_map, lut, real_topk = get_block_map_blhd(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        sparse_map, lut, real_topk = self._get_block_map_blhd(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
-        out = _attention_ar.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        out = self._attention_ar.apply(q, k, v, sparse_map, lut, real_topk, self.BLKQ, self.BLKK)
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), sparse_map, self.BLKQ, self.BLKK, self.topk, self.arch, operator="dynamic_sparse_triton_ar")
         out = out.reshape(max_seqlen_q, -1)
 
         return out
@@ -204,9 +262,11 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         k = k.unsqueeze(0).transpose(1, 2).contiguous()
         v = v.unsqueeze(0).transpose(1, 2).contiguous()
 
-        sparse_map, lut, real_topk = get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
-        lut, valid_block_num = block_map_ordinal_lut_triton(sparse_map)
+        sparse_map, lut, real_topk = self._get_block_map(q, k, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        lut, valid_block_num = self._block_map_ordinal_lut(sparse_map)
         out = sage3_block_sparse_attn(q, k, v, lut, valid_block_num, per_block_mean=self.per_block_mean)
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q, k, v, sparse_map, self.BLKQ, self.BLKK, self.topk, self.arch, operator="dynamic_sparse_sage3")
         out = out.transpose(1, 2).reshape(max_seqlen_q, -1)
         return out
 
@@ -224,7 +284,7 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         # (L, H, D) -> (B, L, H, D)
         qt = q.unsqueeze(0).transpose(1, 2).contiguous()
         kt = k.unsqueeze(0).transpose(1, 2).contiguous()
-        sparse_map, lut, real_topk = get_block_map(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        sparse_map, lut, real_topk = self._get_block_map(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
 
         # (L, H, D) -> (B, L, H, D)
         q = q.unsqueeze(0)
@@ -232,7 +292,7 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         v = v.unsqueeze(0)
 
         # (B, H, Q_block_num, K_block_num)
-        full_block_idx, full_block_cnt = block_map_ordinal_lut_triton(sparse_map)
+        full_block_idx, full_block_cnt = self._block_map_ordinal_lut(sparse_map)
         mask_block_cnt = torch.zeros_like(full_block_cnt)
         mask_block_idx = torch.zeros_like(full_block_idx)
         block_sparse_tensors = BlockSparseTensorsTorch(
@@ -249,6 +309,8 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
             v=v,
             block_sparse_tensors=block_sparse_tensors,
         )
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), sparse_map, self.BLKQ, self.BLKK, self.topk, self.arch, operator="dynamic_sparse_fa4")
         out = out.reshape(max_seqlen_q, -1)
         return out
 
@@ -268,7 +330,7 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
         q_block_map = q_block_map.contiguous()
         k_block_map = k_block_map.contiguous()
 
-        sparse_map, lut, real_topk = get_block_map(q_block_map, k_block_map, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+        sparse_map, lut, real_topk = self._get_block_map(q_block_map, k_block_map, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
         seqlen, head_num, head_dim = q.shape
 
         q_ranges, k_ranges = self.generate_qk_ranges(sparse_map[0], self.BLKQ, self.BLKK, seqlen)
@@ -287,6 +349,11 @@ class DynamicSparseAttnWeight(AttnWeightTemplate):
             attn_type_map=attn_type_map,
             auto_range_merge=True,
         )[0]
+
+        if workload_stats.enabled("attention"):
+            # Recover views of consumed packed inputs after native success without retaining pre-reorder buffers.
+            statistics_qkv = (value.reshape(head_num, seqlen, head_dim).transpose(0, 1) for value in (q, k, v))
+            workload_stats.record_sparse_attn(*statistics_qkv, ranges=(q_ranges, k_ranges), operator="dynamic_sparse_magi", layout="SHD")
 
         out = out.reshape(head_num, seqlen, head_dim).permute(1, 0, 2)
 

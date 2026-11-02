@@ -6,6 +6,9 @@ The LightX2V server is a distributed video/image generation service built with F
 
 ## Directory Structure
 
+For request defaults, model/task capability checks, and adding fields across CLI,
+Python, JSON, forms and OpenAI, see [Adding Request Parameters](../../docs/EN/source/developer_guides/request_parameters.md).
+
 ```
 server/
 ├── __init__.py
@@ -18,6 +21,7 @@ server/
 │   ├── __init__.py
 │   ├── router.py            # Main router aggregation
 │   ├── deps.py              # Dependency injection container
+│   ├── request_parsing.py   # Schema-driven form decoding and documentation
 │   ├── server.py            # ApiServer class
 │   ├── files.py             # /v1/files/*
 │   ├── service_routes.py    # /v1/service/*
@@ -46,6 +50,39 @@ server/
 │   └── audio.py             # AudioHandler
 └── metrics/                 # Prometheus metrics
 ```
+
+## NUMA-local CPU offload weights
+
+On Linux CUDA hosts with known GPU NUMA topology, enable rank-local pinned
+weight placement in the model configuration:
+
+```json
+{
+  "cpu_offload": true,
+  "offload_granularity": "block",
+  "cpu_offload_numa": true
+}
+```
+
+The existing inference, server and Python pipeline entry points use the same
+loader. GPU topology is resolved through CUDA; no CPU affinity or launcher
+environment settings are required. Each rank owns one arena using the existing
+SysV/NUMA/CUDA-registration backend. Ordinary checkpoint and adapter loading and
+per-GPU H2D transfers are preserved. Compatibility follows the operator's CPU
+storage contract, including ordinary floating weights and common per-channel
+FP8/INT8 backends such as Q8F, vLLM, SGL and Triton. Operators must declare their
+CPU storage through `base_attrs` or `tensor_name` and any final dtype conversion
+through `cpu_storage_dtype`. The loader checks that final operator tensors still
+reference the registered arena and rejects undeclared CPU state. NVFP4, GGUF,
+Marlin and `fp8-pertensor` use specialized loading/storage paths that require
+separate adaptations and are rejected before checkpoint loading. Ordinary
+backend hardware and checkpoint requirements still apply. The
+option defaults to false and requires static CPU block offload;
+lazy loading, TP, LoRA, shared weights and contiguous offload are rejected.
+Call `runner.close()` after serving stops to retire transfers and release the arena.
+For the Python pipeline, call `pipeline.runner.close()` in a `finally` block.
+The InfiniteTalk/Wan model constructor and runner factory also release adopted
+NUMA weights if later inference-module, encoder or warmup initialization fails.
 
 ## Architecture
 
@@ -216,12 +253,12 @@ sequenceDiagram
     end
 
     par Parallel Inference across all ranks
-        TIW0->>TIW0: runner.set_inputs(task_data)
-        TIW0->>TIW0: runner.run_pipeline()
+        TIW0->>TIW0: input_info = runner.prepare_request(task_data)
+        TIW0->>TIW0: runner.run_request(input_info)
     and
         Note over TIW1: If world_size > 1
-        TIW1->>TIW1: runner.set_inputs(task_data)
-        TIW1->>TIW1: runner.run_pipeline()
+        TIW1->>TIW1: input_info = runner.prepare_request(task_data)
+        TIW1->>TIW1: runner.run_request(input_info)
     end
 
     Note over TIW0,TIW1: Synchronization
@@ -304,10 +341,19 @@ stateDiagram-v2
 
 ```python
 class VideoTaskRequest(BaseTaskRequest):
-    target_video_length: int = 81
+    num_frames: Optional[int] = Field(
+        None,
+        description="Number of output frames; defaults to the startup config",
+    )
+    reuse_prefix_segments: int = Field(0, ge=0)
+    video_path: str = ""
+    sr_ratio: float = Field(2.0, gt=0)
     audio_path: str = ""
     video_duration: int = 5
+    resize_mode: Optional[str] = None
+    fixed_area: Optional[str] = None
     talk_objects: Optional[list[TalkObject]] = None
+    ref_image_paths: list[str] = Field(default_factory=list)
 ```
 
 ### ImageTaskRequest
@@ -323,12 +369,25 @@ class ImageTaskRequest(BaseTaskRequest):
 class BaseTaskRequest(BaseModel):
     task_id: str  # auto-generated
     prompt: str = ""
-    negative_prompt: str = ""
+    negative_prompt: Optional[str] = ""
     image_path: str = ""  # URL, base64, or local path
-    save_result_path: str = ""
-    infer_steps: int = 5
-    seed: int  # auto-generated
+    save_result_path: Optional[str] = None  # omitted/null: do not save a file
+    seed: Optional[int]  # non-negative; omitted/null: 42
 ```
+
+To download an asynchronous task's file result, provide `save_result_path` in the request. Omitting it or passing null skips file saving. Synchronous image APIs return the image from memory.
+
+Omitted or null `negative_prompt` defaults to `""`. Explicit strings, including `""`, require model support. Empty text can still use model templates and does not disable CFG.
+
+Single-task services use the task selected by `--task` at startup, so POST requests can omit `task`. For runners that support multiple tasks, every native JSON or form request must specify `task`; unsupported tasks are rejected. The OpenAI image generation and editing endpoints select `t2i` and `i2i`, respectively.
+
+Native image and video request schemas accept the inference fields supported by their runners, including animation conditions, action/state paths, LTX reference controls, and image-edit options. The runner validates whether a field is supported by the selected model, task, and startup configuration. Unknown JSON or form fields are rejected with HTTP 422; startup settings such as `infer_steps` and `warmup` belong in the startup configuration.
+
+Only `seko_talk` tasks `s2v` and `rs2v` support `resize_mode` and `fixed_area` requests for image and mask resizing. Omitted or null values use the startup config. A `size` request for these tasks requires the configured or requested `resize_mode` to be `fixed_shape`.
+
+The `/form` endpoints accept the same named request fields as the JSON endpoints, alongside their existing file uploads. Encode structured values such as `size`, `image_frame_indices`, `image_strength` lists, `ref_image_paths`, `talk_objects`, and WorldPlay `pose` objects as JSON strings. For example, use `size='[480,832]'`. Text fields, including prompts and `layout_bboxes`, retain their submitted text.
+
+Video, pose-video, mask-video, action, and state paths refer to files or directories on the server. Image and audio inputs retain their existing URL, Base64, and local-path handling. Python-only inputs such as callbacks and in-memory policy tensors are not exposed as JSON fields; synchronous image APIs select tensor output internally.
 
 ## Configuration
 

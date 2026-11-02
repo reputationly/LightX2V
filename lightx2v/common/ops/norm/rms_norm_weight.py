@@ -5,16 +5,13 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
-from lightx2v.common.ops.norm.triton_ops import (
-    fused_norm_3drope,
-    fused_qk_norm_3drope,
-    fused_qk_rms_norm,
-    rms_norm_kernel,
-)
 from lightx2v.common.ops.utils import *
 from lightx2v.utils.envs import *
 from lightx2v.utils.registry_factory import RMS_WEIGHT_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
+from lightx2v_platform.ops.offload.weight_storage import FloatingWeightStorage, StorageDescription
+
+from .compile_ops import mean_square, rms_norm_from_sum, sum_square
 
 try:
     import sgl_kernel
@@ -34,6 +31,13 @@ except ImportError:
     magi_register_custom_op = None
 
 from lightx2v.common.magi_custom_op_mode import use_magi_custom_ops
+
+try:
+    from .triton_ops import fused_qk_rms_norm
+except ModuleNotFoundError as exc:
+    if exc.name != "triton":
+        raise
+    fused_qk_rms_norm = None
 
 
 @torch.library.custom_op(
@@ -60,7 +64,7 @@ def rmsnorm_flashinfer_fake(
     return torch.empty_like(input_tensor)
 
 
-class RMSWeightTemplate(metaclass=ABCMeta):
+class RMSWeightTemplate(FloatingWeightStorage, metaclass=ABCMeta):
     def __init__(
         self,
         weight_name,
@@ -96,6 +100,11 @@ class RMSWeightTemplate(metaclass=ABCMeta):
             self.base_attrs.append((self.weight_name, "weight", False))
         else:
             self.weight = None
+
+    def describe_storage(self, metadata):
+        description = super().describe_storage(metadata)
+        auxiliary = (("weight_diff", self.weight_diff_name),) if self.weight_name is not None else ()
+        return StorageDescription(description.tensors, auxiliary)
 
     def _get_lora_attr_mapping(self):
         if self.weight_name is not None:
@@ -235,6 +244,16 @@ class RMSWeight(RMSWeightTemplate):
         return output if weight is None else output * weight
 
 
+@RMS_WEIGHT_REGISTER("torch_opaque")
+class RMSWeightOpaque(RMSWeight):
+    """Preserve PyTorch's variance reduction during compilation."""
+
+    def _norm(self, x):
+        if torch.compiler.is_compiling():
+            return x * torch.rsqrt(mean_square(x) + self.eps)
+        return super()._norm(x)
+
+
 @RMS_WEIGHT_REGISTER("torch_native")
 class RMSWeightNative(RMSWeight):
     def apply(self, input_tensor):
@@ -308,21 +327,32 @@ class RMSWeightTP(RMSWeightTemplate):
 class RMSWeightTPFP32(RMSWeightTP):
     """Tensor-parallel RMSNorm with FP32 accumulation and computation."""
 
-    def apply(self, input_tensor):
-        input_dtype = input_tensor.dtype
+    def _norm(self, input_tensor, native_reduction=False):
         input_fp32 = input_tensor.float()
-        local_sum = input_fp32.square().sum(dim=-1, keepdim=True)
-
+        local_sum = sum_square(input_fp32) if native_reduction and torch.compiler.is_compiling() else input_fp32.square().sum(dim=-1, keepdim=True)
         if self.tp_size > 1 and self.tp_group is not None:
             dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.tp_group)
-
         global_hidden_dim = input_tensor.shape[-1] * self.tp_size
-        output = input_fp32 * torch.rsqrt(local_sum / global_hidden_dim + self.eps)
+        if native_reduction and torch.compiler.is_compiling():
+            return rms_norm_from_sum(input_fp32, local_sum, global_hidden_dim, self.eps)
+        return input_fp32 * torch.rsqrt(local_sum / global_hidden_dim + self.eps)
 
+    def apply(self, input_tensor):
+        output = self._norm(input_tensor)
         weight = self._get_actual_weight()
         if weight is not None:
             output = output * weight.float()
-        return output.to(input_dtype)
+        return output.to(input_tensor.dtype)
+
+
+@RMS_WEIGHT_REGISTER("TensorParallelTorch")
+class RMSWeightTPTorch(RMSWeightTPFP32):
+    """Match Torch RMSNorm's cast before applying the learned weight."""
+
+    def apply(self, input_tensor, native_reduction=False):
+        output = self._norm(input_tensor, native_reduction).to(input_tensor.dtype)
+        weight = self._get_actual_weight()
+        return output if weight is None else output * weight
 
 
 @RMS_WEIGHT_REGISTER("sgl-kernel")
@@ -500,6 +530,9 @@ class RMSWeightOnePass(RMSWeight):
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        from .triton_ops import rms_norm_kernel
+
+        self._kernel = rms_norm_kernel
         super().__init__(
             weight_name,
             create_cuda_buffer,
@@ -518,7 +551,7 @@ class RMSWeightOnePass(RMSWeight):
             return torch.nn.functional.rms_norm(input_tensor, (input_tensor.shape[-1],), eps=self.eps)
         if use_magi_custom_ops() and magi_register_custom_op is not None:
             return torch.ops.lightx2v.rms_norm(input_tensor, w, self.eps)
-        return rms_norm_kernel(input_tensor, w, self.eps)
+        return self._kernel(input_tensor, w, self.eps)
 
 
 def apply_qk_rms_norm(
@@ -533,6 +566,9 @@ def apply_qk_rms_norm(
         return query, key
 
     if use_triton and norm_q is not None and norm_k is not None and norm_q.eps == norm_k.eps and query.is_cuda and key.is_cuda and query.shape[-1] == key.shape[-1]:
+        if fused_qk_rms_norm is None:
+            raise ModuleNotFoundError("Fused QK RMSNorm requires Triton", name="triton")
+
         q_shape = query.shape
         k_shape = key.shape
         head_dim = q_shape[-1]
@@ -580,6 +616,9 @@ class RMSWeightFusedQKNorm3DRope:
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        from .triton_ops import fused_qk_norm_3drope
+
+        self._kernel = fused_qk_norm_3drope
         self.q_weight_name_t = q_weight_name_t
         self.q_weight_name_hw = q_weight_name_hw
         self.k_weight_name_t = k_weight_name_t
@@ -607,7 +646,7 @@ class RMSWeightFusedQKNorm3DRope:
         k : [seq, num_kv_heads, head_dim] bfloat16
         """
         cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = cos_sin
-        fused_qk_norm_3drope(
+        self._kernel(
             q,
             k,
             self._w_qt,
@@ -645,6 +684,9 @@ class RMSWeightDualNorm3DRope:
         lora_prefix="diffusion_model.blocks",
         lora_path="",
     ):
+        from .triton_ops import fused_norm_3drope
+
+        self._kernel = fused_norm_3drope
         self.weight_name_t = weight_name_t
         self.weight_name_hw = weight_name_hw
         self.create_cuda_buffer = create_cuda_buffer
@@ -662,7 +704,7 @@ class RMSWeightDualNorm3DRope:
     def apply(self, x, cos_sin):
         """In-place fused dual-RMSNorm + 3D Neox-RoPE on x: [seq, num_heads, head_dim]."""
         cos_t, sin_t, cos_h, sin_h, cos_w, sin_w = cos_sin
-        fused_norm_3drope(
+        self._kernel(
             x,
             self._w_t,
             self._w_hw,
@@ -674,3 +716,11 @@ class RMSWeightDualNorm3DRope:
             sin_w,
             eps=self.eps,
         )
+
+
+def apply_projection_norm(norm, projected):
+    if torch.compiler.is_compiling() and type(norm) is RMSWeightSgl and not projected.is_contiguous() and norm.sensitive_layer_dtype == norm.infer_dtype and flashinfer_rmsnorm is not None:
+        # The compiled SGL path already uses this kernel. Its row-stride
+        # support avoids copying slices of the packed projection output.
+        return rmsnorm_flashinfer(projected, norm._get_actual_weight(), norm.eps, norm.enable_pdl)
+    return norm.apply(projected)

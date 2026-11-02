@@ -1,22 +1,16 @@
 import asyncio
 import time
-import uuid
-from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from loguru import logger
 
 from ...schema import ImageTaskRequest, TaskResponse
 from ...task_manager import TaskStatus, task_manager
 from ..deps import get_services, validate_url_async
+from ..request_parsing import form_request_openapi, parse_form_request
 
 router = APIRouter()
-
-
-def _write_file_sync(file_path: Path, content: bytes) -> None:
-    with open(file_path, "wb") as buffer:
-        buffer.write(content)
 
 
 async def _wait_task_and_stream_result(task_id: str, timeout_seconds: int, poll_interval_seconds: float):
@@ -102,7 +96,7 @@ async def create_image_task(message: ImageTaskRequest):
             if not await validate_url_async(message.image_mask_path):
                 raise HTTPException(status_code=400, detail=f"Image mask URL is not accessible: {message.image_mask_path}")
 
-        message.prefer_memory_result = False
+        message._prefer_memory_result = False
         task_id = task_manager.create_task(message)
         message.task_id = task_id
 
@@ -144,7 +138,7 @@ async def create_image_task_sync(
             if not message.presigned_url.startswith(("http://", "https://")):
                 raise HTTPException(status_code=400, detail=f"Invalid presigned_url: {message.presigned_url}")
 
-        message.prefer_memory_result = True
+        message._prefer_memory_result = True
         task_id = task_manager.create_task(message)
         message.task_id = task_id
 
@@ -182,60 +176,18 @@ async def create_image_task_sync(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/form", response_model=TaskResponse)
+@router.post("/form", response_model=TaskResponse, openapi_extra=form_request_openapi(ImageTaskRequest, image_file={"type": "string", "format": "binary"}))
 async def create_image_task_form(
+    request: Request,
     image_file: UploadFile = File(None),
-    prompt: str = Form(default=""),
-    save_result_path: str = Form(default=""),
-    negative_prompt: str = Form(default=""),
-    infer_steps: int = Form(default=5),
-    seed: int = Form(default=42),
-    aspect_ratio: str = Form(default="16:9"),
 ):
     services = get_services()
     assert services.file_service is not None, "File service is not initialized"
 
-    async def save_file_async(file: UploadFile, target_dir: Path) -> str:
-        if not file or not file.filename:
-            return ""
-
-        file_extension = Path(file.filename).suffix
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = target_dir / unique_filename
-
-        content = await file.read()
-        await asyncio.to_thread(_write_file_sync, file_path, content)
-
-        return str(file_path)
-
-    image_path = ""
+    form = await request.form()
+    message = parse_form_request(ImageTaskRequest, {key: value for key, value in form.items() if key != "image_file"})
     if image_file and image_file.filename:
-        image_path = await save_file_async(image_file, services.file_service.input_image_dir)
+        content = await image_file.read()
+        message.image_path = str(await asyncio.to_thread(services.file_service.save_uploaded_file, content, image_file.filename))
 
-    message = ImageTaskRequest(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image_path=image_path,
-        save_result_path=save_result_path,
-        infer_steps=infer_steps,
-        seed=seed,
-        aspect_ratio=aspect_ratio,
-    )
-
-    try:
-        message.prefer_memory_result = False
-        task_id = task_manager.create_task(message)
-        message.task_id = task_id
-
-        return TaskResponse(
-            task_id=task_id,
-            task_status="pending",
-            save_result_path=message.save_result_path,
-        )
-    except RuntimeError as e:
-        if getattr(e, "original_error_type", "") == "ValueError":
-            raise HTTPException(status_code=413, detail=str(e))
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Failed to create image form task: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return await create_image_task(message)

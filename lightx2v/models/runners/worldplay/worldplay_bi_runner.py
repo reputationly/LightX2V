@@ -11,6 +11,7 @@ from lightx2v.models.networks.worldplay.bi_model import WorldPlayBIModel
 from lightx2v.models.networks.worldplay.pose_utils import pose_to_input
 from lightx2v.models.runners.hunyuan_video.hunyuan_video_15_runner import HunyuanVideo15Runner
 from lightx2v.models.schedulers.worldplay.bi_scheduler import WorldPlayBIScheduler
+from lightx2v.utils.input_info import WorldPlayI2VInputInfo, WorldPlayT2VInputInfo
 from lightx2v.utils.profiler import ProfilingContext4DebugL2
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -111,10 +112,12 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
     - Chunk-based generation with context frame selection
     """
 
+    input_info_cls_by_task = {"t2v": WorldPlayT2VInputInfo, "i2v": WorldPlayI2VInputInfo}
+    supported_request_fields_by_task = {task: request_fields | {"pose"} for task, request_fields in HunyuanVideo15Runner.supported_request_fields_by_task.items()}
+
     def __init__(self, config):
         # BI-specific parameters
         self.chunk_latent_frames = config.get("chunk_latent_frames", 16)  # BI uses 16 by default
-        self.model_type = config.get("model_type", "bi")
         self.action_ckpt = config.get("action_ckpt", None)
         self.use_prope = config.get("use_prope", True)
 
@@ -230,7 +233,7 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
 
         # Process pose input if available
         pose_output = None
-        if hasattr(self.input_info, "pose") and self.input_info.pose is not None:
+        if self.input_info.pose is not None:
             pose_output = self._process_pose_input(self.input_info.pose, self.input_info.latent_shape[1])
 
         torch_device_module.empty_cache()
@@ -257,7 +260,7 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
 
         # Process pose input if available
         pose_output = None
-        if hasattr(self.input_info, "pose") and self.input_info.pose is not None:
+        if self.input_info.pose is not None:
             pose_output = self._process_pose_input(self.input_info.pose, self.input_info.latent_shape[1])
 
         torch_device_module.empty_cache()
@@ -284,21 +287,12 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
         Returns:
             Dict with viewmats, Ks, action tensors
         """
-        try:
-            viewmats, Ks, action = pose_to_input(pose_data, latent_num)
-
-            viewmats = viewmats.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32)
-            Ks = Ks.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32)
-            action = action.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.long)
-
-            return {
-                "viewmats": viewmats,
-                "Ks": Ks,
-                "action": action,
-            }
-        except Exception as e:
-            logger.warning(f"Failed to process pose input: {e}. Continuing without pose conditioning.")
-            return None
+        viewmats, Ks, action = pose_to_input(pose_data, latent_num)
+        return {
+            "viewmats": viewmats.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32),
+            "Ks": Ks.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.float32),
+            "action": action.unsqueeze(0).to(device=AI_DEVICE, dtype=torch.long),
+        }
 
     def init_run(self):
         """Initialize run with pose conditioning support."""
@@ -322,7 +316,13 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
         if self.points_local is None:
             self.points_local = generate_points_in_sphere(50000, 8.0).to(AI_DEVICE)
 
-    def run_denoising_loop(self):
+    def run_segment(self, segment_idx=0):
+        self.run_denoising_loop(segment_idx)
+        if segment_idx is not None and segment_idx == self.video_segment_num - 1:
+            del self.inputs
+        return self.scheduler.latents
+
+    def run_denoising_loop(self, segment_idx=0):
         """
         Run bidirectional denoising loop with chunk-based generation.
 
@@ -340,15 +340,7 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
             logger.info(f"Generating chunk {chunk_idx + 1}/{total_chunks}")
 
             # Prepare chunk data
-            (chunk_latents, chunk_viewmats, chunk_Ks, chunk_action) = self.scheduler.prepare_chunk(chunk_idx)
-
-            # Update scheduler with chunk-specific pose data
-            if chunk_viewmats is not None:
-                self.scheduler.viewmats = chunk_viewmats
-            if chunk_Ks is not None:
-                self.scheduler.Ks = chunk_Ks
-            if chunk_action is not None:
-                self.scheduler.action = chunk_action
+            chunk_latents, _, _, _ = self.scheduler.prepare_chunk(chunk_idx)
 
             # Select context frames for non-first chunks
             context_frame_indices = []
@@ -373,142 +365,74 @@ class WorldPlayBIRunner(HunyuanVideo15Runner):
             self.scheduler.set_context_frame_indices(context_frame_indices)
 
             # Run denoising for this chunk
-            chunk_output = self._denoise_chunk_bi(chunk_idx, chunk_latents, context_frame_indices)
+            chunk_output = self._denoise_chunk_bi(chunk_idx, chunk_latents, context_frame_indices, segment_idx)
 
             # Update latents with generated chunk
             self.scheduler.update_chunk_latents(chunk_idx, chunk_output)
 
-    def _denoise_chunk_bi(self, chunk_idx, chunk_latents, context_frame_indices):
-        """
-        Run bidirectional denoising loop for a single chunk.
+    def _denoise_chunk_bi(self, chunk_idx, chunk_latents, context_frame_indices, segment_idx=0):
+        """Denoise a chunk with aligned context, conditions, pose and RoPE."""
+        full_latents = self.scheduler.latents
+        full_cond = self.scheduler.cond_latents_concat
+        full_mask = self.scheduler.mask_concat
+        full_viewmats = self.scheduler.viewmats
+        full_Ks = self.scheduler.Ks
+        full_action = self.scheduler.action
+        full_cos_sin = self.scheduler.cos_sin
+        full_timestep_input = self.scheduler.timestep_input
 
-        For BI model (matching HY-WorldPlay bi_rollout):
-        - First chunk (chunk_idx == 0): all frames use the same timestep t
-        - Non-first chunks: context frames use stabilization_level - 1, current frames use t
-        - Bidirectional attention is used (not causal)
+        num_chunk_frames = chunk_latents.shape[2]
+        start_frame = chunk_idx * self.chunk_latent_frames
+        frame_indices = context_frame_indices + list(range(start_frame, start_frame + num_chunk_frames))
+        context_latents = full_latents[:, :, context_frame_indices] if context_frame_indices else None
+        _, _, total_frames, height, width = full_latents.shape
 
-        Args:
-            chunk_idx: Current chunk index
-            chunk_latents: Initial latent tensor for this chunk
-            context_frame_indices: List of context frame indices
+        try:
+            self.scheduler.latents = chunk_latents
+            self.scheduler.cond_latents_concat = full_cond[:, :, frame_indices]
+            self.scheduler.mask_concat = full_mask[:, :, frame_indices]
+            self.scheduler.cos_sin = full_cos_sin.reshape(total_frames, height * width, -1)[frame_indices].flatten(0, 1)
+            if full_viewmats is not None:
+                self.scheduler.viewmats = full_viewmats[:, frame_indices]
+            if full_Ks is not None:
+                self.scheduler.Ks = full_Ks[:, frame_indices]
+            if full_action is not None:
+                self.scheduler.action = full_action[:, frame_indices]
 
-        Returns:
-            Denoised latent tensor for this chunk
-        """
-        # Store original latents and replace with chunk
-        original_latents = self.scheduler.latents
-        self.scheduler.latents = chunk_latents
+            for step_idx in range(self.scheduler.infer_steps):
+                if self.video_segment_num == 1:
+                    self.check_stop()
+                self.scheduler.step_pre(step_idx)
+                t = self.scheduler.timesteps[step_idx]
+                timestep_input = t.expand(num_chunk_frames)
+                chunk_latents = self.scheduler.latents
 
-        # Get context data if available
-        context_latents = None
-        context_viewmats = None
-        context_Ks = None
-        context_action = None
+                if context_frame_indices:
+                    t_ctx = self.scheduler.get_context_timestep()
+                    timestep_input = torch.cat([t_ctx, timestep_input])
+                    self.scheduler.latents = torch.cat([context_latents, chunk_latents], dim=2)
 
-        if context_frame_indices and chunk_idx > 0:
-            # Get context data from full latents
-            context_latents = original_latents[:, :, context_frame_indices, :, :]
+                self.scheduler.timestep_input = timestep_input
+                noise_pred = self.model.infer_bi(self.inputs)
+                self.scheduler.latents = chunk_latents
+                self.scheduler.noise_pred = noise_pred[:, :, -num_chunk_frames:]
+                self.scheduler.step_post()
 
-            # Get context pose data
-            full_pose = self.inputs.get("pose_output")
-            if full_pose is not None:
-                if full_pose.get("viewmats") is not None:
-                    context_viewmats = full_pose["viewmats"][:, context_frame_indices]
-                if full_pose.get("Ks") is not None:
-                    context_Ks = full_pose["Ks"][:, context_frame_indices]
-                if full_pose.get("action") is not None:
-                    context_action = full_pose["action"][:, context_frame_indices]
+                if self.progress_callback:
+                    segment_steps = self.scheduler.total_chunks * self.scheduler.infer_steps
+                    current_step = segment_idx * segment_steps + chunk_idx * self.scheduler.infer_steps + step_idx + 1
+                    self.progress_callback(current_step / (self.video_segment_num * segment_steps) * 100, 100)
 
-        # Reset step index for this chunk
-        self.scheduler.step_index = 0
-        num_chunk_frames = self.scheduler.latents.shape[2]
-
-        # Run denoising steps
-        for step_idx in range(self.scheduler.infer_steps):
-            self.scheduler.step_index = step_idx
-            t = self.scheduler.timesteps[step_idx]
-
-            # Prepare timestep input based on chunk (matching HY-WorldPlay bi_rollout)
-            if chunk_idx == 0:
-                # First chunk: all frames use the same timestep t
-                # This matches HY-WorldPlay: timestep_input = torch.full((self.chunk_latent_frames,), t, ...)
-                timestep_input = torch.full(
-                    (num_chunk_frames,),
-                    t,
-                    device=AI_DEVICE,
-                    dtype=self.scheduler.timesteps.dtype,
-                )
-                latent_model_input = self.scheduler.latents
-            else:
-                # Non-first chunk: context uses stabilization level, current uses t
-                # This matches HY-WorldPlay:
-                # t_ctx = torch.full((len(selected_frame_indices),), stabilization_level - 1, ...)
-                # t_now = torch.full((self.chunk_latent_frames,), t, ...)
-                # timestep_input = torch.cat([t_ctx, t_now], dim=0)
-                t_ctx = torch.full(
-                    (len(context_frame_indices),),
-                    self.scheduler.stabilization_level - 1,
-                    device=AI_DEVICE,
-                    dtype=self.scheduler.timesteps.dtype,
-                )
-                t_now = torch.full(
-                    (num_chunk_frames,),
-                    t,
-                    device=AI_DEVICE,
-                    dtype=self.scheduler.timesteps.dtype,
-                )
-                timestep_input = torch.cat([t_ctx, t_now], dim=0)
-
-                # Concatenate context and current latents
-                latent_model_input = torch.cat([context_latents, self.scheduler.latents], dim=2)
-
-            # Update scheduler with concatenated data for this step
-            if chunk_idx > 0 and context_frame_indices:
-                # Concatenate pose data
-                start_idx = chunk_idx * self.chunk_latent_frames
-                end_idx = start_idx + num_chunk_frames
-
-                full_pose = self.inputs.get("pose_output")
-                if full_pose is not None:
-                    if full_pose.get("viewmats") is not None:
-                        chunk_viewmats = full_pose["viewmats"][:, start_idx:end_idx]
-                        self.scheduler.viewmats = torch.cat([context_viewmats, chunk_viewmats], dim=1) if context_viewmats is not None else chunk_viewmats
-                    if full_pose.get("Ks") is not None:
-                        chunk_Ks = full_pose["Ks"][:, start_idx:end_idx]
-                        self.scheduler.Ks = torch.cat([context_Ks, chunk_Ks], dim=1) if context_Ks is not None else chunk_Ks
-                    if full_pose.get("action") is not None:
-                        chunk_action = full_pose["action"][:, start_idx:end_idx]
-                        self.scheduler.action = torch.cat([context_action, chunk_action], dim=1) if context_action is not None else chunk_action
-
-            # Store timestep for model
-            self.scheduler.timestep_input = timestep_input
-
-            # Temporarily set latents to concatenated input
-            temp_latents = self.scheduler.latents
-            self.scheduler.latents = latent_model_input
-
-            # Run model inference
-            noise_pred = self.model.infer_bi(self.inputs)
-
-            # Restore latents
-            self.scheduler.latents = temp_latents
-
-            # Extract noise prediction for current chunk only
-            if chunk_idx > 0 and context_frame_indices:
-                # noise_pred includes context frames, extract current chunk portion
-                noise_pred = noise_pred[:, :, -num_chunk_frames:, :, :]
-
-            # Update noise prediction and step
-            self.scheduler.noise_pred = noise_pred
-            self.scheduler.step_post()
-
-        # Get denoised chunk
-        denoised_chunk = self.scheduler.latents.clone()
-
-        # Restore original latents
-        self.scheduler.latents = original_latents
-
-        return denoised_chunk
+            return self.scheduler.latents.clone()
+        finally:
+            self.scheduler.latents = full_latents
+            self.scheduler.cond_latents_concat = full_cond
+            self.scheduler.mask_concat = full_mask
+            self.scheduler.viewmats = full_viewmats
+            self.scheduler.Ks = full_Ks
+            self.scheduler.action = full_action
+            self.scheduler.cos_sin = full_cos_sin
+            self.scheduler.timestep_input = full_timestep_input
 
     def cleanup(self):
         """Cleanup after generation."""

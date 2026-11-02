@@ -1,3 +1,4 @@
+import gc
 import glob
 import math
 import os
@@ -7,22 +8,31 @@ import torch.distributed as dist
 from loguru import logger
 from safetensors import safe_open
 
+from lightx2v.common.ops.mm.fp8_f16_accum import fp8_accum_gemm, fp8_f16_accum_mm_unavailable_reason
 from lightx2v.models.networks.base_model import BaseTransformerModel
+from lightx2v.models.networks.minimax_h3.adaln_cache import validate_adaln_cache_config
+from lightx2v.models.networks.minimax_h3.adaln_cache_guide import ADALN_CACHE_GUIDE
 from lightx2v.models.networks.minimax_h3.infer.module_io import MiniMaxH3SequenceParallelState
-from lightx2v.models.networks.minimax_h3.infer.offload import MiniMaxH3OffloadTransformerInfer
+from lightx2v.models.networks.minimax_h3.infer.offload import MiniMaxH3MpsOffloadTransformerInfer, MiniMaxH3OffloadTransformerInfer
+from lightx2v.models.networks.minimax_h3.infer.offload.transformer_infer import validate_minimax_h3_residency_config
 from lightx2v.models.networks.minimax_h3.infer.post_infer import MiniMaxH3PostInfer
 from lightx2v.models.networks.minimax_h3.infer.pre_infer import MiniMaxH3PreInfer
 from lightx2v.models.networks.minimax_h3.infer.transformer_infer import MiniMaxH3TransformerInfer
 from lightx2v.models.networks.minimax_h3.weights import (
     MiniMaxH3PostWeights,
     MiniMaxH3PreWeights,
+    MiniMaxH3StreamingTransformerWeights,
     MiniMaxH3TransformerWeights,
 )
 from lightx2v.models.networks.minimax_h3.weights.tensor_parallel import unwrap_tp_linear
 from lightx2v.utils.envs import GET_DTYPE
+from lightx2v.utils.fp8_f16_accum_checkpoint import ACTIVATION_QMAX, H3_QUANTIZATION_PROFILE, WEIGHT_QMAX, validate_checkpoint
+from lightx2v_platform.base.global_var import AI_DEVICE
 
 H3_CHANNEL_QUANT_SCHEMES = {
     "fp8-q8f",
+    "fp8-f16-accum",
+    "fp8-f32-accum",
     "fp8-musa",
     "fp8-sgl",
     "fp8-torchao",
@@ -47,8 +57,25 @@ class MiniMaxH3Model(BaseTransformerModel):
     post_weight_class = MiniMaxH3PostWeights
 
     def __init__(self, model_path, config, device, lora_path=None, lora_strength=1.0, lora_alpha=None):
+        validate_minimax_h3_residency_config(config)
         self.lora_alpha = lora_alpha
+        config.setdefault("use_fused_qkv", bool(config.get("dit_quantized", False)))
+        if config.get("cpu_offload_block_contiguous", False):
+            for option in ("use_fused_qkv", "dit_release_block_offload_buffers", "dit_quantized"):
+                if config.get(option, False):
+                    raise ValueError(f"MiniMax-H3 contiguous block offload does not support {option}")
+        self.use_adaln_cache = bool(config.get("use_adaln_cache", False))
+        if config.get("cpu_offload", False) and not (self.use_adaln_cache or config.get("allow_online_adaln_offload", False)):
+            message = f"\nMINIMAX-H3 CPU OFFLOAD CONFIGURATION ERROR\n\ncpu_offload=true requires use_adaln_cache=true.\n\n{ADALN_CACHE_GUIDE}"
+            logger.error(message)
+            raise ValueError(message)
+        if self.use_adaln_cache:
+            validate_adaln_cache_config(config)
+            self.remove_keys = [".adaln_proj.", "time_embedder.", "norm_out.linear."]
         self.block_offload = config.get("cpu_offload", False) and config.get("offload_granularity", "model") == "block"
+        if config.get("dit_release_block_offload_buffers", False):
+            if not self.block_offload or any(config.get(key, False) for key in ("tensor_parallel", "dit_quantized", "use_compile", "lora_dynamic_apply")) or lora_path or config.get("lora_configs"):
+                raise ValueError("dit_release_block_offload_buffers requires unquantized block offload without TP, compile or LoRA")
         # Model offload moves pre/blocks/post together. Pre/post residency only applies
         # to block offload and is ignored otherwise.
         self.prepost_resident = self.block_offload and config.get("dit_prepost_resident", False)
@@ -64,10 +91,26 @@ class MiniMaxH3Model(BaseTransformerModel):
                 raise NotImplementedError(f"MiniMax-H3 quantized inference requires a per-output-channel FP8/INT8 scheme; got {quant_scheme!r}. Supported schemes: {sorted(H3_CHANNEL_QUANT_SCHEMES)}")
             if not config.get("dit_quantized_ckpt"):
                 raise ValueError("MiniMax-H3 quantized inference requires dit_quantized_ckpt")
+            if quant_scheme in ("fp8-f16-accum", "fp8-f32-accum"):
+                validate_checkpoint(config["dit_quantized_ckpt"], profile=H3_QUANTIZATION_PROFILE)
+                if quant_scheme == "fp8-f32-accum":
+                    fp8_accum_gemm(torch.float32)
+                fallback_reason = fp8_f16_accum_mm_unavailable_reason()
+                if fallback_reason is not None:
+                    logger.warning("MiniMax-H3 DiT FP8-F16 accumulation requested but {}; falling back to FP8-SGL", fallback_reason)
+                else:
+                    logger.info(
+                        "MiniMax-H3 DiT {} enabled for Q/K/V, attention output, and FFN projections (weight qmax={}, activation qmax={})",
+                        quant_scheme,
+                        WEIGHT_QMAX,
+                        ACTIVATION_QMAX,
+                    )
         elif config.get("dit_quant_scheme", "Default") != "Default":
             raise ValueError("MiniMax-H3 dit_quant_scheme requires a dit_quantized_ckpt")
         if config.get("cpu_offload", False) and config.get("offload_granularity", "model") not in {"model", "block"}:
             raise NotImplementedError("MiniMax-H3 supports model and block CPU offload")
+        if config.get("dit_disk_streaming", False):
+            assert lora_path is None and not config.get("lora_configs")
         if config.get("attn_type") == "sol_attn":
             reorder = str(config.get("sol_attn_setting", {}).get("reorder", "none")).lower()
             if reorder != "none":
@@ -104,6 +147,77 @@ class MiniMaxH3Model(BaseTransformerModel):
             source = weight_dict if weight_dict is not None else self.original_weight_dict
             self._h3_weight_shapes = {key: tuple(tensor.shape) for key, tensor in source.items() if isinstance(tensor, torch.Tensor) and tensor.ndim == 2}
         return super()._apply_weights(weight_dict)
+
+    def _init_weights(self, weight_dict=None):
+        if self.config.get("dit_disk_streaming", False):
+            return self._init_disk_streaming_weights()
+        return super()._init_weights(weight_dict)
+
+    def _init_disk_streaming_weights(self):
+        self.transformer_weights = MiniMaxH3StreamingTransformerWeights(self.config)
+        self.pre_weight = self.pre_weight_class(self.config)
+        self.post_weight = self.post_weight_class(self.config)
+
+        checkpoint = self.transformer_weights.checkpoint
+        prepost_tensor_names = {name for weight in self._iter_weight_objects(self.pre_weight, self.post_weight) for name, _, _ in getattr(weight, "base_attrs", ())}
+        prepost_weights = checkpoint.load_tensors(prepost_tensor_names, device="cpu")
+        try:
+            self.pre_weight.load(prepost_weights)
+            self.post_weight.load(prepost_weights)
+        finally:
+            del prepost_weights
+            gc.collect()
+            device_module = getattr(torch, torch.device(self.device).type, None)
+            if device_module is not None and hasattr(device_module, "empty_cache"):
+                if torch.device(self.device).type == "mps":
+                    device_module.synchronize()
+                device_module.empty_cache()
+        return None
+
+    def _load_shared_cpu_weights(self, unified_dtype, sensitive_layer):
+        from lightx2v.models.networks.minimax_h3.shared_block_weights import load_shared_dit
+
+        return load_shared_dit(self)
+
+    def release_block_offload_buffers(self):
+        if not self.block_offload:
+            return
+        if self.config.get("dit_disk_streaming", False):
+            self.release_disk_streaming_buffer()
+            return
+        self.transformer_infer.release_resident_blocks()
+        getattr(torch, AI_DEVICE).synchronize()
+        weights = self.transformer_weights
+        weights.offload_block_cuda_buffers = None
+        weights._modules.pop("offload_block_cuda_buffers", None)
+        if weights.offload_group is not None:
+            weights.offload_group.device_slots = ()
+        self.transformer_infer.offload_manager = None
+
+    def ensure_block_offload_buffers(self):
+        if not self.block_offload:
+            return
+        if self.config.get("dit_disk_streaming", False):
+            self.transformer_weights._ensure_streaming_buffers()
+            return
+        if self.transformer_infer.offload_manager is not None:
+            return
+        from lightx2v.common.modules.weight_module import WeightModuleList
+        from lightx2v.models.networks.minimax_h3.weights.transformer_weights import MiniMaxH3TransformerBlockWeights
+
+        buffers = WeightModuleList([MiniMaxH3TransformerBlockWeights(i, self.config, create_cuda_buffer=True) for i in range(2)])
+        for index, buffer in enumerate(buffers):
+            source = self.transformer_weights.blocks[index].state_dict()
+            for weight in self._iter_weight_objects(buffer):
+                for name, attr, _ in getattr(weight, "base_attrs", ()):
+                    tensor = source[name]
+                    device = self.device if torch.device(self.device).type != "cpu" else AI_DEVICE
+                    setattr(weight, f"{attr}_cuda_buffer", torch.empty_strided(tensor.shape, tensor.stride(), dtype=tensor.dtype, device=device))
+        self.transformer_weights.add_module("offload_block_cuda_buffers", buffers)
+        if self.transformer_weights.offload_group is not None:
+            self.transformer_weights.offload_group.device_slots = buffers
+        self.transformer_infer.offload_manager = self.transformer_infer.create_offload_manager()
+        self._init_offload_manager()
 
     @staticmethod
     def _normalize_dynamic_lora_key(key):
@@ -295,17 +409,19 @@ class MiniMaxH3Model(BaseTransformerModel):
         if not self.use_tp:
             return
         checks = {
-            "num_attention_heads": int(self.config.get("num_attention_heads", 56)),
-            "ffn_hidden_size": int(self.config.get("ffn_hidden_size", 14336)),
-            "adaln_output_size": 18 * int(self.config.get("hidden_size", 5376)),
+            "num_attention_heads": self.config["num_attention_heads"],
+            "ffn_dim": self.config["ffn_dim"],
         }
+        if not self.use_adaln_cache:
+            checks["adaln_output_size"] = 18 * self.config["hidden_size"]
         invalid = {name: value for name, value in checks.items() if value % self.tp_size}
         if invalid:
             details = ", ".join(f"{name}={value}" for name, value in invalid.items())
             raise ValueError(f"MiniMax-H3 TP size {self.tp_size} must divide {details}")
 
-    @staticmethod
-    def _tp_split_type(key):
+    def _tp_split_type(self, key):
+        if key.startswith("token_refiner.") and not self.config.get("text_refiner_tensor_parallel", True):
+            return None
         if ".attn.to_q." in key or ".attn.to_k." in key or ".attn.to_v." in key:
             return "col"
         if ".attn.to_out.0." in key:
@@ -398,8 +514,20 @@ class MiniMaxH3Model(BaseTransformerModel):
         finally:
             self.use_tp = use_tp
 
+    @staticmethod
+    def _fp8_f16_checkpoint_tensor(key, tensor, sensitive_layer):
+        # H3 causal's original .pt checkpoint stores every projection as FP32.
+        # Its BF16 loader keeps only the input/time/output projections in FP32;
+        # restore that same contract for unquantized tensors in the FP8 file.
+        if tensor.dtype != torch.float32 or key.endswith(".weight_scale") or ".lora_" in key:
+            return tensor
+        if key.split(".", 1)[0] in sensitive_layer:
+            return tensor
+        return tensor.to(torch.bfloat16)
+
     def _load_quant_ckpt(self, unified_dtype, sensitive_layer):
-        if not self.use_tp:
+        fp8_f16_profile = self.config.get("dit_quant_scheme") in ("fp8-f16-accum", "fp8-f32-accum")
+        if not self.use_tp and not fp8_f16_profile:
             return super()._load_quant_ckpt(unified_dtype, sensitive_layer)
         checkpoint_path = self.config["dit_quantized_ckpt"]
         files = sorted(glob.glob(os.path.join(checkpoint_path, "*.safetensors"))) if os.path.isdir(checkpoint_path) else [checkpoint_path]
@@ -409,10 +537,12 @@ class MiniMaxH3Model(BaseTransformerModel):
         logger.info(f"MiniMax-H3 rank {dist.get_rank() if dist.is_initialized() else 0} loading TP checkpoint shards on {load_device}")
         for file_path in files:
             with safe_open(file_path, framework="pt", device="cpu") as source:
+                self._record_checkpoint_metadata(source)
                 for key in source.keys():
                     if any(remove_key in key for remove_key in remove_keys):
                         continue
-                    weight_dict[key] = self._load_local_tensor(source, key, load_device)
+                    tensor = self._load_local_tensor(source, key, load_device)
+                    weight_dict[key] = self._fp8_f16_checkpoint_tensor(key, tensor, sensitive_layer) if fp8_f16_profile else tensor
         self._validate_checkpoint_devices(weight_dict, load_device)
         return weight_dict
 
@@ -457,6 +587,7 @@ class MiniMaxH3Model(BaseTransformerModel):
         # can retain the full safetensors storage behind a small TP view.  Shard
         # on CPU first so accelerator memory contains only this rank's weights.
         with safe_open(file_path, framework="pt", device="cpu") as source:
+            self._record_checkpoint_metadata(source)
             weight_dict = {
                 key: self._load_local_tensor(source, key, load_device)
                 for key in source.keys()
@@ -466,10 +597,23 @@ class MiniMaxH3Model(BaseTransformerModel):
         return weight_dict
 
     def _init_infer_class(self):
-        if self.config.get("feature_caching", "NoCaching") != "NoCaching":
+        caching = self.config.get("feature_caching", "NoCaching")
+        if caching not in ("NoCaching", "DPCache"):
             raise NotImplementedError("MiniMax-H3 feature caching is not implemented")
         self.pre_infer_class = MiniMaxH3PreInfer
-        self.transformer_infer_class = MiniMaxH3OffloadTransformerInfer if self.cpu_offload else MiniMaxH3TransformerInfer
+        if self.config.get("dit_disk_streaming", False):
+            if caching != "NoCaching":
+                raise NotImplementedError("MiniMax-H3 feature caching is not implemented for disk streaming")
+            self.transformer_infer_class = MiniMaxH3MpsOffloadTransformerInfer
+        elif caching == "DPCache":
+            from lightx2v.models.networks.minimax_h3.infer.feature_caching.dpcache.transformer_infer import (
+                MiniMaxH3OffloadTransformerInferDPCaching,
+                MiniMaxH3TransformerInferDPCaching,
+            )
+
+            self.transformer_infer_class = MiniMaxH3OffloadTransformerInferDPCaching if self.cpu_offload else MiniMaxH3TransformerInferDPCaching
+        else:
+            self.transformer_infer_class = MiniMaxH3OffloadTransformerInfer if self.cpu_offload else MiniMaxH3TransformerInfer
         self.post_infer_class = MiniMaxH3PostInfer
 
     def _init_infer(self):
@@ -495,7 +639,7 @@ class MiniMaxH3Model(BaseTransformerModel):
     @torch.no_grad()
     def infer(self, inputs):
         prepost_offload = self.block_offload and not self.prepost_resident
-        if prepost_offload and self.scheduler.step_index == 0:
+        if prepost_offload and self.scheduler.step_index == getattr(self.scheduler, "start_step_index", 0):
             self.pre_weight.to_cuda()
             self.post_weight.to_cuda()
         output = self._infer_cond_uncond(inputs, infer_condition=True)
@@ -564,8 +708,15 @@ class MiniMaxH3Model(BaseTransformerModel):
         return output
 
     def to_cpu(self):
+        if self.config.get("dit_disk_streaming", False):
+            self.release_disk_streaming_buffer()
         super().to_cpu()
         if hasattr(self.transformer_infer, "offload_manager"):
             # Full teardown moves the active aliases away from the persistent
             # device buffers. Force buffer 0 to be populated again next run.
             self.transformer_infer.offload_manager.need_init_first_buffer = True
+
+    def release_disk_streaming_buffer(self):
+        self.transformer_infer.offload_manager.close()
+        self.transformer_infer.compiled_blocks.clear()
+        self.transformer_weights.release_disk_streaming_buffer()

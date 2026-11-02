@@ -3,7 +3,6 @@ model:
     pretrained_model_name_or_path: models/Wan2.1-T2V-14B/
     max_sequence_length: 512
     running_dtype: bf16
-    transformer_param_dtype: bf16
     vae_dtype: fp32
     load_vae: true
     load_text_encoder: true
@@ -36,15 +35,9 @@ distributed:
 
 data:
     train:
-        name: video_dataset
+        name: prompt_dataset
         data_path:
-            - data/wan22/metadata.jsonl
-        height: 480
-        width: 832
-        num_frames: 81
-        frame_rate: 16
-        fix_frame_rate: true
-        random_start: true
+            - data/prompts/wan22_train_prompts.txt
         num_workers: 8
         pin_memory: true
         shuffle: true
@@ -53,15 +46,15 @@ data:
         name: prompt_dataset
         data_path:
             - data/prompts/wan22_val_prompts.txt
-        max_samples: 2
+        max_samples: 32
         num_workers: 0
         shuffle: false
 
 scheduler:
+    min_sigma: 0.02
+    max_sigma: 0.98
     num_train_timesteps: 1000
     timestep_distribution: uniform
-    min_t: 0.001
-    max_t: 1.0
     time_shift_settings:
         do_time_shift: true
         shift_type: linear
@@ -72,7 +65,7 @@ scheduler:
 
 training:
     method: dmd
-    max_train_iters: 5000
+    max_train_iters: 1000
     gradient_accumulation_iters: 1
     gradient_checkpointing: true
     max_grad_norm: 10.0
@@ -82,15 +75,15 @@ training:
     save_total_limit: 2
     dmd:
         ida:
-            enabled: true
+            enabled: false
             decay: 0.97
         div_loss:
-            enabled: true
+            enabled: false
             weight: 5.0e-2
             teacher_inference_steps: 40
             anchor_step: 10
         fake_real:
-            enabled: true
+            enabled: false
             weight: 0.2
             timestep_list:
                 - 750
@@ -98,19 +91,8 @@ training:
         fake_update_ratio: 5
         generation_shapes:
             - {value: [81, 480, 832]}
-        denoising_step_list:
-            - 1000
-            - 750
-            - 500
-            - 250
-        warp_denoising_step: true
         ts_schedule: false
         ts_schedule_max: false
-        num_train_timestep: 1000
-        timestep_shift: 5.0
-        min_score_timestep: 0
-        min_step_ratio: 0.02
-        max_step_ratio: 0.98
     student:
         train_type: full
         optimizer:
@@ -128,7 +110,7 @@ training:
             weight_decay: 0.01
             adam_epsilon: 0.00000001
     teacher:
-        guidance_scale: 3.0
+        guidance_scale: 5.0
         cfg_norm: none
     output_dir: ./output_train/wan2_1_t2v_14b_dmd
 
@@ -137,13 +119,7 @@ inference:
     default_width: 832
     default_height: 480
     num_frames: 81
-    num_inference_steps: 4
-    denoising_step_list:
-        - 1000
-        - 750
-        - 500
-        - 250
-    warp_denoising_step: true
+    num_inference_steps: ${training.dmd.num_inference_steps}
     fps: 16
     enable_cfg: false
     cfg_guidance_scale: 1.0

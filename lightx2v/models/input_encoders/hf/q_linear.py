@@ -31,6 +31,11 @@ try:
 except ImportError:
     fp8_linear = None
 
+from lightx2v.common.ops.mm.fp8_f16_accum import (
+    fp8_accum_gemm,
+    fp8_f16_accum_linear,
+    validate_fp8_f16_accum_qmax,
+)
 from lightx2v.common.ops.mm.sgl_kernel import sgl_fp8_scaled_mm
 from lightx2v.common.ops.mm.triton_kernels import fp8_gemm_bias_triton, fp8_gemm_triton, fp8_quantize_triton, int8_gemm_bias_triton, int8_gemm_triton, int8_quantize_triton
 from lightx2v_platform.ops.mm.mthreads_musa.fp8_scaled_mm import fp8_linear as musa_fp8_linear
@@ -308,6 +313,36 @@ class SglQuantLinearFp8(nn.Module):
         self.weight_scale = maybe_cast(self.weight_scale)
         self.bias = maybe_cast(self.bias)
         return self
+
+
+class F16AccumQuantLinearFp8(SglQuantLinearFp8):
+    fp8_accum_dtype = torch.float16
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fp8_activation_qmax = None
+
+    def enable_fp8_f16_accum(self, activation_qmax):
+        activation_qmax = validate_fp8_f16_accum_qmax(activation_qmax)
+        self.fp8_gemm = fp8_accum_gemm(self.fp8_accum_dtype)
+        if self.fp8_gemm is not None:
+            self.fp8_activation_qmax = activation_qmax
+
+    def forward(self, input_tensor):
+        if self.fp8_activation_qmax is None:
+            return super().forward(input_tensor)
+        return fp8_f16_accum_linear(
+            input_tensor,
+            self.weight.t(),
+            self.weight_scale,
+            self.bias,
+            self.fp8_activation_qmax,
+            self.fp8_gemm,
+        )
+
+
+class F32AccumQuantLinearFp8(F16AccumQuantLinearFp8):
+    fp8_accum_dtype = torch.float32
 
 
 class MusaQuantLinearFp8(nn.Module):

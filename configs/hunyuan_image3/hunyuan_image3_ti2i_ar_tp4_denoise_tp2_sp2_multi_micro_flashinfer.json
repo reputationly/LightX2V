@@ -3,7 +3,6 @@
     "sample_guide_scale": 5.0,
     "flow_shift": 1.0,
     "image_size": "auto",
-    "feature_caching": "NoCaching",
     "moe_backend": "multi_micro",
     "attn_impl": "torch_sdpa",
     "flashinfer_autotune_mode": "auto",
@@ -51,7 +50,7 @@
         "cfg_mode": "serial"
     },
     "enable_cfg": true,
-    "infer_align_image_size": true,
+    "align_image_size": true,
     "bot_task": "think_recaption",
     "use_system_prompt": "en_unified",
     "max_new_tokens": 2048,

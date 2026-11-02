@@ -1,6 +1,8 @@
 import torch
 import torch.distributed as dist
 
+from .seq_p import validate_quant_scheme
+
 try:
     from sageattn3_sparse import dequant_fp4 as dequant_fp4_sage3
     from sageattn3_sparse import quant_fp4 as quant_fp4_sage3
@@ -35,7 +37,7 @@ def _fp8_all_to_all(input_t, group=None):
 def _fp4_all_to_all(input_t, group=None):
     """All-to-all with SageAttention3 FP4 compression along the last dim."""
     if quant_fp4_sage3 is None or dequant_fp4_sage3 is None:
-        raise ImportError("sageattn3_sparse quant_fp4/dequant_fp4 is required for seq_p_fp4_comm.")
+        raise ImportError("sageattn3_sparse quant_fp4/dequant_fp4 is required for sequence-parallel FP4 communication.")
 
     shape = input_t.shape
     hidden = shape[-1]
@@ -52,19 +54,21 @@ def _fp4_all_to_all(input_t, group=None):
     ).reshape(shape)
 
 
-def all2all_seq2head(input, group=None, use_fp8_comm=False, use_fp4_comm=False):
+def all2all_seq2head(input, group=None, quant_scheme=None):
     """
     将输入张量从 [seq_len/N, heads, hidden_dims] 转换为 [seq_len, heads/N, hidden_dims] 的格式。
 
     参数:
         input (torch.Tensor): 输入张量，形状为 [seq_len/N, heads, hidden_dims]
+        group: 序列并行进程组；None 表示默认进程组。
+        quant_scheme: 通信量化格式；支持 None、"fp8" 和 "fp4"。
 
     返回:
         torch.Tensor: 转换后的输出张量，形状为 [seq_len, heads/N, hidden_dims]
     """
     # 确保输入是一个3D张量
     assert input.dim() == 3, f"input must be 3D tensor"
-    assert not (use_fp8_comm and use_fp4_comm), "use_fp8_comm and use_fp4_comm can't be enabled at the same time."
+    validate_quant_scheme(quant_scheme)
 
     # 获取当前进程的世界大小
     world_size = dist.get_world_size(group=group)
@@ -82,9 +86,9 @@ def all2all_seq2head(input, group=None, use_fp8_comm=False, use_fp4_comm=False):
     )
 
     # 执行 all-to-all 操作，将输入张量的内容分发到所有进程
-    if use_fp8_comm:
+    if quant_scheme == "fp8":
         output = _fp8_all_to_all(input_t, group=group)
-    elif use_fp4_comm:
+    elif quant_scheme == "fp4":
         output = _fp4_all_to_all(input_t, group=group)
     else:
         output = torch.empty_like(input_t)
@@ -94,6 +98,30 @@ def all2all_seq2head(input, group=None, use_fp8_comm=False, use_fp4_comm=False):
     output = output.reshape(seq_len, shard_heads, hidden_dims).contiguous()
 
     return output  # 返回转换后的输出张量
+
+
+def all2all_seq2head_qkv(query, key, value, group=None):
+    """Exchange equal-shaped Q/K/V together, retaining contiguous outputs.
+
+    The payload groups heads by destination rank before grouping Q/K/V. A
+    plain concatenation of all query heads followed by key/value heads would
+    send different tensor kinds to different ranks.
+    """
+    if query.ndim != 3 or query.shape != key.shape or query.shape != value.shape:
+        raise ValueError("QKV exchange requires equal [tokens, heads, dim] shapes")
+    if query.dtype != key.dtype or query.dtype != value.dtype or query.device != key.device or query.device != value.device:
+        raise ValueError("QKV exchange requires matching dtypes and devices")
+    world_size = dist.get_world_size(group=group)
+    tokens, heads, dim = query.shape
+    if heads % world_size:
+        raise ValueError("Attention heads must be divisible by the sequence-parallel group size")
+    local_heads = heads // world_size
+    packed = torch.stack(tuple(tensor.reshape(tokens, world_size, local_heads, dim).transpose(0, 1) for tensor in (query, key, value)), dim=2)
+    received = torch.empty_like(packed)
+    dist.all_to_all_single(received, packed, group=group)
+    # [source rank, tokens, QKV, local heads, dim] -> three contiguous tensors.
+    unpacked = received.permute(2, 0, 1, 3, 4).contiguous().flatten(1, 2)
+    return tuple(unpacked.unbind(0))
 
 
 def all2all_head2seq(input, group=None):

@@ -1,9 +1,6 @@
 import torch
 from loguru import logger
 
-from .utils.sla_util import get_block_map
-from .utils.sparge_util import block_map_ordinal_lut_triton, get_block_map_meansim
-
 try:
     from flash_attn import flash_attn_func as flash_attn_func_v2
     from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v2
@@ -29,6 +26,7 @@ except (ImportError, AttributeError) as exc:
     BlockSparseTensorsTorch = None
 
 
+from lightx2v.utils import workload_stats
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 
 from .template import AttnWeightTemplate
@@ -54,16 +52,21 @@ class FlashAttn2Weight(AttnWeightTemplate):
         softmax_scale = kwargs.get("softmax_scale", None)
         if len(q.shape) == 3:
             bs = 1
+            total_seqlen = q.shape[0]
         elif len(q.shape) == 4:
             bs = q.shape[0]
-        total_seqlen = bs * max_seqlen_q
+            total_seqlen = bs * q.shape[1]
 
         if bs == 1:
-            if len(q.shape) == 3:
-                q = q.unsqueeze(0)
-                k = k.unsqueeze(0)
-                v = v.unsqueeze(0)
-            x = flash_attn_func_v2(q, k, v, softmax_scale=softmax_scale, causal=causal).reshape(total_seqlen, -1)
+            if len(q.shape) == 4:
+                q, k, v = q.squeeze(0), k.squeeze(0), v.squeeze(0)
+            if k.shape[0] > 256:
+                # FA2's dense single-batch kernel can return NaNs for long KV on SM90.
+                cu_q = torch.arange(2, device=q.device, dtype=torch.int32) * q.shape[0]
+                cu_kv = torch.arange(2, device=k.device, dtype=torch.int32) * k.shape[0]
+                x = flash_attn_varlen_func_v2(q, k, v, cu_q, cu_kv, q.shape[0], k.shape[0], softmax_scale=softmax_scale, causal=causal).reshape(total_seqlen, -1)
+            else:
+                x = flash_attn_func_v2(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), softmax_scale=softmax_scale, causal=causal).reshape(total_seqlen, -1)
         else:
             if cu_seqlens_q.is_cpu:
                 cu_seqlens_q = cu_seqlens_q.to(q.device, non_blocking=True)
@@ -95,6 +98,23 @@ class FlashAttn2Weight(AttnWeightTemplate):
             q, k, v = q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0)
         elif q.ndim != 4:
             raise ValueError(f"Dense FlashAttention2 expects 3D or 4D Q/K/V, got q.ndim={q.ndim}.")
+
+        if q.shape[0] == 1 and k.shape[1] > 256:
+            cu_q = torch.arange(2, device=q.device, dtype=torch.int32) * q.shape[1]
+            cu_kv = torch.arange(2, device=k.device, dtype=torch.int32) * k.shape[1]
+            output, lse, *_ = flash_attn_varlen_func_v2(
+                q.squeeze(0),
+                k.squeeze(0),
+                v.squeeze(0),
+                cu_q,
+                cu_kv,
+                q.shape[1],
+                k.shape[1],
+                softmax_scale=softmax_scale,
+                causal=False,
+                return_attn_probs=True,
+            )
+            return output.reshape(q.shape[1], -1), lse.transpose(0, 1)
 
         output, lse, *_ = flash_attn_func_v2(
             q.contiguous(),
@@ -129,9 +149,10 @@ class FlashAttn3Weight(AttnWeightTemplate):
         softmax_scale = kwargs.get("softmax_scale", None)
         if len(q.shape) == 3:
             bs = 1
+            total_seqlen = q.shape[0]
         elif len(q.shape) == 4:
             bs = q.shape[0]
-        total_seqlen = bs * max_seqlen_q
+            total_seqlen = bs * q.shape[1]
 
         if bs == 1:
             if len(q.shape) == 3:
@@ -211,7 +232,7 @@ class FlashAttn4Weight(AttnWeightTemplate):
             k,
             v,
         )
-        x = x.reshape(bs * max_seqlen_q, -1)
+        x = x.reshape(q.shape[1], -1)
         return x
 
 
@@ -221,6 +242,12 @@ class SparseFlashAttn4Weight(AttnWeightTemplate):
     sparse_mode = "sla_mode"
 
     def __init__(self):
+        from .utils.sla_util import get_block_map
+        from .utils.sparge_util import block_map_ordinal_lut_triton, get_block_map_meansim
+
+        self._block_map_ordinal_lut_triton = block_map_ordinal_lut_triton
+        self._get_block_map = get_block_map
+        self._get_block_map_meansim = get_block_map_meansim
         self.config = {}
         self.topk = 1 - self.sparsity_ratio
         self.BLKQ, self.BLKK = 128, 128
@@ -247,15 +274,15 @@ class SparseFlashAttn4Weight(AttnWeightTemplate):
         qt = q.transpose(1, 2).contiguous()
         kt = k.transpose(1, 2).contiguous()
         if self.sparse_mode == "sla_mode":
-            sparse_map, lut, real_topk = get_block_map(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            sparse_map, lut, real_topk = self._get_block_map(qt, kt, topk_ratio=self.topk, BLKQ=self.BLKQ, BLKK=self.BLKK)
         elif self.sparse_mode == "sparge_mode":
             smooth_k = kt - kt.mean(dim=-2, keepdim=True)
-            sparse_map = get_block_map_meansim(qt, smooth_k, cdfthreshd=None, topk=self.topk, return_lut=False, BLKQ=self.BLKQ, BLKK=self.BLKK)
+            sparse_map = self._get_block_map_meansim(qt, smooth_k, cdfthreshd=None, topk=self.topk, return_lut=False, BLKQ=self.BLKQ, BLKK=self.BLKK)
         else:
             logger.info(f"spas_flash_attn4 sparse_mode only support sla_mode and sparge_mode now.")
 
         # (B, H, Q_block_num, K_block_num)
-        full_block_idx, full_block_cnt = block_map_ordinal_lut_triton(sparse_map)
+        full_block_idx, full_block_cnt = self._block_map_ordinal_lut_triton(sparse_map)
         mask_block_cnt = torch.zeros_like(full_block_cnt)
         mask_block_idx = torch.zeros_like(full_block_idx)
         block_sparse_tensors = BlockSparseTensorsTorch(
@@ -273,5 +300,7 @@ class SparseFlashAttn4Weight(AttnWeightTemplate):
             block_sparse_tensors=block_sparse_tensors,
         )
 
+        if workload_stats.enabled("attention"):
+            workload_stats.record_sparse_attn(q, k, v, sparse_map, self.BLKQ, self.BLKK, operator="spas_flash_attn4", layout="BSHD")
         x = x.reshape(bs * max_seqlen_q, -1)
         return x

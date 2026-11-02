@@ -12,6 +12,7 @@ from .radial_attn import RadialAttnWeight
 from .rainfusion_attn import RainfusionAttnWeight
 from .ring_attn import RingAttnWeight
 from .sage_attn import SageAttn2KInt8VFP8Weight, SageAttn2Weight, SageAttn3Weight, SparseSageAttn2Weight, SparseSageAttn3Weight
+from .sage_sm120_cached import SageAttn2Sm120CachedWeight
 from .sol_attn import SolAttnWeight
 from .sparge_attn import SpargeAttnWeight
 from .sparse_mask_generator import NbhdMaskGenerator, SlaMaskGenerator, SpargeMaskGenerator, SvgMaskGenerator
@@ -19,4 +20,5 @@ from .sparse_operator import FlashinferOperator, FlexBlockOperator, MagiOperator
 from .svg2_attn import Svg2AttnWeight
 from .svg_attn import SvgAttnWeight
 from .torch_sdpa import TorchSDPAWeight
+from .torch_sdpa_mps import TorchSDPAMPSWeight
 from .ulysses_attn import UlyssesAttnWeight

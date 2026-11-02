@@ -1,3 +1,4 @@
+import math
 import os
 from contextlib import suppress
 
@@ -8,12 +9,14 @@ from PIL import Image, ImageOps
 from loguru import logger
 
 from lightx2v.models.audio_encoders.hf.minimax_h3 import MiniMaxH3AudioVAE
-from lightx2v.models.input_encoders.hf.minimax_h3 import MiniMaxH3Qwen3VLTextEncoder
+from lightx2v.models.input_encoders.hf.minimax_h3 import MiniMaxH3MpsQwen3VLTextEncoder, MiniMaxH3Qwen3VLTextEncoder
+from lightx2v.models.networks.minimax_h3.infer.offload.transformer_infer import MiniMaxH3OffloadTransformerInfer
 from lightx2v.models.networks.minimax_h3.lora import MiniMaxH3LoraAdapter
 from lightx2v.models.networks.minimax_h3.model import MiniMaxH3Model
 from lightx2v.models.networks.minimax_h3.packing import (
     TEXT_TAG,
     align_num_frames,
+    audio_latent_num_frames,
     prepare_keyframe_image,
     resolve_canvas_size,
     unpack_audio_tokens,
@@ -38,15 +41,18 @@ from lightx2v.models.networks.minimax_h3.packing_ref2av import (
     trim_reference_num_frames,
 )
 from lightx2v.models.runners.default_runner import DefaultRunner
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, RESAMPLING_FIELDS, VIDEO_OUTPUT_FIELDS
 from lightx2v.models.schedulers.minimax_h3 import MiniMaxH3Scheduler
+from lightx2v.models.schedulers.minimax_h3.resampling import validate_draft_steps, validate_resample_start_step
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.ops import Audio
 from lightx2v.models.video_encoders.hf.minimax_h3 import MiniMaxH3VideoVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import DTYPE_MAP, GET_RECORDER_MODE
-from lightx2v.utils.input_info import FL2AVInputInfo, I2AVInputInfo, L2AVInputInfo, Ref2AVInputInfo, T2AVInputInfo
+from lightx2v.utils.input_info import INPUT_INFO_TYPES
 from lightx2v.utils.ltx2_media_io import encode_video
 from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
+from lightx2v.utils.utils import resize_resampling_frames
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
@@ -95,15 +101,28 @@ class MiniMaxH3Runner(DefaultRunner):
         (544, 960, 124),
     )
     _WARMUP_STEP_COUNT = 2
-    _WARMUP_TASKS = ("t2av", "fl2av", "i2av", "l2av", "ref2av")
+    supported_request_fields_by_task = {
+        "t2av": COMMON_REQUEST_FIELDS | VIDEO_OUTPUT_FIELDS | RESAMPLING_FIELDS | {"prompt"},
+        "i2av": COMMON_REQUEST_FIELDS | VIDEO_OUTPUT_FIELDS | RESAMPLING_FIELDS | {"image_path", "prompt"},
+        "l2av": COMMON_REQUEST_FIELDS | VIDEO_OUTPUT_FIELDS | RESAMPLING_FIELDS | {"last_frame_path", "prompt"},
+        "fl2av": COMMON_REQUEST_FIELDS | VIDEO_OUTPUT_FIELDS | RESAMPLING_FIELDS | {"image_path", "last_frame_path", "prompt"},
+        "ref2av": COMMON_REQUEST_FIELDS | VIDEO_OUTPUT_FIELDS | RESAMPLING_FIELDS | {"audio_path", "image_path", "prompt", "video_path"},
+    }
 
     def __init__(self, config):
-        if config.get("task") not in {"t2av", "i2av", "l2av", "fl2av", "ref2av"}:
-            raise ValueError("MiniMax-H3 supports t2av/i2av/l2av/fl2av/ref2av")
-        self.loaded_transformer_partition = "transformer_ref" if config["task"] == "ref2av" else "transformer"
         if config.get("lazy_load", False) or config.get("unload_modules", False):
             raise NotImplementedError("MiniMax-H3 does not support lazy_load or unload_modules yet; use the released sharded checkpoint with model or block CPU offload.")
         super().__init__(config)
+        self.loaded_transformer_partition = "transformer_ref" if config.get("model_variant") == "ref2av" else "transformer"
+
+    def get_supported_tasks(self):
+        """Return tasks supported by the loaded transformer weights."""
+        if self.config.get("text_encoder_disk_streaming", False):
+            return ("t2av",)
+        if self.config["model_variant"] == "ref2av":
+            return ("ref2av",)
+        # Allow ref2av requests to use the base transformer for better visual quality.
+        return ("t2av", "i2av", "l2av", "fl2av", "ref2av")
 
     def init_modules(self):
         super().init_modules()
@@ -115,9 +134,7 @@ class MiniMaxH3Runner(DefaultRunner):
 
     @ProfilingContext4DebugL1("Warmup")
     def run_warmup(self):
-        task = self.config["task"]
-        if task not in self._WARMUP_TASKS:
-            raise NotImplementedError(f"MiniMax-H3 warmup does not support task: {task}")
+        task = self.config["model_variant"]
 
         if task == "ref2av" and self.config.get("vae_use_compile", False):
             height, width, _ = self._WARMUP_SHAPES[0]
@@ -127,11 +144,11 @@ class MiniMaxH3Runner(DefaultRunner):
             del pixels
 
         for height, width, num_frames in self._WARMUP_SHAPES:
-            logger.info(f"Warmup: {height}x{width}x{num_frames}")
+            logger.info(f"Warmup {task}: {height}x{width}x{num_frames}")
             transformer_offloaded = not self.config.get("cpu_offload", False)
             try:
                 self.scheduler.generator = None
-                self._prepare_warmup_inputs(height, width, num_frames)
+                self._prepare_warmup_inputs(task, height, width, num_frames)
                 self.inputs = self._run_input_encoder_local_h3()
                 self.init_run()
 
@@ -157,46 +174,66 @@ class MiniMaxH3Runner(DefaultRunner):
         logger.info("[Warmup] Warmup completed")
         self._maybe_freeze_gc()
 
-    def _prepare_warmup_inputs(self, height, width, num_frames):
-        task = self.config["task"]
-        common = {
-            "seed": 0,
-            "prompt": "A sunrise over distant mountains reflected across a calm lake beneath drifting clouds."
+    def _prepare_warmup_inputs(self, task, height, width, num_frames):
+        self.input_info = INPUT_INFO_TYPES[task](
+            task=task,
+            seed=0,
+            prompt="A sunrise over distant mountains reflected across a calm lake beneath drifting clouds."
             if (height, width, num_frames) == self._WARMUP_SHAPES[0]
             else "A cinematic fox walking through a snowy forest.",
-            "target_shape": [height, width],
-            "target_video_length": num_frames,
-            "return_result_tensor": True,
-        }
+            size=[height, width],
+            num_frames=num_frames,
+            return_result_tensor=True,
+        )
         image = Image.new("RGB", (width, height), color=0)
-        if task == "t2av":
-            self.input_info = T2AVInputInfo(**common)
-        elif task == "i2av":
-            self.input_info = I2AVInputInfo(**common, image_path=image)
-        elif task == "l2av":
-            self.input_info = L2AVInputInfo(**common, last_frame_path=image)
-        elif task == "fl2av":
-            self.input_info = FL2AVInputInfo(**common, image_path=image, last_frame_path=image.copy())
-        else:
-            self.input_info = Ref2AVInputInfo(**common, image_path=image)
+        if task in ("i2av", "fl2av", "ref2av"):
+            self.input_info.image_path = image
+        if task in ("l2av", "fl2av"):
+            self.input_info.last_frame_path = image.copy() if task == "fl2av" else image
 
-    def clear_warmup_state(self):
-        self.scheduler.clear()
+    def clear_conditioning_state(self):
         self.condition_video_latents = []
         self.condition_audio_latents = []
         self.keyframe_anchors = ()
         self.prepared_references = None
+        self.source_video_latents = None
+        self.source_audio_latents = None
+
+    def clear_warmup_state(self):
+        self.scheduler.clear()
+        self.clear_conditioning_state()
         self.input_info = None
         self.__dict__.pop("inputs", None)
+
+    def end_run(self):
+        self.clear_conditioning_state()
+        super().end_run()
 
     def init_scheduler(self):
         self.scheduler = MiniMaxH3Scheduler(self.config)
 
     @ProfilingContext4DebugL2("Load models")
     def load_model(self):
+        if self._is_mps_low_memory_streaming():
+            self._validate_mps_low_memory_streaming_config()
         self.model = self.load_transformer()
+        if self.config.get("dit_release_block_offload_buffers", False):
+            self.model.release_block_offload_buffers()
         self.text_encoders = self.load_text_encoder()
+        if self._is_mps_low_memory_streaming():
+            self.video_vae = None
+            self.audio_vae = None
+            return
         self.video_vae, self.audio_vae = self.load_vae()
+
+    def _is_mps_low_memory_streaming(self):
+        return AI_DEVICE == "mps" and self.config.get("model_variant") == "fl2av" and self.config.get("dit_disk_streaming", False) and self.config.get("text_encoder_disk_streaming", False)
+
+    def _validate_mps_low_memory_streaming_config(self):
+        if not self.config.get("text_encoder_release_block_offload_buffers", False):
+            raise ValueError("MiniMax-H3 MPS low-memory streaming requires text_encoder_release_block_offload_buffers=true.")
+        if self.config.get("warmup", False):
+            raise ValueError("MiniMax-H3 MPS low-memory streaming requires warmup=false in the first implementation.")
 
     def load_transformer(self):
         model_kwargs = {
@@ -214,6 +251,8 @@ class MiniMaxH3Runner(DefaultRunner):
         return MiniMaxH3Model(**model_kwargs)
 
     def load_text_encoder(self):
+        if self.config.get("text_encoder_disk_streaming", False):
+            return [MiniMaxH3MpsQwen3VLTextEncoder(self.config)]
         return [MiniMaxH3Qwen3VLTextEncoder(self.config)]
 
     @staticmethod
@@ -262,9 +301,12 @@ class MiniMaxH3Runner(DefaultRunner):
             cpu_offload=cpu_offload,
             checkpoint_path=video_vae_quantized_ckpt,
             quant_scheme=video_vae_quant_scheme,
+            encoder_conv_mode=self.config.get("vae_encoder_conv_mode", "torch"),
             sensitive_layer_dtype=vae_sensitive_layer_dtype,
             use_compile=self.config.get("vae_use_compile", False),
             attn_type=self.config.get("vae_attn_type", "torch_sdpa"),
+            offload_granularity=self.config.get("video_vae_offload_granularity", "model"),
+            shared_cpu_config=self.config if self.config.get("video_vae_shared_cpu_weights", False) else None,
         )
         self._vae_decode_tile_shapes = self.config.get("vae_decode_tile_shape", {})
         self._validate_vae_decode_tile_shapes(self._vae_decode_tile_shapes, video_vae)
@@ -289,24 +331,24 @@ class MiniMaxH3Runner(DefaultRunner):
         return video_vae, audio_vae
 
     def _resolve_request_geometry(self, geometry_image=None):
-        if self.input_info.target_shape:
-            if len(self.input_info.target_shape) != 2:
-                raise ValueError(f"MiniMax-H3 target_shape must be [height, width], got {self.input_info.target_shape}")
-            height, width = (int(value) for value in self.input_info.target_shape)
+        if self.input_info.size:
+            if len(self.input_info.size) != 2:
+                raise ValueError(f"MiniMax-H3 size must be [height, width], got {self.input_info.size}")
+            height, width = (int(value) for value in self.input_info.size)
         elif geometry_image is not None:
             height, width = resolve_canvas_size(*geometry_image.size)
-            self.input_info.target_shape = [height, width]
+            self.input_info.size = [height, width]
         else:
-            height = int(self.config["target_height"])
-            width = int(self.config["target_width"])
-            self.input_info.target_shape = [height, width]
+            height = int(self.config["size"][0])
+            width = int(self.config["size"][1])
+            self.input_info.size = [height, width]
 
-        requested_frames = int(self.input_info.target_video_length or self.config.get("target_video_length", 124))
+        requested_frames = int(self.input_info.num_frames or self.config.get("num_frames", 124))
         num_frames = align_num_frames(requested_frames)
         if num_frames != requested_frames:
             logger.warning(f"MiniMax-H3 frame count must be 17*n+5; aligning {requested_frames} upward to {num_frames}")
         validate_t2av_geometry(num_frames, height, width)
-        self.input_info.target_video_length = num_frames
+        self.input_info.num_frames = num_frames
         self.request_height = height
         self.request_width = width
         self.request_num_frames = num_frames
@@ -332,21 +374,17 @@ class MiniMaxH3Runner(DefaultRunner):
         return ImageOps.exif_transpose(image).convert("RGB")
 
     def _prepare_keyframes(self):
-        task = self.config["task"]
-        if task == "t2av":
-            if not isinstance(self.input_info, T2AVInputInfo):
-                raise TypeError(f"MiniMax-H3 t2av expects T2AVInputInfo, got {type(self.input_info).__name__}")
-            return [], ()
+        task = self.input_info.task
         if task == "i2av":
-            if not isinstance(self.input_info, I2AVInputInfo) or not self.input_info.image_path:
+            if not self.input_info.image_path:
                 raise ValueError("MiniMax-H3 i2av requires exactly one --image_path")
             values, anchors = [self.input_info.image_path], ("first",)
         elif task == "l2av":
-            if not isinstance(self.input_info, L2AVInputInfo) or not self.input_info.last_frame_path:
+            if not self.input_info.last_frame_path:
                 raise ValueError("MiniMax-H3 l2av requires --last_frame_path")
             values, anchors = [self.input_info.last_frame_path], ("last",)
         elif task == "fl2av":
-            if not isinstance(self.input_info, FL2AVInputInfo) or not self.input_info.image_path or not self.input_info.last_frame_path:
+            if not self.input_info.image_path or not self.input_info.last_frame_path:
                 raise ValueError("MiniMax-H3 fl2av requires --image_path and --last_frame_path")
             values, anchors = [self.input_info.image_path, self.input_info.last_frame_path], ("first", "last")
         else:
@@ -379,8 +417,6 @@ class MiniMaxH3Runner(DefaultRunner):
         return [value]
 
     def _prepare_references(self):
-        if not isinstance(self.input_info, Ref2AVInputInfo):
-            raise TypeError(f"MiniMax-H3 ref2av expects Ref2AVInputInfo, got {type(self.input_info).__name__}")
         entries = []
         for kind, value in (
             ("image", self.input_info.image_path),
@@ -395,6 +431,8 @@ class MiniMaxH3Runner(DefaultRunner):
         kinds = ["image" if "image" in entry else "video" if "video" in entry else "audio" for entry in entries]
         if kinds.count("image") > MAX_REFERENCE_IMAGES or kinds.count("video") > MAX_REFERENCE_VIDEOS:
             raise ValueError("MiniMax-H3 ref2av reference image/video count exceeds 9/3")
+        if kinds.count("audio") > MAX_REFERENCE_AUDIOS:
+            raise ValueError(f"MiniMax-H3 ref2av accepts at most {MAX_REFERENCE_AUDIOS} audio references")
         if all(kind == "audio" for kind in kinds):
             raise ValueError("MiniMax-H3 ref2av does not allow audio-only references")
 
@@ -403,7 +441,6 @@ class MiniMaxH3Runner(DefaultRunner):
             raise ValueError(f"reference_image_resize_mode must be one of {REFERENCE_IMAGE_RESIZE_MODES}, got {resize_mode!r}")
 
         references = []
-        audio_count = 0
         max_duration = self.request_num_frames / 24.0
         for entry, kind in zip(entries, kinds):
             if kind == "image":
@@ -434,12 +471,10 @@ class MiniMaxH3Runner(DefaultRunner):
                 frames = prepare_reference_frames(resample_reference_frames(frames, float(entry.get("fps", fps))), self.request_num_frames)
                 reference = MiniMaxH3PreparedReference("video", has_audio=soundtrack is not None, frames=frames)
                 if soundtrack is not None:
-                    audio_count += 1
                     waveform = soundtrack.waveform.squeeze(0) if soundtrack.waveform.ndim == 3 else soundtrack.waveform
                     reference.waveform = prepare_reference_waveform(waveform, soundtrack.sampling_rate, self.audio_vae.sampling_rate, max_duration)
                 references.append(reference)
                 continue
-            audio_count += 1
             value = entry["audio"]
             if isinstance(value, (str, os.PathLike)):
                 waveform, sample_rate = decode_reference_audio(value)
@@ -460,9 +495,17 @@ class MiniMaxH3Runner(DefaultRunner):
                     waveform=prepare_reference_waveform(waveform, decoded.sampling_rate, self.audio_vae.sampling_rate, max_duration),
                 )
             )
-        if audio_count > MAX_REFERENCE_AUDIOS:
-            raise ValueError(f"MiniMax-H3 ref2av accepts at most {MAX_REFERENCE_AUDIOS} audio-bearing references")
         return references
+
+    def _ensure_vae_loaded(self):
+        if self.video_vae is None or self.audio_vae is None:
+            self.video_vae, self.audio_vae = self.load_vae()
+
+    def _release_low_memory_vae(self):
+        if self._is_mps_low_memory_streaming() and (self.video_vae is not None or self.audio_vae is not None):
+            self.video_vae = None
+            self.audio_vae = None
+            self.maybe_empty_cache(force=True, collect_garbage=True)
 
     def _encode_keyframes(self, keyframes):
         latents = []
@@ -491,20 +534,68 @@ class MiniMaxH3Runner(DefaultRunner):
                 audio_latents.append(latent)
         return video_latents, audio_latents
 
+    def _resample_option(self, key, default=None):
+        value = getattr(self.input_info, key, None)
+        return self.config.get(key, default) if value is None else value
+
+    def _prepare_resampling_source(self):
+        """Resize source RGB to the target canvas, then encode clean AV.
+
+        Same-size inputs skip resizing. Video encoding uses the existing
+        seed-42 posterior sample; audio encoding uses the posterior mean.
+        """
+        self.source_video_latents = None
+        self.source_audio_latents = None
+        resample_source_video = self._resample_option("resample_source_video")
+        draft_steps = validate_draft_steps(getattr(self.input_info, "draft_steps", None), self.scheduler.infer_steps)
+        if draft_steps is not None and resample_source_video:
+            raise ValueError("MiniMax-H3 draft_steps cannot be combined with resample_source_video")
+        if not resample_source_video:
+            return
+        validate_resample_start_step(self._resample_option("resample_start_step", 1), self.scheduler.infer_steps)
+        validate_t2av_geometry(self.request_num_frames, self.request_height, self.request_width)
+        source = os.fspath(resample_source_video)
+        if not os.path.isfile(source):
+            raise ValueError(f"MiniMax-H3 regeneration source is not a local file: {source}")
+        frames, fps, soundtrack = decode_reference_video(source)
+        if not math.isfinite(fps) or abs(fps - 24.0) > 1e-4:
+            raise ValueError(f"Source video must have 24 fps; got {fps}. Convert it explicitly before regeneration")
+        if frames.shape[0] != self.request_num_frames:
+            raise ValueError(f"Source video has {frames.shape[0]} frames; request has {self.request_num_frames}. Regeneration preserves duration and does not trim or pad video")
+        if soundtrack is None:
+            raise ValueError("Source video has no soundtrack. MiniMax-H3 regeneration requires a source video with audio")
+        source_height, source_width = frames.shape[1:3]
+        if (source_height, source_width) != (self.request_height, self.request_width):
+            frames = resize_resampling_frames(
+                frames,
+                self.request_height,
+                self.request_width,
+                workers=self.config.get("resample_resize_workers", 4),
+                parallel=self.config.get("resample_resize_parallel", True),
+                device=AI_DEVICE,
+            )
+        self._ensure_vae_loaded()
+        pixels = torch.from_numpy(frames).permute(3, 0, 1, 2)[None].float().div_(255.0)
+        self.source_video_latents = self.video_vae.encode_condition(pixels, video=True).float()
+        del pixels, frames
+        # Align samples to H3's rounded 40 Hz audio latent count, removing
+        # only codec padding / the final fractional hop. No temporal resize.
+        num_samples = audio_latent_num_frames(self.request_num_frames) * self.audio_vae.hop_length
+        waveform, sample_rate = soundtrack
+        waveform = prepare_reference_waveform(waveform, sample_rate, self.audio_vae.sampling_rate, self.request_num_frames / 24.0 + 0.1)
+        missing = num_samples - waveform.shape[-1]
+        if missing > self.audio_vae.sampling_rate / 24:
+            raise ValueError("Source audio is more than one video frame shorter than the requested clip; refusing an implicit duration change")
+        waveform = torch.nn.functional.pad(waveform, (0, max(0, missing)))[:, :num_samples].contiguous()
+        self.source_audio_latents = self.audio_vae.encode(waveform).float()
+        logger.info(f"MiniMax-H3 RGB regeneration source {source}: {source_width}x{source_height} -> {self.request_width}x{self.request_height}, audio=source")
+
     @ProfilingContext4DebugL2("Run Input Encoder")
     def _run_input_encoder_local_h3(self):
-        task = self.config["task"]
-        requested_partition = "transformer_ref" if task == "ref2av" else "transformer"
-        if requested_partition != self.loaded_transformer_partition:
-            raise ValueError(
-                "MiniMax-H3 cannot switch between the base and reference transformer partitions after initialization; "
-                f"loaded {self.loaded_transformer_partition!r}, requested {requested_partition!r}. "
-                "Create a separate LightX2VPipeline for ref2av."
-            )
-        self.condition_video_latents = []
-        self.condition_audio_latents = []
-        self.keyframe_anchors = ()
-        self.prepared_references = None
+        task = self.input_info.task
+        if self.loaded_transformer_partition == "transformer_ref" and task != "ref2av":
+            raise ValueError(f"MiniMax-H3 transformer_ref only supports ref2av requests; received task {task!r}. Use model_variant='fl2av' for base-transformer tasks.")
+        self.clear_conditioning_state()
         if task == "ref2av":
             self._resolve_request_geometry()
             self.prepared_references = self._prepare_references()
@@ -553,24 +644,38 @@ class MiniMaxH3Runner(DefaultRunner):
             condition_video_latents=self.condition_video_latents,
             condition_audio_latents=self.condition_audio_latents,
             references=self.prepared_references,
+            source_video_latents=self.source_video_latents,
+            source_audio_latents=self.source_audio_latents,
+            resample_start_step=self._resample_option("resample_start_step", 1),
+            draft_steps=getattr(self.input_info, "draft_steps", None),
         )
         logger.info(
             "MiniMax-H3 packed layout: "
             f"text={prompt_embeds.shape[0]}, audio={self.scheduler.audio_latents.shape[0]}, "
             f"video={self.scheduler.video_latents.shape[0]}, total={self.scheduler.layout.sequence_length}"
         )
+        if self.scheduler.start_step_index == self.scheduler.infer_steps:
+            logger.info("MiniMax-H3 resample_start_step reached the clean endpoint; decoding VAE-encoded source with zero DiT evaluations")
+            return
         if not self.config.get("cpu_offload", False):
             logger.info("MiniMax-H3 transformer is resident on the accelerator")
         elif self.config.get("offload_granularity", "model") == "model":
             logger.info("Moving the native MiniMax-H3 transformer to the accelerator")
             self.model.to_cuda()
+        elif self.config.get("dit_disk_streaming", False):
+            logger.info("MiniMax-H3 diffusers disk offload enabled; prefetching directly into two shared MPS block buffers")
         else:
             logger.info("MiniMax-H3 block offload enabled; keeping source blocks on CPU and using two accelerator buffers")
+        if self.config.get("dit_release_block_offload_buffers", False):
+            self.model.ensure_block_offload_buffers()
         torch_device_module.synchronize()
 
     def run_segment(self, segment_idx=0):
         infer_steps = self.scheduler.infer_steps
-        for step_index in range(infer_steps):
+        start_index = self.scheduler.start_step_index
+        end_index = self.scheduler.draft_steps if self.scheduler.draft_steps is not None else infer_steps
+        remaining_steps = end_index - start_index
+        for step_index in range(start_index, end_index):
             with ProfilingContext4DebugL1(
                 "Run Dit every step",
                 recorder_mode=GET_RECORDER_MODE(),
@@ -584,9 +689,14 @@ class MiniMaxH3Runner(DefaultRunner):
                 with ProfilingContext4DebugL1("🚀 infer_main"):
                     self.model.infer(self.inputs)
                 with ProfilingContext4DebugL1("step_post"):
-                    self.scheduler.step_post()
+                    if self.scheduler.draft_steps is not None and step_index == end_index - 1:
+                        self.scheduler.project_clean()
+                    else:
+                        self.scheduler.step_post()
                 if self.progress_callback:
-                    self.progress_callback(((step_index + 1) / infer_steps) * 100, 100)
+                    self.progress_callback(((step_index - start_index + 1) / remaining_steps) * 100, 100)
+        if remaining_steps == 0 and self.progress_callback:
+            self.progress_callback(100, 100)
         return self.scheduler.video_latents, self.scheduler.audio_latents
 
     @ProfilingContext4DebugL2("Offload DiT")
@@ -594,15 +704,33 @@ class MiniMaxH3Runner(DefaultRunner):
         if not self.config.get("cpu_offload", False):
             return
         if self.model.block_offload:
+            if isinstance(self.model.transformer_infer, MiniMaxH3OffloadTransformerInfer):
+                self.model.transformer_infer.release_resident_blocks()
             if not self.model.prepost_resident:
-                logger.info("Offloading MiniMax-H3 pre/post weights; retaining the two block-offload device buffers")
+                logger.info("Offloading MiniMax-H3 pre/post weights")
                 self.model.pre_weight.to_cpu()
                 self.model.post_weight.to_cpu()
+            if self.config.get("dit_release_block_offload_buffers", False):
+                self.model.release_block_offload_buffers()
+            elif self._is_mps_low_memory_streaming():
+                logger.info("Releasing MiniMax-H3 disk-streaming DiT device block buffers")
+                self.model.release_disk_streaming_buffer()
         else:
             logger.info("Offloading MiniMax-H3 transformer before VAE decode")
             self.model.to_cpu()
         torch_device_module.synchronize()
         self.maybe_empty_cache(force=True, collect_garbage=True)
+
+    def set_vae_decode_tile_shape(self):
+        if self._vae_decode_tile_shapes:
+            resolution = f"{self.request_height}x{self.request_width}"
+            default_tile_shape = (
+                self.video_vae.tile_sample_min_height,
+                self.video_vae.tile_sample_min_width,
+            )
+            tile_shape = self._vae_decode_tile_shapes.get(resolution, default_tile_shape)
+            self.video_vae.set_decode_tile_shape(*tile_shape)
+            logger.info(f"MiniMax-H3 Video VAE decode tile shape for {resolution}: {tile_shape[0]}x{tile_shape[1]}")
 
     @ProfilingContext4DebugL1(
         "Run VAE Decoder",
@@ -611,6 +739,7 @@ class MiniMaxH3Runner(DefaultRunner):
         metrics_labels=["MiniMaxH3Runner"],
     )
     def run_vae_decoder(self, video_rows, audio_rows):
+        self._ensure_vae_loaded()
         video_rows = video_rows[self.scheduler.num_condition_video_rows :]
         audio_rows = audio_rows[self.scheduler.num_condition_audio_rows :]
         video_latents = unpatchify_video_tokens(
@@ -622,15 +751,7 @@ class MiniMaxH3Runner(DefaultRunner):
             patch_size=tuple(self.config.get("patch_size", (1, 2, 2))),
         )
         audio_latents = unpack_audio_tokens(audio_rows, self.scheduler.num_audio_latents)
-        if self._vae_decode_tile_shapes:
-            resolution = f"{self.request_height}x{self.request_width}"
-            default_tile_shape = (
-                self.video_vae.tile_sample_min_height,
-                self.video_vae.tile_sample_min_width,
-            )
-            tile_shape = self._vae_decode_tile_shapes.get(resolution, default_tile_shape)
-            self.video_vae.set_decode_tile_shape(*tile_shape)
-            logger.info(f"MiniMax-H3 Video VAE decode tile shape for {resolution}: {tile_shape[0]}x{tile_shape[1]}")
+        self.set_vae_decode_tile_shape()
 
         with ProfilingContext4DebugL1("Run Video VAE Decoder"):
             video = self.video_vae.decode(video_latents)
@@ -644,7 +765,10 @@ class MiniMaxH3Runner(DefaultRunner):
     def _video_to_uint8_frames(video):
         if video.ndim != 5 or video.shape[0] != 1 or video.shape[1] != 3:
             raise ValueError(f"decoded H3 video must be [1,3,F,H,W], got {tuple(video.shape)}")
-        return (video[0].permute(1, 2, 3, 0).float() * 255.0).round().to(torch.uint8).contiguous().cpu()
+        frames = video[0].permute(1, 2, 3, 0)
+        if frames.dtype != torch.uint8:
+            frames = (frames.float() * 255.0).round().to(torch.uint8)
+        return frames.contiguous().cpu()
 
     def process_images_after_vae_decoder(self):
         if self.video_vae.decode_parallel and dist.get_rank() != 0:
@@ -688,6 +812,7 @@ class MiniMaxH3Runner(DefaultRunner):
         should_offload_transformer = self.config.get("cpu_offload", False)
         transformer_offloaded = not should_offload_transformer
         try:
+            self._prepare_resampling_source()
             self.init_run()
             try:
                 video_rows, audio_rows = self.run_segment(0)
@@ -706,8 +831,9 @@ class MiniMaxH3Runner(DefaultRunner):
                 with suppress(Exception):
                     self._offload_transformer()
             try:
-                self.end_run()
+                self._release_low_memory_vae()
             finally:
+                self.end_run()
                 # Decoded FP32 video is large (roughly 1.5 GiB at the default
                 # shape). Returned tensors keep their own references/copies;
                 # the runner should not retain another request-sized result.

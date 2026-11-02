@@ -46,12 +46,17 @@ class LTX2TransformerInfer(BaseTransformerInfer):
 
         if self.seq_parallel:
             self.seq_p_group = config.get("device_mesh").get_group(mesh_dim="seq_p")
-            self.seq_p_fp8_comm = config.get("parallel", {}).get("seq_p_fp8_comm", False)
-            self.seq_p_fp4_comm = config.get("parallel", {}).get("seq_p_fp4_comm", False)
+            parallel_config = config.get("parallel", {})
+            self.seq_p_prepost_backend = parallel_config.get("seq_p_prepost_backend", "torch")
+            self.seq_p_a2a_backend = parallel_config.get("seq_p_a2a_backend", "torch")
+            self.seq_p_quant_scheme = parallel_config.get("seq_p_quant_scheme")
+            if self.seq_p_quant_scheme is not None and self.seq_p_quant_scheme not in ("fp8", "fp4"):
+                raise ValueError(f"Unknown seq_p_quant_scheme={self.seq_p_quant_scheme!r}; expected None, 'fp8', or 'fp4'.")
         else:
             self.seq_p_group = None
-            self.seq_p_fp8_comm = False
-            self.seq_p_fp4_comm = False
+            self.seq_p_prepost_backend = "torch"
+            self.seq_p_a2a_backend = "torch"
+            self.seq_p_quant_scheme = None
 
         # Initialize tensor parallel group
         if config.get("tensor_parallel", False):
@@ -63,7 +68,7 @@ class LTX2TransformerInfer(BaseTransformerInfer):
             self.tp_rank = 0
             self.tp_size = 1
 
-        modulate_type = config.get("modulate_type", config.get("norm_modulate_backend", "triton"))
+        modulate_type = config.get("modulate_type", "triton")
         if modulate_type == "triton":
             self.modulate_func = fuse_scale_shift_kernel
         elif modulate_type == "torch":
@@ -285,29 +290,24 @@ class LTX2TransformerInfer(BaseTransformerInfer):
         k = k.view(-1, num_heads_effective, head_dim)
         v = v.view(-1, num_heads_effective, head_dim)
 
-        if is_self_attn:
-            k, v = self._prepare_self_attention_kv(attn_phase, k, v, is_audio=is_audio)
-
         seq_len = q.size(0)
         # For video self-attention with sequence parallel (non-TP only)
         if is_self_attn and not is_audio and self.seq_parallel and not use_tp:
-            # Cache cu_seqlens_qkv for self-attention (q, k, v have same length)
-            if self.v_attn_cu_seqlens_qkv is None:
-                self.v_attn_cu_seqlens_qkv = self._create_cu_seqlens(q.shape[0])
-
-            out = attn_phase.attn_func_parallel.apply(
+            out, aux_out = attn_phase.attn_func_parallel.apply(
                 q=q,
                 k=k,
                 v=v,
-                slice_qkv_len=seq_len,
-                cu_seqlens_qkv=self.v_attn_cu_seqlens_qkv,
                 attention_module=attn_phase.attn_func,
                 seq_p_group=self.seq_p_group,
-                use_fp8_comm=self.seq_p_fp8_comm,
-                use_fp4_comm=self.seq_p_fp4_comm,
-                use_tensor_fusion=False,
-                enable_head_parallel=False,
+                prepost_backend=self.seq_p_prepost_backend,
+                a2a_backend=self.seq_p_a2a_backend,
+                quant_scheme=self.seq_p_quant_scheme,
+                tensor_fusion=False,
+                head_parallel=False,
+                attention_kwargs={},
             )
+            if aux_out is not None:
+                raise RuntimeError("LTX2 video self-attention received an unexpected auxiliary output.")
         else:
             # For all other attention types (cross-attn, audio self-attn, TP, non-parallel)
             # Cache cu_seqlens_qkv for self-attention only
@@ -318,7 +318,7 @@ class LTX2TransformerInfer(BaseTransformerInfer):
                     self.a_attn_cu_seqlens_qkv = self._create_cu_seqlens(q.shape[0])
 
                 cu_seqlens_q = self.v_attn_cu_seqlens_qkv if not is_audio else self.a_attn_cu_seqlens_qkv
-                cu_seqlens_kv = cu_seqlens_q if q.shape[0] == k.shape[0] else self._create_cu_seqlens(k.shape[0])
+                cu_seqlens_kv = cu_seqlens_q
             else:
                 # For cross-attention, always create cu_seqlens dynamically
                 # because k length varies by context type (text, audio, video)
@@ -342,10 +342,6 @@ class LTX2TransformerInfer(BaseTransformerInfer):
             out = out * gates.unsqueeze(-1)
             out = out.reshape(seq_len, num_heads_effective * head_dim)
         return attn_phase.to_out.apply(out)
-
-    def _prepare_self_attention_kv(self, attn_phase, k: torch.Tensor, v: torch.Tensor, *, is_audio: bool):
-        """Hook for causal inference. The regular LTX2 path keeps current-sequence K/V unchanged."""
-        return k, v
 
     def _infer_ffn(self, ffn_phase, x: torch.Tensor) -> torch.Tensor:
         """

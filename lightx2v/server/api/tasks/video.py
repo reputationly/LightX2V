@@ -1,20 +1,14 @@
 import asyncio
-import uuid
-from pathlib import Path
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from loguru import logger
 
 from ...schema import TaskResponse, VideoTaskRequest
 from ...task_manager import task_manager
 from ..deps import get_services, validate_url_async
+from ..request_parsing import form_request_openapi, parse_form_request
 
 router = APIRouter()
-
-
-def _write_file_sync(file_path: Path, content: bytes) -> None:
-    with open(file_path, "wb") as buffer:
-        buffer.write(content)
 
 
 @router.post("/", response_model=TaskResponse)
@@ -26,7 +20,6 @@ async def create_video_task(message: VideoTaskRequest):
 
         task_id = task_manager.create_task(message)
         message.task_id = task_id
-        logger.info(f"[latency-probe] task submitted task_id={task_id} pending={task_manager.get_pending_task_count()}")
 
         return TaskResponse(
             task_id=task_id,
@@ -40,74 +33,37 @@ async def create_video_task(message: VideoTaskRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/form", response_model=TaskResponse)
+@router.post(
+    "/form",
+    response_model=TaskResponse,
+    openapi_extra=form_request_openapi(
+        VideoTaskRequest,
+        image_file={"type": "string", "format": "binary"},
+        last_frame_file={"type": "string", "format": "binary"},
+        audio_file={"type": "string", "format": "binary"},
+    ),
+)
 async def create_video_task_form(
-    image_file: UploadFile = File(...),
+    request: Request,
+    image_file: UploadFile = File(None),
     last_frame_file: UploadFile = File(None),
-    prompt: str = Form(default=""),
-    save_result_path: str = Form(default=""),
-    negative_prompt: str = Form(default=""),
-    infer_steps: int = Form(default=5),
-    target_video_length: int = Form(default=81),
-    seed: int = Form(default=42),
     audio_file: UploadFile = File(None),
-    video_duration: int = Form(default=5),
-    target_fps: int = Form(default=16),
 ):
     services = get_services()
     assert services.file_service is not None, "File service is not initialized"
 
-    async def save_file_async(file: UploadFile, target_dir: Path) -> str:
-        if not file or not file.filename:
-            return ""
-
-        file_extension = Path(file.filename).suffix
-        unique_filename = f"{uuid.uuid4()}{file_extension}"
-        file_path = target_dir / unique_filename
-
-        content = await file.read()
-        await asyncio.to_thread(_write_file_sync, file_path, content)
-
-        return str(file_path)
-
-    image_path = ""
+    form = await request.form()
+    message = parse_form_request(VideoTaskRequest, {key: value for key, value in form.items() if key not in {"image_file", "last_frame_file", "audio_file"}})
     if image_file and image_file.filename:
-        image_path = await save_file_async(image_file, services.file_service.input_image_dir)
+        content = await image_file.read()
+        message.image_path = str(await asyncio.to_thread(services.file_service.save_uploaded_file, content, image_file.filename))
 
-    last_frame_path = ""
     if last_frame_file and last_frame_file.filename:
-        last_frame_path = await save_file_async(last_frame_file, services.file_service.input_image_dir)
+        content = await last_frame_file.read()
+        message.last_frame_path = str(await asyncio.to_thread(services.file_service.save_uploaded_file, content, last_frame_file.filename))
 
-    audio_path = ""
     if audio_file and audio_file.filename:
-        audio_path = await save_file_async(audio_file, services.file_service.input_audio_dir)
+        content = await audio_file.read()
+        message.audio_path = str(await asyncio.to_thread(services.file_service.save_uploaded_file, content, audio_file.filename, services.file_service.input_audio_dir))
 
-    message = VideoTaskRequest(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        last_frame_path=last_frame_path,
-        image_path=image_path,
-        save_result_path=save_result_path,
-        infer_steps=infer_steps,
-        target_video_length=target_video_length,
-        seed=seed,
-        audio_path=audio_path,
-        video_duration=video_duration,
-        target_fps=target_fps,
-    )
-
-    try:
-        task_id = task_manager.create_task(message)
-        message.task_id = task_id
-        logger.info(f"[latency-probe] task submitted task_id={task_id} pending={task_manager.get_pending_task_count()}")
-
-        return TaskResponse(
-            task_id=task_id,
-            task_status="pending",
-            save_result_path=message.save_result_path,
-        )
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Failed to create video form task: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return await create_video_task(message)

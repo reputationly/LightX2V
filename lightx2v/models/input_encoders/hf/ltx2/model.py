@@ -1,5 +1,4 @@
 import gc
-import os
 from pathlib import Path
 
 import torch
@@ -169,68 +168,29 @@ class LTX2TextEncoder:
         Returns:
             List of tuples, each containing (v_context, a_context) tensors for each prompt.
         """
-        gemma_on_cpu = os.environ.get("LTX_GEMMA_ON_CPU", "") == "1"
-        # cpu_offload keeps the 28.6GB (15.36B-param bf16) Gemma backbone resident on CPU
-        # and streams it to the GPU one submodule at a time for the (sub-second) text
-        # encode — see GemmaTextEncoder._run_text_model_layerwise_on_gpu. This is what
-        # makes v2a fit a 40GB card in a persistent server: the whole backbone on GPU
-        # peaks 38.85GB in gemma's forward alone and leaves no room for the DiT denoise,
-        # so it OOMs; streaming keeps only the module in flight resident, measured 3.96GB
-        # encode peak and 0.02GB retained once it returns. Transfers go through page-locked
-        # homes (pinned lazily on first stream) so each round trip is ~15-20 GB/s, not
-        # pageable ~2 GB/s. See docs/LTX2.3-纯配音V2A-设计文档.md.
-        layerwise = self.cpu_offload and not gemma_on_cpu
-        # Drive the encoder's per-submodule streaming from cpu_offload (env fallback keeps
-        # the offline precompute path working). Off when LTX_GEMMA_ON_CPU forces a full
-        # CPU run whose contexts are moved to GPU below.
-        self.text_encoder.pinned_layerwise = layerwise
-        try:
-            result = []
-            for prompt in prompts:
-                v_context, a_context, _ = self.text_encoder(prompt)
-                if gemma_on_cpu:
-                    v_context = v_context.to(AI_DEVICE)
-                    a_context = a_context.to(AI_DEVICE)
-                result.append((v_context, a_context))
-            return result
-        finally:
-            # A failed/OOM'd encode can strand the module it was mid-stream on (at most one
-            # ~1GB layer) on GPU. The persistent worker's failure cleanup clears the
-            # scheduler/cache but not the text encoder, so reclaim any stranded weights here
-            # to keep the worker from accumulating GPU memory across requests.
-            if layerwise:
-                self.text_encoder.restore_offloaded()
+        if self.cpu_offload:
+            self.text_encoder = self.text_encoder.to(AI_DEVICE)
+        result = []
+        for prompt in prompts:
+            v_context, a_context, _ = self.text_encoder(prompt)
+            result.append((v_context, a_context))
+        if self.cpu_offload:
+            self.text_encoder = self.text_encoder.to("cpu")
+        return result
 
     def infer(
         self,
         prompt: str,
-        negative_prompt: str = "",
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Infer text encoder outputs for prompt and negative prompt.
-
-        This is a convenience function that encodes both prompt and negative prompt,
-        and returns the video and audio contexts for both.
-
-        Args:
-            text_encoder: The Gemma text encoder instance.
-            prompt: Positive prompt string.
-            negative_prompt: Negative prompt string (default: empty string).
-
-        Returns:
-            Tuple containing:
-            - v_context_p: Video context for positive prompt
-            - a_context_p: Audio context for positive prompt
-            - v_context_n: Video context for negative prompt
-            - a_context_n: Audio context for negative prompt
-        """
-        contexts = self.encode_text(prompts=[prompt, negative_prompt])
-        context_p, context_n = contexts
-        v_context_p, a_context_p = context_p
-        v_context_n, a_context_n = context_n
+        negative_prompt: str | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        """Return positive and negative video/audio contexts; None skips negative encoding."""
+        prompts = [prompt] if negative_prompt is None else [prompt, negative_prompt]
+        contexts = self.encode_text(prompts=prompts)
+        v_context_p, a_context_p = contexts[0]
+        v_context_n, a_context_n = contexts[1] if negative_prompt is not None else (None, None)
         return v_context_p, a_context_p, v_context_n, a_context_n
 
-    def apply_lora(self, lora_configs):
+    def apply_lora(self, lora_configs, force_fp32=False):
         """
         Apply LoRA weights to text encoder's feature extractor.
 
@@ -238,6 +198,7 @@ class LTX2TextEncoder:
             lora_configs: List of LoRA configuration dicts, each containing:
                 - path: Path to LoRA safetensors file
                 - strength: LoRA strength (default: 1.0)
+            force_fp32: Merge in FP32, then restore the original weight dtype
 
         Returns:
             bool: True if LoRA was successfully applied, False otherwise
@@ -246,10 +207,6 @@ class LTX2TextEncoder:
             logger.warning("Text encoder does not have expected structure. Skipping LoRA application.")
             return False
 
-        # LoRA rebinds feature_extractor .weight tensors. Under pinned-layerwise streaming
-        # the page-lock lives on each tensor's own .data (not a side table), so the rebound
-        # post-LoRA weights simply arrive unpinned and _stream_to_gpu re-pins them on first
-        # use — no home invalidation needed here.
         encoder_model = self.text_encoder
 
         if not hasattr(encoder_model, "feature_extractor"):
@@ -272,6 +229,7 @@ class LTX2TextEncoder:
             (r"^text_embedding_projection\.", "feature_extractor."),
         ]
         lora_loader = LoRALoader(key_mapping_rules=key_mapping_rules)
+        lora_dtype = torch.float32 if force_fp32 else GET_DTYPE()
 
         for lora_config in lora_configs:
             lora_path = lora_config["path"]
@@ -284,13 +242,14 @@ class LTX2TextEncoder:
                 text_encoder_keys = [key for key in all_keys if key.startswith("text_embedding_projection.")]
 
                 # Only load the filtered keys
-                text_encoder_lora_weights = {key: f.get_tensor(key).to(GET_DTYPE()).to(self.device) for key in text_encoder_keys}
+                text_encoder_lora_weights = {key: f.get_tensor(key).to(lora_dtype).to(self.device) for key in text_encoder_keys}
 
             if text_encoder_lora_weights:
                 applied_count = lora_loader.apply_lora(
                     weight_dict=weight_dict,
                     lora_weights=text_encoder_lora_weights,
                     strength=lora_strength,
+                    force_fp32=force_fp32,
                 )
 
                 if applied_count > 0:

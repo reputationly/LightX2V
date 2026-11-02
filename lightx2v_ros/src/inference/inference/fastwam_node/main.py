@@ -6,7 +6,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Bool, Float32MultiArray, Int32, String
 
 from lightx2v.models.runners.wan.fastwam_runner import FastWAMPolicy
-from lightx2v.utils.set_config import auto_calc_config, get_default_config
+from lightx2v.utils.set_config import build_startup_config
 
 
 class FastWAMNode(Node):
@@ -16,15 +16,24 @@ class FastWAMNode(Node):
         self.declare_parameter("env", "libero")
         self.declare_parameter("config_json", "")
         self.declare_parameter("model_path", "")
+        self.declare_parameter("model_cls", "fastwam")
         self.declare_parameter("num_steps_wait", -1)
 
         env = str(self.get_parameter("env").value).strip().lower()
         self.contract = get_contract(env)
 
-        self.get_logger().info(f"[{self.contract.name}] loading FastWAM policy")
+        model_cls = str(self.get_parameter("model_cls").value)
+        if model_cls not in {"fastwam", "realtimewam"}:
+            raise ValueError("model_cls must be fastwam or realtimewam")
+        policy_class = FastWAMPolicy
+        if model_cls == "realtimewam":
+            from lightx2v.models.runners.wan.realtimewam_runner import RealtimeWAMPolicy
+
+            policy_class = RealtimeWAMPolicy
+        self.get_logger().info(f"[{self.contract.name}] loading {model_cls} policy")
         self.policy_config = self.build_policy_config()
-        self.policy = FastWAMPolicy.from_config(self.policy_config)
-        self.get_logger().info(f"[{self.contract.name}] FastWAM policy loaded")
+        self.policy = policy_class.from_config(self.policy_config)
+        self.get_logger().info(f"[{self.contract.name}] {model_cls} policy loaded")
 
         self.images = {cam: None for cam in self.contract.policy_input_cameras}
         self.state = None
@@ -59,16 +68,14 @@ class FastWAMNode(Node):
         model_path = str(self.get_parameter("model_path").value).strip()
         if not model_path:
             raise ValueError("FastWAM ROS node requires `model_path`.")
-        config = get_default_config()
-        config.update(
+        config = build_startup_config(
             {
-                "model_cls": "fastwam",
+                "model_cls": str(self.get_parameter("model_cls").value),
                 "task": "i2va",
                 "model_path": model_path,
                 "config_json": config_json,
             }
         )
-        config = auto_calc_config(config)
 
         # The config_json is authoritative for policy params; warn loudly on any
         # mismatch with the environment contract so dimension bugs surface early.

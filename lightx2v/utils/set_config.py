@@ -1,94 +1,117 @@
 import json
 import os
+from dataclasses import fields
 
 import torch
 import torch.distributed as dist
 from loguru import logger
 from torch.distributed.tensor.device_mesh import init_device_mesh
 
-from lightx2v.utils.input_info import ALL_INPUT_INFO_KEYS
+from lightx2v.utils.async_vae import normalize_async_vae_config
+from lightx2v.utils.input_info import align_num_frames
 from lightx2v.utils.lockable_dict import LockableDict
 from lightx2v.utils.utils import find_torch_model_path, is_main_process
 from lightx2v_platform.base.global_var import AI_DEVICE
 
+EDENLIVE_COMPONENT_FILES = {
+    "wan21_edenlive": {
+        "dit_original_ckpt": "dit-14b-bidir",
+        "vae_path": "vae-14b/Wan2.1_VAE.pth",
+        "clip_original_ckpt": "clip/image_encoder/model.safetensors",
+    },
+    "wan21_edenlive_ar": {
+        "dit_original_ckpt": "dit-14b",
+        "vae_path": "vae-14b/Wan2.1_VAE.pth",
+        "clip_original_ckpt": "clip/image_encoder/model.safetensors",
+    },
+    "wan22_edenlive": {
+        "dit_original_ckpt": "dit-5b-bidir",
+        "vae_path": "vae-5b/Wan2.2_VAE.pth",
+    },
+    "wan22_edenlive_ar": {
+        "dit_original_ckpt": "dit-5b",
+        "vae_path": "vae-5b/Wan2.2_VAE.pth",
+    },
+}
+
 
 def get_default_config():
-    default_config = {
-        "do_mm_calib": False,
-        "cpu_offload": False,
-        "max_area": False,
-        "vae_stride": (4, 8, 8),
-        "patch_size": (1, 2, 2),
-        "feature_caching": "NoCaching",  # ["NoCaching", "TaylorSeer", "Tea"]
-        "teacache_thresh": 0.26,
-        "use_ret_steps": False,
-        "use_bfloat16": True,
-        "lora_configs": None,  # List of dicts with 'path' and 'strength' keys
-        "parallel": False,
-        "seq_parallel": False,
-        "cfg_parallel": False,
-        "enable_cfg": False,
-        "warmup": False,
-        "use_image_encoder": True,
-    }
-    default_config = LockableDict(default_config)
-    return default_config
-
-
-def validate_model_task_args(args):
-    """Validate model/task combinations before assembling the runtime config."""
-    task = getattr(args, "task", None)
-    model_cls = getattr(args, "model_cls", None)
-    has_omni_vision_subtask = hasattr(args, "omni_vision_subtask")
-    omni_vision_subtask = getattr(args, "omni_vision_subtask", None)
-
-    if task == "omni_vision_task":
-        if model_cls != "sensenova_vision":
-            raise ValueError("--task omni_vision_task requires --model_cls sensenova_vision")
-        # Offline inference exposes this argument and must select one subtask.
-        # The resident server omits it because each request chooses a subtask
-        # after the complete model has been loaded.
-        if has_omni_vision_subtask and not omni_vision_subtask:
-            raise ValueError("--omni_vision_subtask is required when --task omni_vision_task")
-    else:
-        if model_cls == "sensenova_vision":
-            raise ValueError("--model_cls sensenova_vision requires --task omni_vision_task")
-        if omni_vision_subtask:
-            raise ValueError("--omni_vision_subtask is only valid with --task omni_vision_task")
-
-
-def set_args2config(args):
-    config = get_default_config()
-    config.update({k: v for k, v in vars(args).items() if k not in ALL_INPUT_INFO_KEYS and v is not None})
-
-    # Snapshot worldmirror-specific CLI flags so they can win over JSON
-    # defaults after auto_calc_config merges the JSON in. See the
-    # ``worldmirror`` branch of ``auto_calc_config`` for the replay logic.
-    _wm_cli_keys = (
-        "subfolder",
-        "disable_heads",
-        "enable_bf16",
-        "save_rendered",
-        "render_interp_per_pair",
-        "render_depth",
-        "wm_config_path",
-        "wm_ckpt_path",
+    return LockableDict(
+        {
+            "do_mm_calib": False,
+            "cpu_offload": False,
+            "cpu_offload_numa": False,
+            "shared_cpu_weights": False,
+            "shared_cpu_weight_scope": "auto",
+            "shared_cpu_weight_strict_numa": True,
+            "shared_cpu_weight_register_chunk_mb": 128,
+            "max_area": False,
+            "vae_stride": (4, 8, 8),
+            "patch_size": (1, 2, 2),
+            "feature_caching": "NoCaching",  # ["NoCaching", "TaylorSeer", "Tea"]
+            "teacache_thresh": 0.26,
+            "use_ret_steps": False,
+            "use_bfloat16": True,
+            "lora_configs": None,  # List of dicts with 'path' and 'strength' keys
+            "lora_merge_force_fp32": False,
+            "parallel": False,
+            "seq_parallel": False,
+            "cfg_parallel": False,
+            "pipefusion_parallel": False,
+            "enable_cfg": False,
+            "warmup": False,
+            "use_image_encoder": True,
+        }
     )
-    config["_wm_cli_snapshot"] = {k: getattr(args, k, None) for k in _wm_cli_keys if hasattr(args, k)}
+
+
+def build_startup_config(config_data):
+    """Assemble startup settings from deployment and model configs."""
+    deployment_config = dict(config_data)
+    if deployment_config.get("config_json") is not None:
+        logger.info(f"Loading some config from {deployment_config['config_json']}")
+        with open(deployment_config["config_json"], "r") as f:
+            config_json = json.load(f)
+        deployment_config.update(config_json)
+    deployment_config["task"] = config_data.get("task")
+    if config_data.get("model_variant") is not None:
+        deployment_config["model_variant"] = config_data["model_variant"]
+    if config_data.get("fps") is not None:
+        deployment_config["fps"] = config_data["fps"]
+
+    model_config = load_model_config(deployment_config)
+    config = get_default_config()
+    config.update(model_config)
+    config.update(deployment_config)
+    normalize_startup_config(config, model_config)
+    configure_nccl_graph(config)
     return config
 
 
-def auto_calc_config(config):
-    cli_num_iterations = config.get("num_iterations", None)
-    if config.get("config_json", None) is not None:
-        logger.info(f"Loading some config from {config['config_json']}")
-        with open(config["config_json"], "r") as f:
-            config_json = json.load(f)
-        config.update(config_json)
-        if cli_num_iterations is not None:
-            config["num_iterations"] = cli_num_iterations
+def configure_nccl_graph(config):
+    """Configure Ulysses graph communication before creating process groups."""
+    parallel = config.get("parallel") or {}
+    if AI_DEVICE != "cuda" or not config.get("use_cuda_graph", False) or parallel.get("seq_p_size", 1) <= 1 or parallel.get("seq_p_attn_type", "ulysses") != "ulysses":
+        return
 
-    if config.get("model_cls") == "ltx2_5":
+    # Older NCCL reuses incomplete IPC mappings for cuMem-backed buffer views.
+    # https://github.com/pytorch/torchtitan/pull/5393
+    # https://github.com/NVIDIA/nccl/pull/2362
+    nccl_version = torch.cuda.nccl.version()
+    if nccl_version < (2, 32, 3) and os.environ.get("NCCL_GRAPH_REGISTER") != "0":
+        logger.warning(
+            f"NCCL {'.'.join(map(str, nccl_version))} has an IPC registration bug with Ulysses CUDA Graphs; "
+            "setting NCCL_GRAPH_REGISTER=0. Graph and compile remain enabled. NCCL 2.32.3 fixes this issue."
+        )
+        os.environ["NCCL_GRAPH_REGISTER"] = "0"
+
+
+def load_model_config(deployment_config):
+    """Read checkpoint defaults and resolve component paths."""
+    model_path = deployment_config["model_path"]
+    model_cls = deployment_config["model_cls"]
+    model_config = {}
+    if model_cls == "ltx2_5":
         # Match Wan's checkpoint lookup contract: an explicit component path
         # wins; otherwise find the released filename below --model_path.
         component_files = {
@@ -96,17 +119,18 @@ def auto_calc_config(config):
             "text_encoder_original_ckpt": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
             "video_vae_original_ckpt": "vae/ltx-2.5-video-vae-bf16.safetensors",
             "audio_vae_original_ckpt": "vae/ltx-2.5-audio-vae-bf16.safetensors",
-            "duration_head_original_ckpt": "model_patches/ltx-2.5-duration-head-bf16.safetensors",
             "upsampler_original_ckpt": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
         }
+        if deployment_config.get("auto_duration", True):
+            component_files["duration_head_original_ckpt"] = "model_patches/ltx-2.5-duration-head-bf16.safetensors"
         for key, filename in component_files.items():
-            config[key] = find_torch_model_path(config, key, filename, subdir=[])
+            model_config[key] = find_torch_model_path(deployment_config, key, filename, subdir=[])
 
         # The release root has no config.json; the authoritative transformer
         # architecture is embedded in the safetensors metadata.  Merge it in
         # just like the directory-based LTX-2 loader does, while retaining
         # LightX2V's rope implementation selector.
-        transformer_path = config.get("dit_original_ckpt")
+        transformer_path = model_config["dit_original_ckpt"]
         if transformer_path and os.path.isfile(transformer_path):
             try:
                 from safetensors import safe_open
@@ -116,208 +140,152 @@ def auto_calc_config(config):
                 checkpoint_config = json.loads(metadata.get("config", "{}"))
                 transformer_config = dict(checkpoint_config.get("transformer", {}))
                 transformer_config.pop("rope_type", None)
-                config.update(transformer_config)
-                config["ltx_model_version"] = metadata.get("model_version", "")
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                model_config.update(transformer_config)
+                model_config["ltx_model_version"] = metadata.get("model_version", "")
+            except (OSError, ValueError, TypeError) as exc:
                 raise ValueError(f"Failed to read LTX-2.5 transformer metadata from {transformer_path}: {exc}") from exc
 
-    assert os.path.exists(config["model_path"]), f"Model path not found: {config['model_path']}"
+    assert os.path.exists(model_path), f"Model path not found: {model_path}"
 
-    if config["model_cls"] == "hunyuan_video_1.5":  # Special config for hunyuan video 1.5 model folder structure
-        config["transformer_model_path"] = os.path.join(config["model_path"], "transformer", config["transformer_model_name"])  # transformer_model_name: [480p_t2v, 480p_i2v, 720p_t2v, 720p_i2v]
-        if os.path.exists(os.path.join(config["transformer_model_path"], "config.json")):
-            with open(os.path.join(config["transformer_model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-    elif config["model_cls"] in ["worldplay_distill", "worldplay_ar", "worldplay_bi"]:  # Special config for WorldPlay models
-        config["transformer_model_path"] = os.path.join(config["model_path"], "transformer", config["transformer_model_name"])
-        if os.path.exists(os.path.join(config["transformer_model_path"], "config.json")):
-            with open(os.path.join(config["transformer_model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-    elif config["model_cls"] == "hunyuan3d":
-        # Hunyuan3D shape loads hunyuan3d-dit-v2-1/config.yaml + checkpoint in the runner.
+    if model_cls == "matrix_game4":
+        with open(os.path.join(model_path, "release-config.json"), "r") as f:
+            release = json.load(f)
+        variant = deployment_config.get("model_variant", "castle")
+        if variant not in release["scenes"]:
+            raise ValueError(f"Unknown Matrix-Game-4 model_variant {variant!r}; choose from {tuple(release['scenes'])}")
+        model_config.update(release["architecture"]["dit_config"])
+        model_config.update(model_variant=variant, num_channels_latents=model_config["out_dim"], vae_stride=[4, 16, 16])
+        component_files = {
+            "dit_original_ckpt": f"models/{variant}/model.safetensors",
+            "t5_original_ckpt": "base/models_t5_umt5-xxl-enc-bf16.pth",
+            "t5_tokenizer_path": "base/google/umt5-xxl",
+            "vae_path": "base/Wan2.2_VAE.pth",
+            "tae_path": "base/taew2_2.pth",
+        }
+        for key, filename in component_files.items():
+            model_config[key] = deployment_config.get(key, os.path.join(model_path, filename))
+    elif model_cls in EDENLIVE_COMPONENT_FILES:
+        component_files = {
+            "t5_original_ckpt": "umt5/text_encoder/model.safetensors",
+            "t5_tokenizer_path": "umt5/tokenizer",
+            **EDENLIVE_COMPONENT_FILES[model_cls],
+        }
+        for key, filename in component_files.items():
+            model_config[key] = deployment_config.get(key, os.path.join(model_path, filename))
+        dit_path = model_config["dit_original_ckpt"]
+        dit_dir = dit_path if os.path.isdir(dit_path) else os.path.dirname(dit_path)
+        with open(os.path.join(dit_dir, "config.json"), "r") as f:
+            checkpoint_config = json.load(f)
+        model_config.update(checkpoint_config)
+        model_config.setdefault("text_len", 512)
+        model_config.setdefault("rope_type", "flashinfer_rope")
+        model_config.setdefault("modulate_type", "triton")
+        model_config.update(
+            dim=checkpoint_config["num_attention_heads"] * checkpoint_config["attention_head_dim"],
+            num_heads=checkpoint_config["num_attention_heads"],
+            # Released configs record the base input width, excluding the trained proxy channels.
+            in_dim=checkpoint_config["in_channels"] + 1024,
+            out_dim=checkpoint_config["out_channels"],
+            num_channels_latents=checkpoint_config["out_channels"],
+        )
+        vae_config_path = os.path.join(os.path.dirname(model_config["vae_path"]), "config.json")
+        with open(vae_config_path, "r") as f:
+            vae_config = json.load(f)
+        temporal_scale = vae_config.get("scale_factor_temporal", 2 ** sum(vae_config["temperal_downsample"]))
+        spatial_scale = vae_config.get("scale_factor_spatial", 2 ** (len(vae_config["dim_mult"]) - 1) * vae_config.get("patch_size", 1))
+        model_config["vae_stride"] = [temporal_scale, spatial_scale, spatial_scale]
+    elif model_cls in {"hunyuan_video_1.5", "worldplay_distill", "worldplay_ar", "worldplay_bi"}:
+        transformer_path = os.path.join(model_path, "transformer", deployment_config["transformer_model_name"])
+        model_config["transformer_model_path"] = transformer_path
+        if os.path.exists(os.path.join(transformer_path, "config.json")):
+            with open(os.path.join(transformer_path, "config.json"), "r") as f:
+                model_config.update(json.load(f))
+    elif model_cls in {"hunyuan3d", "hidream_o1_image", "streamrender_h3"}:
+        # These runners load their own model configuration.
         pass
-    elif config["model_cls"] == "hidream_o1_image":
-        pass
-    elif config["model_cls"] == "sensenova_vision":
-        llm_config_path = os.path.join(config["model_path"], "llm_config.json")
-        vit_config_path = os.path.join(config["model_path"], "vit_config.json")
-        missing = [path for path in (llm_config_path, vit_config_path) if not os.path.isfile(path)]
-        if missing:
-            raise FileNotFoundError(f"SenseNova-Vision model_path must contain llm_config.json and vit_config.json; missing: {missing}")
-        with open(llm_config_path, "r") as f:
-            config["llm_config"] = json.load(f)
-        with open(vit_config_path, "r") as f:
-            config["vit_config"] = json.load(f)
-
-        # SenseNova's root config.json is project metadata, not a Bagel model
-        # config. Assemble the shared Bagel structure explicitly instead.
-        config["vae_config"] = {"z_channels": 16, "downsample": 8}
-        config["visual_gen"] = True
-        config["visual_und"] = True
-        config["latent_patch_size"] = 2
-        config["max_latent_size_update"] = 64
-        config["vit_max_num_patch_per_side"] = 70
-        config["connector_act"] = "gelu_pytorch_tanh"
-        config["interpolate_pos"] = False
-        config["enable_vision_context"] = True
-        sensenova_source_path = os.getenv("SENSENOVA_SOURCE_PATH", "").strip()
-        if sensenova_source_path:
-            config["sensenova_source_path"] = sensenova_source_path
-    elif config["model_cls"] == "wan2.2_s2v":
-        config_path = os.path.join(config["model_path"], "config.json")
+    elif model_cls == "wan2.2_s2v":
+        config_path = os.path.join(model_path, "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        config.setdefault("text_dim", 4096)
-        config.setdefault("patch_size", (1, 2, 2))
-        config.setdefault("window_size", (-1, -1))
-        config.setdefault("qk_norm", True)
-        config.setdefault("cross_attn_norm", True)
-    elif config["model_cls"] == "worldmirror":
+                model_config.update(json.load(f))
+        model_config.setdefault("text_dim", 4096)
+        model_config.setdefault("patch_size", (1, 2, 2))
+        model_config.setdefault("window_size", (-1, -1))
+        model_config.setdefault("qk_norm", True)
+        model_config.setdefault("cross_attn_norm", True)
+    elif model_cls == "worldmirror":
         # WorldMirror weights live under {model_path}/{subfolder}/, with a config.json
         # alongside model.safetensors. The runner loads this config directly; here we
         # only expose the resolved transformer path for logging.
-        subfolder = config.get("subfolder", "HY-WorldMirror-2.0")
-        candidate = os.path.join(config["model_path"], subfolder)
+        subfolder = deployment_config.get("subfolder", "HY-WorldMirror-2.0")
+        candidate = os.path.join(model_path, subfolder)
         if os.path.isdir(candidate):
-            config["transformer_model_path"] = candidate
+            model_config["transformer_model_path"] = candidate
         else:
-            config["transformer_model_path"] = config["model_path"]
-
-        # Re-apply worldmirror-specific CLI overrides. ``auto_calc_config`` just
-        # finished merging the JSON, which will have clobbered any store_true /
-        # default-bearing CLI flags that the user set on the command line. We
-        # pull those specific keys back from the original args snapshot so that
-        # ``--enable_bf16`` / ``--save_rendered`` / ``--disable_heads`` etc.
-        # always win over JSON defaults.
-        #
-        # Caveat: ``argparse``'s ``store_true`` flags look the same (value
-        # ``False``) whether the user omitted them or explicitly wants False,
-        # so we only treat non-False, non-None values as explicit overrides.
-        # This matches the documented "CLI overrides JSON-true is not possible
-        # without a dedicated --no_xxx flag" behaviour.
-        _cli_snapshot = config.pop("_wm_cli_snapshot", None)
-        if isinstance(_cli_snapshot, dict):
-            for k, v in _cli_snapshot.items():
-                if v is None or v is False:
-                    continue
-                config[k] = v
-            # Translate the ``--wm_config_path`` / ``--wm_ckpt_path`` CLI
-            # aliases to the runner-visible keys, and don't leave the
-            # aliases lying around in the printed/locked config.
-            wm_config = config.pop("wm_config_path", None)
-            wm_ckpt = config.pop("wm_ckpt_path", None)
-            if wm_config:
-                config["config_path"] = wm_config
-            if wm_ckpt:
-                config["ckpt_path"] = wm_ckpt
-    elif config["model_cls"] == "dreamzero":
-        config_path = os.path.join(config["model_path"], "config.json")
+            model_config["transformer_model_path"] = model_path
+    elif model_cls == "dreamzero":
+        config_path = os.path.join(model_path, "config.json")
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-            action_head_config = model_config.get("action_head_cfg", {}).get("config", {})
+                checkpoint_config = json.load(f)
+            model_config.update(checkpoint_config)
+            action_head_config = checkpoint_config.get("action_head_cfg", {}).get("config", {})
             diffusion_model_config = action_head_config.get("diffusion_model_cfg", {})
-            config.update(action_head_config)
-            config.update(diffusion_model_config)
-            if "num_frames" in config:
-                config["target_video_length"] = config["num_frames"]
-            if "out_dim" in config:
-                config["num_channels_latents"] = config["out_dim"]
-    elif config["model_cls"] == "longcat_image":  # Special config for longcat_image: load both root and transformer config
-        if os.path.exists(os.path.join(config["model_path"], "config.json")):
-            with open(os.path.join(config["model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        if os.path.exists(os.path.join(config["model_path"], "transformer", "config.json")):
-            with open(os.path.join(config["model_path"], "transformer", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-    elif config["model_cls"] == "cosmos3":
-        transformer_config_path = os.path.join(config["model_path"], "transformer", "config.json")
+            model_config.update(action_head_config)
+            model_config.update(diffusion_model_config)
+    elif model_cls == "longcat_image":
+        for subfolder in ("", "transformer"):
+            config_path = os.path.join(model_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    model_config.update(json.load(f))
+    elif model_cls in {"cosmos3", "lingbot_video"}:
+        transformer_config_path = os.path.join(model_path, "transformer", "config.json")
         if os.path.exists(transformer_config_path):
             with open(transformer_config_path, "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        config.setdefault("target_video_length", 1)
-        config.setdefault("target_fps", config.get("base_fps", 24))
-        config.setdefault("enable_cfg", True)
-    elif config["model_cls"] == "lingbot_video":
-        transformer_config_path = os.path.join(config["model_path"], "transformer", "config.json")
-        if os.path.exists(transformer_config_path):
-            with open(transformer_config_path, "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        config.setdefault("target_video_length", 1)
-        config.setdefault("target_fps", 24)
-        config.setdefault("enable_cfg", True)
-        config.setdefault("vae_stride", (4, 8, 8))
-        config.setdefault("vae_scale_factor_spatial", 8)
-        config.setdefault("vae_scale_factor_temporal", 4)
-        config.setdefault("vae_scale_factor", 8)
-    elif config["model_cls"] == "minimax_h3":
-        supported_tasks = {"t2av", "i2av", "l2av", "fl2av", "ref2av"}
-        task = config.get("task")
-        if task not in supported_tasks:
-            raise ValueError(f"MiniMax-H3 supports {sorted(supported_tasks)}, got {task!r}")
-        transformer_subfolder = "transformer_ref" if task == "ref2av" else "transformer"
-        transformer_path = os.path.join(config["model_path"], transformer_subfolder)
+                model_config.update(json.load(f))
+    elif model_cls in ("minimax_h3", "minimax_h3_causal", "taomate_h3"):
+        causal = model_cls == "minimax_h3_causal"
+        if causal:
+            if deployment_config.get("task") != "refa2v":
+                raise ValueError("MiniMax-H3 causal currently supports task='refa2v'; set --task refa2v when starting the model")
+            if not deployment_config.get("dit_original_ckpt"):
+                raise ValueError("MiniMax-H3 causal inference requires dit_original_ckpt pointing to the causal checkpoint")
+            transformer_subfolder = "transformer_ref"
+        else:
+            model_variant = deployment_config.get("model_variant")
+            if model_variant not in ("fl2av", "ref2av"):
+                raise ValueError("MiniMax-H3 requires model_variant='fl2av' or 'ref2av'; set --model-variant when starting the model")
+            if model_cls == "taomate_h3" and model_variant != "fl2av":
+                raise ValueError("TaoMate-H3 Stage3 requires the FL2VA base partition")
+            transformer_subfolder = "transformer_ref" if model_variant == "ref2av" else "transformer"
+        transformer_path = os.path.join(model_path, transformer_subfolder)
         transformer_config_path = os.path.join(transformer_path, "config.json")
         if not os.path.isfile(transformer_config_path):
             raise FileNotFoundError(f"MiniMax-H3 transformer config not found: {transformer_config_path}")
         with open(transformer_config_path, "r") as f:
-            model_config = json.load(f)
-        config.update(model_config)
-        config["dit_original_ckpt"] = transformer_path
-        if config.get("dit_quantized_ckpt"):
-            config["dit_quantized"] = True
-            config["dit_quant_scheme"] = {
-                "fp8": "fp8-q8f",
-                "int8": "int8-q8f",
-            }.get(config.get("dit_quant_scheme"), config.get("dit_quant_scheme", "Default"))
-        config["enable_cfg"] = False
-        config["fps"] = 24
-        config["vae_spatial_scale_factor"] = 16
-        config["vae_scale_factor"] = 16
-        config.setdefault("video_flow_shift", 12.0)
-        config.setdefault("audio_flow_shift", 3.0)
-        config.setdefault("audio_sampling_rate", 32000)
+            model_config.update(json.load(f))
+        if not causal:
+            model_config["dit_original_ckpt"] = transformer_path
+        model_config.setdefault("fps", 24)
+        model_config.setdefault("video_flow_shift", 12.0)
+        model_config.setdefault("audio_flow_shift", 3.0)
+        model_config.setdefault("audio_sampling_rate", 32000)
     else:
-        if os.path.exists(os.path.join(config["model_path"], "config.json")):
-            with open(os.path.join(config["model_path"], "config.json"), "r") as f:
-                model_config = json.load(f)
-            if config["model_cls"] in ["ltx2", "ltx2_ar", "ltx2_5"]:
-                # LTX uses rope_type for the layout ("split"), while LightX2V
-                # uses it to select a registered RoPE implementation.
-                model_config.pop("rope_type", None)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "low_noise_model", "config.json")):  # 需要一个更优雅的update方法
-            with open(os.path.join(config["model_path"], "low_noise_model", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "distill_models", "low_noise_model", "config.json")):  # 需要一个更优雅的update方法
-            with open(os.path.join(config["model_path"], "distill_models", "low_noise_model", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "original", "config.json")):
-            with open(os.path.join(config["model_path"], "original", "config.json"), "r") as f:
-                model_config = json.load(f)
-            config.update(model_config)
-        elif os.path.exists(os.path.join(config["model_path"], "transformer", "config.json")):
-            with open(os.path.join(config["model_path"], "transformer", "config.json"), "r") as f:
-                model_config = json.load(f)
-            if config["model_cls"] in ["ltx2", "ltx2_ar", "ltx2_5"]:
-                # Upstream LTX2 uses rope_type for the layout name ("split"),
-                # while LightX2V uses it as the registered RoPE implementation.
-                model_config.pop("rope_type", None)
-            elif config["model_cls"] == "z_image":
+        for subfolder in ("", "low_noise_model", "distill_models/low_noise_model", "original", "transformer"):
+            config_path = os.path.join(model_path, subfolder, "config.json")
+            if not os.path.exists(config_path):
+                continue
+            with open(config_path, "r") as f:
+                checkpoint_config = json.load(f)
+            if model_cls in {"ltx2", "ltx2_5"} and subfolder in ("", "transformer"):
+                # LTX uses rope_type for the layout, while LightX2V uses it
+                # to select a registered RoPE implementation.
+                checkpoint_config.pop("rope_type", None)
+            elif model_cls == "z_image" and subfolder == "transformer":
                 # https://huggingface.co/Tongyi-MAI/Z-Image-Turbo/blob/main/transformer/config.json
-                z_image_patch_size = model_config.pop("all_patch_size", [2])
-                z_image_f_patch_size = model_config.pop("all_f_patch_size", [1])
+                z_image_patch_size = checkpoint_config.pop("all_patch_size", [2])
+                z_image_f_patch_size = checkpoint_config.pop("all_f_patch_size", [1])
                 if not (len(z_image_patch_size) == 1 and len(z_image_f_patch_size) == 1):
                     raise ValueError(
                         f"Expected 'all_patch_size' and 'all_f_patch_size' in z_image config to be lists of length 1, "
@@ -326,17 +294,70 @@ def auto_calc_config(config):
                         f"implementation matches the new configs then update this check."
                     )
 
-                model_config["patch_size"] = z_image_patch_size[0]
-                model_config["f_patch_size"] = z_image_f_patch_size[0]
+                checkpoint_config["patch_size"] = z_image_patch_size[0]
+                checkpoint_config["f_patch_size"] = z_image_f_patch_size[0]
 
-            config.update(model_config)
+            model_config.update(checkpoint_config)
+            break
         # load quantized config
-        if config.get("dit_quantized_ckpt", None) is not None:
-            config_path = os.path.join(config["dit_quantized_ckpt"], "config.json")
+        if deployment_config.get("dit_quantized_ckpt") is not None:
+            config_path = os.path.join(deployment_config["dit_quantized_ckpt"], "config.json")
             if os.path.exists(config_path):
                 with open(config_path, "r") as f:
-                    model_config = json.load(f)
-                config.update(model_config)
+                    model_config.update(json.load(f))
+
+    vae_config_path = os.path.join(model_path, "vae", "config.json")
+    if os.path.exists(vae_config_path):
+        with open(vae_config_path, "r") as f:
+            vae_config = json.load(f)
+        if "temperal_downsample" in vae_config:
+            model_config["vae_scale_factor"] = 2 ** len(vae_config["temperal_downsample"])
+        elif "block_out_channels" in vae_config:
+            model_config["vae_scale_factor"] = 2 ** (len(vae_config["block_out_channels"]) - 1)
+        if model_cls == "ernie_image":
+            model_config["vae_scale_factor"] = 2 ** len(vae_config["block_out_channels"])
+        elif model_cls == "cosmos3":
+            model_config["vae_scale_factor_spatial"] = int(vae_config.get("scale_factor_spatial", 16))
+            model_config["vae_scale_factor_temporal"] = int(vae_config.get("scale_factor_temporal", 4))
+            model_config["vae_scale_factor"] = model_config["vae_scale_factor_spatial"]
+
+    if model_cls in ("minimax_h3", "minimax_h3_causal", "taomate_h3", "streamrender_h3"):
+        # The generic Diffusers-VAE heuristic above counts six encoder stages
+        # and would incorrectly derive 32. H3 downsamples space by exactly 16.
+        model_config["vae_spatial_scale_factor"] = 16
+        model_config["vae_scale_factor"] = 16
+    if model_cls == "cosmos3" and os.path.exists(os.path.join(model_path, "sound_tokenizer", "config.json")):
+        with open(os.path.join(model_path, "sound_tokenizer", "config.json"), "r") as f:
+            sound_config = json.load(f)
+        model_config["sound_sampling_rate"] = int(sound_config.get("sampling_rate", 48000))
+        model_config["sound_hop_size"] = int(sound_config.get("hop_size", 1920))
+    return model_config
+
+
+def normalize_startup_config(config, model_config):
+    """Normalize merged startup settings and validate inference constraints."""
+    normalize_async_vae_config(config)
+    if config["model_cls"] == "dreamzero" and "out_dim" in config:
+        config["num_channels_latents"] = config["out_dim"]
+    if config["model_cls"] in {"cosmos3", "lingbot_video"}:
+        config.setdefault("num_frames", 1)
+        config.setdefault("fps", config.get("base_fps", 24) if config["model_cls"] == "cosmos3" else 24)
+    if config["model_cls"] == "lingbot_video":
+        config["vae_scale_factor_spatial"] = int(config.get("vae_scale_factor_spatial", 8))
+        config["vae_scale_factor_temporal"] = int(config.get("vae_scale_factor_temporal", 4))
+        config["vae_scale_factor"] = config["vae_scale_factor_spatial"]
+    if config["model_cls"] in ("minimax_h3", "minimax_h3_causal", "taomate_h3", "streamrender_h3"):
+        if config.get("fps", 24) != 24:
+            raise ValueError(f"MiniMax-H3 requires fps=24 to keep video and audio timing aligned; got {config['fps']!r}")
+        config.setdefault("fps", 24)
+        if config["model_cls"] in ("minimax_h3", "minimax_h3_causal", "taomate_h3"):
+            config.pop("model_variant" if config["model_cls"] == "minimax_h3_causal" else "task", None)
+        if config.get("dit_quantized_ckpt"):
+            config["dit_quantized"] = True
+            config["dit_quant_scheme"] = {
+                "fp8": "fp8-q8f",
+                "int8": "int8-q8f",
+            }.get(config.get("dit_quant_scheme"), config.get("dit_quant_scheme", "Default"))
 
     # Some upstream/offical configs use `num_inference_steps`, while the shared
     # LightX2V scheduler stack expects `infer_steps`.
@@ -348,148 +369,160 @@ def auto_calc_config(config):
 
         normalize_hunyuan_image3_config(config)
 
-    if config["model_cls"] == "lingbot_va" and "target_video_length" not in config:
+    if config["model_cls"] == "lingbot_va" and "num_frames" not in config:
         ar_config = config.get("ar_config", {})
         required_keys = ("num_frame_per_chunk", "num_chunks")
         missing_keys = [key for key in required_keys if key not in ar_config]
         if missing_keys:
-            raise ValueError(f"LingBot-VA requires ar_config.{', ar_config.'.join(missing_keys)} to derive target_video_length.")
+            raise ValueError(f"LingBot-VA requires ar_config.{', ar_config.'.join(missing_keys)} to derive num_frames.")
         latent_frames = int(ar_config["num_frame_per_chunk"]) * int(ar_config["num_chunks"])
         temporal_stride = int(config["vae_stride"][0])
         if latent_frames <= 0 or temporal_stride <= 0:
             raise ValueError(f"LingBot-VA requires positive latent frame count and VAE temporal stride, got latent_frames={latent_frames}, temporal_stride={temporal_stride}.")
-        config["target_video_length"] = (latent_frames - 1) * temporal_stride + 1
-        logger.info(f"Auto-set LingBot-VA target_video_length={config['target_video_length']} from {latent_frames} latent frames and temporal stride {temporal_stride}.")
+        config["num_frames"] = (latent_frames - 1) * temporal_stride + 1
+        logger.info(f"Auto-set LingBot-VA num_frames={config['num_frames']} from {latent_frames} latent frames and temporal stride {temporal_stride}.")
+
+    if config["model_cls"] in ("ltx2", "ltx2_5"):
+        config["vae_stride"] = config["vae_scale_factors"]
 
     if (
-        config["model_cls"] != "minimax_h3"
-        and config["task"] in ["i2v", "t2av", "i2av", "i2va", "s2v", "rs2v", "ltx2_s2v", "v2av", "v2a"]
-        and "target_video_length" in config
+        config["model_cls"] not in ("minimax_h3", "minimax_h3_causal", "taomate_h3", "streamrender_h3")
+        and config["task"] in ["i2v", "t2av", "i2av", "i2va", "s2v", "rs2v", "ltx2_s2v", "v2av"]
+        and config.get("num_frames") is not None
         and "vae_stride" in config
     ):
-        if config["target_video_length"] % config["vae_stride"][0] != 1:
-            logger.warning(f"`num_frames - 1` has to be divisible by {config['vae_stride'][0]}. Rounding to the nearest number.")
-            config["target_video_length"] = config["target_video_length"] // config["vae_stride"][0] * config["vae_stride"][0] + 1
+        temporal_stride = int(config["vae_stride"][0])
+        if (config["num_frames"] - 1) % temporal_stride != 0:
+            original_length = config["num_frames"]
+            config["num_frames"] = align_num_frames(original_length, temporal_stride)
+            logger.warning(f"`num_frames - 1` must be divisible by {temporal_stride}; using {config['num_frames']} instead of {original_length}.")
 
-    # Load diffusers vae config
-    if os.path.exists(os.path.join(config["model_path"], "vae", "config.json")):
-        with open(os.path.join(config["model_path"], "vae", "config.json"), "r") as f:
-            vae_config = json.load(f)
-            if "temperal_downsample" in vae_config:
-                config["vae_scale_factor"] = 2 ** len(vae_config["temperal_downsample"])
-            elif "block_out_channels" in vae_config:
-                config["vae_scale_factor"] = 2 ** (len(vae_config["block_out_channels"]) - 1)
-            if config["model_cls"] == "ernie_image":
-                config["vae_scale_factor"] = 2 ** len(vae_config["block_out_channels"])
-
-    if config["model_cls"] == "cosmos3" and os.path.exists(os.path.join(config["model_path"], "vae", "config.json")):
-        with open(os.path.join(config["model_path"], "vae", "config.json"), "r") as f:
-            vae_config = json.load(f)
-        config["vae_scale_factor_spatial"] = int(vae_config.get("scale_factor_spatial", 16))
-        config["vae_scale_factor_temporal"] = int(vae_config.get("scale_factor_temporal", 4))
-        config["vae_scale_factor"] = config["vae_scale_factor_spatial"]
-    if config["model_cls"] == "lingbot_video":
-        config["vae_scale_factor_spatial"] = int(config.get("vae_scale_factor_spatial", 8))
-        config["vae_scale_factor_temporal"] = int(config.get("vae_scale_factor_temporal", 4))
-        config["vae_scale_factor"] = config["vae_scale_factor_spatial"]
-    if config["model_cls"] == "minimax_h3":
-        # The generic Diffusers-VAE heuristic above counts six encoder stages
-        # and would incorrectly derive 32. H3 downsamples space by exactly 16.
-        config["vae_spatial_scale_factor"] = 16
-        config["vae_scale_factor"] = 16
-    if config["model_cls"] == "cosmos3" and os.path.exists(os.path.join(config["model_path"], "sound_tokenizer", "config.json")):
-        with open(os.path.join(config["model_path"], "sound_tokenizer", "config.json"), "r") as f:
-            sound_config = json.load(f)
-        config["sound_sampling_rate"] = int(sound_config.get("sampling_rate", 48000))
-        config["sound_hop_size"] = int(sound_config.get("hop_size", 1920))
-
-    return config
+    if AI_DEVICE == "mps":
+        assert not any(config.get(key) for key in ("lora_configs", "lora_path", "lora_dynamic_apply", "lora_merge_force_fp32")), (
+            "MPS inference does not support LoRA configs, dynamic LoRA, or load-time LoRA merging. "
+            "Merge LoRA into the model weights offline before inference, remove the LoRA settings, and load the merged model checkpoint."
+        )
 
 
-def set_config(args):
-    validate_model_task_args(args)
-    config = set_args2config(args)
-    config = auto_calc_config(config)
-    return config
+def build_cli_inputs(args):
+    args_data = {key: value for key, value in vars(args).items() if value is not None}
+    startup_fields = {"config_json", "model_cls", "model_variant", "model_path", "task"}
+    startup_args = {key: value for key, value in args_data.items() if key in startup_fields}
+    request_data = {key: value for key, value in args_data.items() if key not in startup_fields}
+    request_data["task"] = args.task
+    startup_config = build_startup_config(startup_args)
+    return startup_config, request_data
 
 
-def set_parallel_config(config):
-    if config["parallel"]:
-        tensor_p_size = int(config["parallel"].get("tensor_p_size", 1))
-        cfg_p_size = int(config["parallel"].get("cfg_p_size", 1))
-        seq_p_size = int(config["parallel"].get("seq_p_size", 1))
-        seg_p_size = int(config["parallel"].get("seg_p_size", 1))
+def _validate_pipefusion_config(config):
+    """Reject unsupported PipeFusion combinations instead of silently misbehaving.
 
-        if seg_p_size > 1:
-            # 段并行(SeedVR SR):并行轴是「整段」,模型是复制的,不经过任何
-            # mesh-aware 的层 —— runner 直接和进程组打交道。与下面的
-            # tensor/seq/cfg mesh 互斥,而且是断言而非假定:这个分支根本不读
-            # cfg_p_size/seq_p_size,若从混合 profile 拷来的配置仍在 JSON 里
-            # 写着 2D mesh,它会照样启动成纯段并行 —— 实际拓扑和签入的配置
-            # 悄悄不一致。
-            assert tensor_p_size == 1 and cfg_p_size == 1 and seq_p_size == 1, (
-                f"seg_p_size ({seg_p_size}) is exclusive with the tensor/seq/cfg meshes, but got tensor_p_size={tensor_p_size}, cfg_p_size={cfg_p_size}, seq_p_size={seq_p_size}"
-            )
-            assert seg_p_size == dist.get_world_size(), f"seg_p_size ({seg_p_size}) must be equal to world_size ({dist.get_world_size()})"
-            config["tensor_parallel"] = False
-            config["seq_parallel"] = False
-            config["cfg_parallel"] = False
-            config["seg_parallel"] = True
-        else:
-            # 上游的 mesh 分支整体下移一级。世界大小校验必须留在这个 else 里:
-            # 段并行下 tensor*cfg*seq 恒为 1,而 world_size 是卡数,放在外面必炸。
-            world_size = dist.get_world_size()
-            expected_world_size = tensor_p_size * cfg_p_size * seq_p_size
-            if expected_world_size != world_size:
-                raise ValueError(
-                    f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) != world_size ({world_size})."
-                )
+    PipeFusion is currently a narrow feature: Flux2 Klein, T2I only, CUDA only,
+    no CFG, and no stacking with SP / TP / feature-caching / cpu-offload. The
+    pipeline driver only implements that slice; anything else must fail loudly
+    at config time rather than run incorrectly (e.g. dropping CFG) or crash.
+    """
+    model_cls = config.get("model_cls")
+    is_klein = model_cls == "flux2_klein" or (model_cls == "flux2" and config.get("model_variant") == "klein")
+    if not is_klein:
+        raise ValueError(
+            "PipeFusion is only supported for the Flux2 Klein model "
+            "(model_cls='flux2_klein', or model_cls='flux2' with model_variant='klein'); "
+            f"got model_cls={model_cls!r}, model_variant={config.get('model_variant')!r}."
+        )
+    if config.get("task", "t2i") != "t2i":
+        raise ValueError(f"PipeFusion currently supports only the 't2i' task, got {config.get('task', 't2i')!r}.")
+    if AI_DEVICE != "cuda":
+        raise ValueError(f"PipeFusion requires CUDA, but AI_DEVICE={AI_DEVICE!r}.")
+    if config.get("feature_caching", "NoCaching") not in ("NoCaching", "None"):
+        raise ValueError(f"PipeFusion cannot be combined with feature_caching={config.get('feature_caching')!r}.")
+    if config.get("cpu_offload", False):
+        raise ValueError("PipeFusion cannot be combined with cpu_offload.")
+    if config.get("unload_modules", False) or config.get("lazy_load", False):
+        raise ValueError("PipeFusion does not support unload_modules / lazy_load.")
+    if config.get("fls", {}).get("enable", False):
+        raise ValueError("PipeFusion cannot be combined with FLS enhancement (fls.enable).")
+    if config.get("enable_cfg", False) and config.get("sample_guide_scale", 1.0) > 1.0:
+        raise ValueError("PipeFusion does not support CFG; set sample_guide_scale <= 1.0 or enable_cfg=False.")
+    if config["parallel"].get("seq_p_size", 1) > 1:
+        raise ValueError("PipeFusion cannot be combined with sequence parallel (seq_p_size > 1).")
+    if config["parallel"].get("cfg_p_size", 1) > 1:
+        raise ValueError("PipeFusion cannot be combined with CFG parallel (cfg_p_size > 1).")
 
-            phase_aware = bool(config.get("model_cls") == "hunyuan_image3" and config["parallel"].get("phase_aware", False))
-            if phase_aware:
-                from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
-
-                initialize_hunyuan_image3_parallel_runtime(config)
-            elif tensor_p_size > 1:
-                # Tensor parallel is the innermost dimension. Optional CFG and
-                # sequence dimensions are prepended so ranks with the same
-                # non-TP coordinates form contiguous TP groups. For TP+SP+CFG:
-                #   mesh shape/names = [cfg_p, seq_p, tensor_p].
-                mesh_shape = []
-                mesh_dim_names = []
-                if cfg_p_size > 1:
-                    mesh_shape.append(cfg_p_size)
-                    mesh_dim_names.append("cfg_p")
-                if seq_p_size > 1:
-                    mesh_shape.append(seq_p_size)
-                    mesh_dim_names.append("seq_p")
-                mesh_shape.append(tensor_p_size)
-                mesh_dim_names.append("tensor_p")
-                config["device_mesh"] = init_device_mesh(
-                    AI_DEVICE,
-                    tuple(mesh_shape),
-                    mesh_dim_names=tuple(mesh_dim_names),
-                )
-                config["tensor_parallel"] = True
-                config["seq_parallel"] = seq_p_size > 1
-                config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
-            else:
-                # Original 2D mesh for cfg_p and seq_p
-                config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, seq_p_size), mesh_dim_names=("cfg_p", "seq_p"))
-                config["tensor_parallel"] = False
-                config["seq_parallel"] = seq_p_size > 1
-                config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
-
-        # warmup dist
-        if AI_DEVICE == "cuda":
-            warmup_device = f"{AI_DEVICE}:{torch.cuda.current_device()}"
-        else:
-            warmup_device = AI_DEVICE
-        _a = torch.zeros([1], device=warmup_device)
-        dist.all_reduce(_a)
+    num_patch = int(config["parallel"].get("num_pipeline_patch", 4))
+    if num_patch <= 0:
+        raise ValueError(f"num_pipeline_patch must be >= 1, got {num_patch}.")
+    warmup_steps = int(config["parallel"].get("pipeline_warmup_steps", 1))
+    if warmup_steps <= 0:
+        raise ValueError(f"pipeline_warmup_steps must be >= 1, got {warmup_steps}.")
 
 
-def print_config(config):
-    config_to_print = config.copy()
+def init_parallel(config):
+    """Create the model's parallel mesh and warm up its communication."""
+    parallel = config["parallel"]
+    if not parallel or config.get("model_cls") == "swiftvr":
+        # SwiftVR owns its chunk group and validates its parallel settings in the runner.
+        return
+
+    tensor_p_size = int(parallel.get("tensor_p_size", 1))
+    cfg_p_size = int(parallel.get("cfg_p_size", 1))
+    seq_p_size = int(parallel.get("seq_p_size", 1))
+    pp_size = int(parallel.get("pp_size", 1))
+    if cfg_p_size > 1 and not config.get("enable_cfg", False):
+        raise ValueError("parallel.cfg_p_size > 1 requires enable_cfg=true")
+    world_size = dist.get_world_size()
+    expected_world_size = tensor_p_size * cfg_p_size * seq_p_size * pp_size
+    if expected_world_size != world_size:
+        raise ValueError(
+            f"Parallel sizes must match the distributed world size: tensor_p_size ({tensor_p_size}) * cfg_p_size ({cfg_p_size}) * seq_p_size ({seq_p_size}) * pp_size ({pp_size}) != world_size ({world_size})."
+        )
+
+    if config.get("model_cls") == "hunyuan_image3" and parallel.get("phase_aware", False):
+        from lightx2v.models.networks.hunyuan_image3.parallel import initialize_hunyuan_image3_parallel_runtime
+
+        initialize_hunyuan_image3_parallel_runtime(config)
+        config["pipefusion_parallel"] = False
+    elif pp_size > 1:
+        if tensor_p_size > 1:
+            raise ValueError("PipeFusion pipeline parallelism cannot be combined with tensor parallelism")
+        # PipeFusion pipeline parallelism: 3D mesh (cfg_p, pp, seq_p).
+        config["device_mesh"] = init_device_mesh(AI_DEVICE, (cfg_p_size, pp_size, seq_p_size), mesh_dim_names=("cfg_p", "pp", "seq_p"))
+        config["tensor_parallel"] = False
+        config["seq_parallel"] = seq_p_size > 1
+        config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+        config["pipefusion_parallel"] = True
+        _validate_pipefusion_config(config)
+        from lightx2v.models.networks.flux2.infer.pipefusion import init_pipeline_parallel_state
+
+        pp_group = config["device_mesh"].get_group(mesh_dim="pp")
+        init_pipeline_parallel_state(pp_group)
+    else:
+        # Keep the original CFG/SP dimensions without TP. With TP, omit unit
+        # dimensions and place TP last so its ranks form contiguous groups.
+        mesh_dims = [("cfg_p", cfg_p_size), ("seq_p", seq_p_size)]
+        if tensor_p_size > 1:
+            mesh_dims = [(name, size) for name, size in mesh_dims if size > 1]
+            mesh_dims.append(("tensor_p", tensor_p_size))
+        config["device_mesh"] = init_device_mesh(
+            AI_DEVICE,
+            tuple(size for _, size in mesh_dims),
+            mesh_dim_names=tuple(name for name, _ in mesh_dims),
+        )
+        config["tensor_parallel"] = tensor_p_size > 1
+        config["seq_parallel"] = seq_p_size > 1
+        config["cfg_parallel"] = bool(config.get("enable_cfg", False) and cfg_p_size > 1)
+        config["pipefusion_parallel"] = False
+
+    warmup_device = f"cuda:{torch.cuda.current_device()}" if AI_DEVICE == "cuda" else AI_DEVICE
+    warmup_tensor = torch.zeros([1], device=warmup_device)
+    dist.all_reduce(warmup_tensor)
+
+
+def print_config(config, title="config"):
     if is_main_process():
-        logger.info(f"config:\n{json.dumps(config_to_print, ensure_ascii=False, indent=4, default=str)}")
+        logger.info(f"{title}:\n{json.dumps(config, ensure_ascii=False, indent=4, default=str)}")
+
+
+def print_request(input_info, supported_request_fields):
+    request = {input_field.name: getattr(input_info, input_field.name) for input_field in fields(input_info) if input_field.repr and input_field.name in supported_request_fields}
+    print_config(request, title="Effective request")

@@ -9,15 +9,13 @@ class HunyuanImage3Scheduler(BaseScheduler):
         scheduler_config = dict(config)
         scheduler_config["infer_steps"] = int(config.get("infer_steps") or config.get("diff_infer_steps", 50))
         super().__init__(scheduler_config)
-        self.sample_guide_scale = config.get("sample_guide_scale", config.get("diff_guidance_scale", 1.0))
         self.flow_shift = config.get("sample_shift", config.get("flow_shift", 1.0))
         self.timesteps = None
         self.sigmas = None
         self.noise_pred = None
 
     def prepare(self, input_info):
-        seed = getattr(input_info, "seed", None) or self.config.get("seed", 42)
-        self.generator = torch.Generator(device=AI_DEVICE).manual_seed(seed)
+        self.generator = torch.Generator(device=AI_DEVICE).manual_seed(input_info.seed)
 
     def set_timesteps(self, num_inference_steps=None, device=None):
         num_inference_steps = num_inference_steps or self.infer_steps

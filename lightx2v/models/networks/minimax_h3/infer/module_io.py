@@ -17,17 +17,18 @@ class MiniMaxH3SequenceParallelState:
 @dataclass
 class MiniMaxH3PreInferOutput:
     hidden_states: torch.Tensor
-    temb: torch.Tensor
+    temb: torch.Tensor | None
     timestep_indices: torch.Tensor
     adaln_indices: torch.Tensor
     rotary_emb: tuple[torch.Tensor, torch.Tensor]
     video_indices: torch.Tensor
     audio_indices: torch.Tensor
     text_indices: torch.Tensor
+    norm_out_modulation: torch.Tensor | None = None
     sequence_parallel_state: MiniMaxH3SequenceParallelState | None = None
 
 
 @dataclass
 class MiniMaxH3VelocityOutput:
-    video: torch.Tensor
-    audio: torch.Tensor
+    video: torch.Tensor | None
+    audio: torch.Tensor | None

@@ -1,7 +1,6 @@
 import torch
 import torch.distributed as dist
 
-from lightx2v.models.networks.wan.infer.offload.transformer_infer import WanOffloadTransformerInfer
 from lightx2v.models.networks.wan.infer.s2v.audio_inject import apply_audio_inject
 from lightx2v.models.networks.wan.infer.s2v.wan_ops import (
     cross_attn_forward,
@@ -94,25 +93,22 @@ class WanS2VTransformerInfer(WanTransformerInfer):
             k = wan_rms_norm(phase0.self_attn_norm_k, mm_weight_autocast_nd(phase0.self_attn_k, norm_x)).view(b, s, n, d)
             v = mm_weight_autocast_nd(phase0.self_attn_v, norm_x).view(b, s, n, d)
             q, k = phase0.s2v_rope.apply(q.float(), k.float(), freqs)
-            attn_out = (
-                phase0.self_attn_1_parallel.apply(
-                    q=q.squeeze(0).to(self.infer_dtype),
-                    k=k.squeeze(0).to(self.infer_dtype),
-                    v=v.squeeze(0).to(self.infer_dtype),
-                    slice_qkv_len=s,
-                    cu_seqlens_qkv=self.self_attn_cu_seqlens_qkv,
-                    attention_module=phase0.self_attn_1,
-                    seq_p_group=self.seq_p_group,
-                    use_fp8_comm=self.seq_p_fp8_comm,
-                    use_fp4_comm=self.seq_p_fp4_comm,
-                    use_tensor_fusion=self.seq_p_tensor_fusion,
-                    enable_head_parallel=self.enable_head_parallel,
-                    block_idx=self.block_idx,
-                    scheduler=self.scheduler,
-                )
-                .float()
-                .view(b, s, -1)
+            attn_out, aux_attn_out = phase0.self_attn_1_parallel.apply(
+                q=q.squeeze(0).to(self.infer_dtype),
+                k=k.squeeze(0).to(self.infer_dtype),
+                v=v.squeeze(0).to(self.infer_dtype),
+                attention_module=phase0.self_attn_1,
+                seq_p_group=self.seq_p_group,
+                prepost_backend=self.seq_p_prepost_backend,
+                a2a_backend=self.seq_p_a2a_backend,
+                quant_scheme=self.seq_p_quant_scheme,
+                tensor_fusion=self.seq_p_tensor_fusion,
+                head_parallel=self.seq_p_head_parallel,
+                attention_kwargs={"block_idx": self.block_idx, "scheduler": self.scheduler},
             )
+            if aux_attn_out is not None:
+                raise RuntimeError("Wan S2V self-attention does not have an auxiliary token output.")
+            attn_out = attn_out.float().view(b, s, -1)
             return mm_weight_autocast_nd(phase0.self_attn_o, attn_out)
 
         return s2v_self_attn_forward(phase0, norm_x, seq_lens, freqs, self.num_heads, self.head_dim)
@@ -150,45 +146,4 @@ class WanS2VTransformerInfer(WanTransformerInfer):
         with torch.amp.autocast(AI_DEVICE, dtype=torch.float32):
             y = segment_gate_bld(y, e[5], seg_idx)
             x = x + y
-        return x
-
-
-class WanS2VOffloadTransformerInfer(WanS2VTransformerInfer, WanOffloadTransformerInfer):
-    """Block-granularity cpu_offload for S2V.
-
-    Standard block weights (self_attn / cross_attn / ffn / modulation) rotate through the
-    offload manager's cuda double-buffers exactly like base Wan; the S2V-specific
-    audio_inject modules are small (a few hundred MB total) and are moved to GPU once and
-    kept resident, since the manager's buffers only mirror the standard block layout.
-    Only "block" (and trivially "model") offload granularity is supported.
-    """
-
-    def __init__(self, config):
-        super().__init__(config)
-        if config.get("cpu_offload", False) and config.get("offload_granularity", "block") == "phase":
-            raise NotImplementedError("S2V offload supports granularity 'block' or 'model', not 'phase'")
-
-    def infer_with_blocks_offload(self, blocks, x, pre_infer_out):
-        # Keep a handle on the real (source) blocks: audio_inject lives there, not in the
-        # rotating cuda buffers.
-        self._s2v_source_blocks = blocks
-        if not getattr(self, "_audio_inject_resident", False):
-            for layer_idx in self.injected_block_id:
-                inj = getattr(blocks[layer_idx], "audio_inject", None)
-                if inj is not None:
-                    inj.to_cuda()
-            self._audio_inject_resident = True
-        return super().infer_with_blocks_offload(blocks, x, pre_infer_out)
-
-    def infer_block(self, block, x, pre_infer_out):
-        # `block` is the manager's cuda buffer holding the current block's standard weights.
-        x = self.infer_s2v_block(block, x, pre_infer_out)
-        if self.block_idx in self.injected_block_id:
-            source_block = self._s2v_source_blocks[self.block_idx]
-            if self.config["seq_parallel"]:
-                x_full = self._gather_along_seq(x)
-                x_full = apply_audio_inject(source_block, x_full, pre_infer_out, self.config)
-                x = self._chunk_along_seq(x_full)
-            else:
-                x = apply_audio_inject(source_block, x, pre_infer_out, self.config)
         return x

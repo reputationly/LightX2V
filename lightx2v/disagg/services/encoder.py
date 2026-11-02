@@ -378,10 +378,6 @@ class EncoderService(BaseService):
         self._phase1_slots = shared_slots
         self._phase1_slot_size = shared_slot_size
 
-        # Seed everything if seed is in config
-        if "seed" in self.config:
-            seed_all(self.config["seed"])
-
         data_bootstrap_addr = self.config.get("data_bootstrap_addr", "127.0.0.1")
         data_bootstrap_room = self.config.get("data_bootstrap_room", 0)
 
@@ -443,7 +439,7 @@ class EncoderService(BaseService):
     def _get_latent_shape_with_lat_hw(self, latent_h, latent_w):
         return [
             self.config.get("num_channels_latents", 16),
-            (self.config["target_video_length"] - 1) // self.config["vae_stride"][0] + 1,
+            (self.config["num_frames"] - 1) // self.config["vae_stride"][0] + 1,
             latent_h,
             latent_w,
         ]
@@ -451,7 +447,7 @@ class EncoderService(BaseService):
     def _compute_latent_shape_from_image(self, image_tensor: torch.Tensor):
         h, w = image_tensor.shape[2:]
         aspect_ratio = h / w
-        max_area = self.config["target_height"] * self.config["target_width"]
+        max_area = self.config["size"][0] * self.config["size"][1]
 
         latent_h = round(np.sqrt(max_area * aspect_ratio) // self.config["vae_stride"][1] // self.config["patch_size"][1] * self.config["patch_size"][1])
         latent_w = round(np.sqrt(max_area / aspect_ratio) // self.config["vae_stride"][2] // self.config["patch_size"][2] * self.config["patch_size"][2])
@@ -464,7 +460,7 @@ class EncoderService(BaseService):
 
         msk = torch.ones(
             1,
-            self.config["target_video_length"],
+            self.config["num_frames"],
             latent_h,
             latent_w,
             device=torch.device(AI_DEVICE),
@@ -477,7 +473,7 @@ class EncoderService(BaseService):
         vae_input = torch.concat(
             [
                 torch.nn.functional.interpolate(first_frame.cpu(), size=(h, w), mode="bicubic").transpose(0, 1),
-                torch.zeros(3, self.config["target_video_length"] - 1, h, w),
+                torch.zeros(3, self.config["num_frames"] - 1, h, w),
             ],
             dim=1,
         ).to(AI_DEVICE)
@@ -517,6 +513,7 @@ class EncoderService(BaseService):
         """
         Generates encoder outputs from prompt and image input.
         """
+        seed_all(config["seed"])
         self.logger.info("Starting processing in EncoderService...")
         room = int(config.get("data_bootstrap_room", 0))
         encoder_metrics = config.setdefault("request_metrics", {}).setdefault("stages", {}).setdefault("encoder", {})
@@ -526,20 +523,17 @@ class EncoderService(BaseService):
         sender = self.data_sender.get(room)
 
         prompt = config.get("prompt")
-        negative_prompt = config.get("negative_prompt")
         if prompt is None:
             raise ValueError("prompt is required in config.")
 
         # 1. Text Encoding
-        text_len = config.get("text_len", 512)
+        text_len = config["text_len"]
 
         context = self.text_encoder.infer([prompt])
         context = torch.stack([torch.cat([u, u.new_zeros(text_len - u.size(0), u.size(1))]) for u in context])
 
         if config.get("enable_cfg", False):
-            if negative_prompt is None:
-                raise ValueError("negative_prompt is required in config when enable_cfg is True.")
-            context_null = self.text_encoder.infer([negative_prompt])
+            context_null = self.text_encoder.infer([config.get("negative_prompt") or ""])
             context_null = torch.stack([torch.cat([u, u.new_zeros(text_len - u.size(0), u.size(1))]) for u in context_null])
         else:
             context_null = None
@@ -553,11 +547,11 @@ class EncoderService(BaseService):
         clip_encoder_out = None
 
         if task == "t2v":
-            latent_h = config["target_height"] // config["vae_stride"][1]
-            latent_w = config["target_width"] // config["vae_stride"][2]
+            latent_h = config["size"][0] // config["vae_stride"][1]
+            latent_w = config["size"][1] // config["vae_stride"][2]
             latent_shape = [
                 config.get("num_channels_latents", 16),
-                (config["target_video_length"] - 1) // config["vae_stride"][0] + 1,
+                (config["num_frames"] - 1) // config["vae_stride"][0] + 1,
                 latent_h,
                 latent_w,
             ]

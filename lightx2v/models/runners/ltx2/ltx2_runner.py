@@ -5,23 +5,23 @@ from math import gcd as _gcd
 import torch
 import torch.distributed as dist
 
-from lightx2v.common.kvcache.utils import causal_chunk_token_range
 from lightx2v.models.input_encoders.hf.ltx2.model import LTX2TextEncoder
 from lightx2v.models.networks.lora_adapter import LoraAdapter
-from lightx2v.models.networks.ltx2.model import LTX2ARModel, LTX2Model
+from lightx2v.models.networks.ltx2.model import LTX2Model
 from lightx2v.models.runners.default_runner import DefaultRunner
-from lightx2v.models.schedulers.ltx2.scheduler import LTX2ARScheduler, LTX2Scheduler, LatentState
+from lightx2v.models.runners.request_fields import VIDEO_REQUEST_FIELDS
+from lightx2v.models.schedulers.ltx2.scheduler import LTX2Scheduler
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.audio_vae import encode_audio
 from lightx2v.models.video_encoders.hf.ltx2.audio_vae.ops import Audio
 from lightx2v.models.video_encoders.hf.ltx2.model import LTX2AudioVAE, LTX2Upsampler, LTX2VideoVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
-from lightx2v.utils.input_info import I2AVInputInfo, T2AVInputInfo
+from lightx2v.utils.input_info import I2AVInputInfo, T2AVInputInfo, align_num_frames
 from lightx2v.utils.ltx2_media_io import decode_audio_from_file, load_image_conditioning, load_video_conditioning
 from lightx2v.utils.ltx2_media_io import encode_video as save_video
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
-from lightx2v.utils.utils import mux_audio_from_video, mux_generated_audio_onto_video
+from lightx2v.utils.utils import mux_audio_from_video
 from lightx2v_platform.base.global_var import AI_DEVICE
 
 torch_device_module = getattr(torch, AI_DEVICE)
@@ -58,17 +58,17 @@ def _ltx2_normalize_image_strengths(image_strength, n: int) -> list[float]:
     return [float(x) for x in image_strength]
 
 
-def _ltx2_resolve_pixel_frame_indices(image_frame_idx, n: int, num_frames: int) -> list[int]:
-    if not image_frame_idx:
+def _ltx2_resolve_pixel_frame_indices(image_frame_indices, n: int, num_frames: int) -> list[int]:
+    if not image_frame_indices:
         if n == 1:
             return [0]
         if num_frames <= 1:
             return [0] * n
         return [round(i * (num_frames - 1) / (n - 1)) for i in range(n)]
-    if len(image_frame_idx) != n:
-        raise ValueError(f"i2av image_frame_idx: expected {n} indices (one per image), got {len(image_frame_idx)}")
+    if len(image_frame_indices) != n:
+        raise ValueError(f"i2av image_frame_indices: expected {n} indices (one per image), got {len(image_frame_indices)}")
     hi = num_frames - 1
-    return [max(0, min(hi, int(x))) for x in image_frame_idx]
+    return [max(0, min(hi, int(x))) for x in image_frame_indices]
 
 
 def _ltx2_pixel_to_latent_frame_idx(pixel_frame_idx: int, temporal_scale: int) -> int:
@@ -87,33 +87,24 @@ def _ltx2_resize_video_denoise_mask_for_stage2(mask: torch.Tensor, target_h: int
     return m.permute(1, 0, 2, 3).contiguous()
 
 
-def _ltx2_debug_tensor_stats(name: str, tensor) -> None:
-    if os.environ.get("LTX_DEBUG_STATS", "") != "1" or tensor is None:
-        return
-    try:
-        if isinstance(tensor, torch.Tensor):
-            sample = tensor.detach()
-        else:
-            return
-        finite = torch.isfinite(sample)
-        finite_count = int(finite.sum().item())
-        total = sample.numel()
-        if finite_count:
-            stats = sample[finite].to(torch.float32)
-            logger.info(
-                f"[LTX_DEBUG_STATS] {name}: shape={tuple(sample.shape)} dtype={sample.dtype} "
-                f"device={sample.device} finite={finite_count}/{total} "
-                f"min={stats.min().item():.6g} max={stats.max().item():.6g} "
-                f"mean={stats.mean().item():.6g} std={stats.std(unbiased=False).item():.6g}"
-            )
-        else:
-            logger.info(f"[LTX_DEBUG_STATS] {name}: shape={tuple(sample.shape)} dtype={sample.dtype} device={sample.device} finite=0/{total}")
-    except Exception as exc:
-        logger.warning(f"[LTX_DEBUG_STATS] failed for {name}: {exc}")
-
-
 @RUNNER_REGISTER("ltx2")
 class LTX2Runner(DefaultRunner):
+    supported_request_fields_by_task = {
+        "t2av": VIDEO_REQUEST_FIELDS,
+        "i2av": VIDEO_REQUEST_FIELDS | {"image_frame_indices", "image_path", "image_strength"},
+        "ltx2_s2v": VIDEO_REQUEST_FIELDS | {"audio_path", "image_frame_indices", "image_path", "image_strength"},
+        "v2av": VIDEO_REQUEST_FIELDS
+        | {
+            "image_frame_indices",
+            "image_path",
+            "image_strength",
+            "mux_audio_video_path",
+            "reference_video_frame_cap",
+            "reference_video_strength",
+            "video_path",
+        },
+    }
+
     _WARMUP_RESOLUTIONS = ((480, 480), (512, 768))
     _UPSAMPLER_WARMUP_RESOLUTIONS = ((480, 480), (1024, 1536))
     transformer_model_class = LTX2Model
@@ -125,7 +116,23 @@ class LTX2Runner(DefaultRunner):
     video_vae_checkpoint_key = None
     audio_vae_checkpoint_key = None
 
+    def create_input_info(self, request_data):
+        input_info = super().create_input_info(request_data)
+        if self.config["model_cls"] != "ltx2_5" and request_data.get("num_frames") is not None:
+            num_frames = input_info.num_frames
+            if num_frames < 1:
+                raise ValueError(f"LTX-2 num_frames must be positive, got {num_frames}")
+            temporal_stride = self.config["vae_scale_factors"][0]
+            if (num_frames - 1) % temporal_stride != 0:
+                input_info.num_frames = align_num_frames(num_frames, temporal_stride)
+                logger.warning(f"`num_frames - 1` must be divisible by {temporal_stride}; using {input_info.num_frames} instead of {num_frames}.")
+        if input_info.task == "v2av" and "size" not in request_data:
+            # Resolve the reference-video size before using the configured fallback.
+            input_info.size = []
+        return input_info
+
     def __init__(self, config):
+        config.setdefault("fps", 24)
         super().__init__(config)
 
     @ProfilingContext4DebugL1("Warmup")
@@ -210,8 +217,8 @@ class LTX2Runner(DefaultRunner):
             seed=0,
             prompt="warmup",
             negative_prompt=" " if self.config["enable_cfg"] else "",
-            target_shape=[height, width],
-            target_video_length=self.config["target_video_length"],
+            size=[height, width],
+            num_frames=self.config["num_frames"],
         )
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
         self.video_denoise_mask = None
@@ -257,8 +264,6 @@ class LTX2Runner(DefaultRunner):
             self.run_input_encoder = self._run_input_encoder_local_ltx2_s2v
         elif self.config["task"] == "v2av":
             self.run_input_encoder = self._run_input_encoder_local_v2av
-        elif self.config["task"] == "v2a":
-            self.run_input_encoder = self._run_input_encoder_local_v2a
 
     def init_scheduler(self):
         self.scheduler = LTX2Scheduler(self.config)
@@ -270,14 +275,6 @@ class LTX2Runner(DefaultRunner):
         self.video_vae, self.audio_vae = self.load_vae()
         if self.config.get("use_upsampler", False):
             self.upsampler = self.load_upsampler()
-        # Release the caching-allocator memory reserved during load (transient
-        # .to(GPU) doubling of the text encoder, block-offload buffer init, etc.).
-        # In a persistent server this reserved-but-unused block otherwise inflates
-        # idle VRAM by several GB and eats the headroom the first inference needs —
-        # end_run() only reclaims it AFTER a successful run, so a first-request OOM
-        # never gets there. Reclaiming here keeps idle at the true resident size.
-        torch_device_module.empty_cache()
-        gc.collect()
 
     def load_transformer(self, use_distilled_lora=False):
         ltx2_model_kwargs = {
@@ -344,7 +341,7 @@ class LTX2Runner(DefaultRunner):
         # Apply LoRA to text encoder if configured
         lora_configs = self.config.get("lora_configs")
         if lora_configs:
-            text_encoder.apply_lora(lora_configs)
+            text_encoder.apply_lora(lora_configs, force_fp32=self.config.get("lora_merge_force_fp32", False))
 
         text_encoders = [text_encoder]
         return text_encoders
@@ -363,7 +360,7 @@ class LTX2Runner(DefaultRunner):
             checkpoint_path=self._checkpoint_path_for(self.video_vae_checkpoint_key),
             device=vae_device,
             dtype=GET_DTYPE(),
-            load_encoder=self.config["task"] in ("i2av", "ltx2_s2v", "v2av", "v2a") or self.config.get("use_upsampler", False),
+            load_encoder=self.config["task"] in ("i2av", "ltx2_s2v", "v2av") or self.config.get("use_upsampler", False),
             use_tiling=self.config.get("use_tiling_vae", False),
             cpu_offload=vae_offload,
             **self._video_vae_extra_kwargs(),
@@ -380,27 +377,27 @@ class LTX2Runner(DefaultRunner):
         return video_vae, audio_vae
 
     def get_latent_shape_with_target_hw(self):
-        if self.input_info.target_shape:
-            target_height = self.input_info.target_shape[0]
-            target_width = self.input_info.target_shape[1]
+        if self.input_info.size:
+            target_height = self.input_info.size[0]
+            target_width = self.input_info.size[1]
         else:
             if self.config.get("use_upsampler", False):
-                target_height = self.config["target_height"] // 2
-                target_width = self.config["target_width"] // 2
+                target_height = self.config["size"][0] // 2
+                target_width = self.config["size"][1] // 2
             else:
-                target_height = self.config["target_height"]
-                target_width = self.config["target_width"]
-            self.input_info.target_shape = [target_height, target_width]
+                target_height = self.config["size"][0]
+                target_width = self.config["size"][1]
+            self.input_info.size = [target_height, target_width]
 
-        target_video_length = self.input_info.target_video_length or self.config["target_video_length"]
+        num_frames = self.input_info.num_frames or self.config["num_frames"]
         video_latent_shape = (
             self.config.get("num_channels_latents", 128),
-            (target_video_length - 1) // self.config["vae_scale_factors"][0] + 1,
+            (num_frames - 1) // self.config["vae_scale_factors"][0] + 1,
             int(target_height) // self.config["vae_scale_factors"][1],
             int(target_width) // self.config["vae_scale_factors"][2],
         )
 
-        duration = float(target_video_length) / float(self.config["fps"])
+        duration = float(num_frames) / float(self.config["fps"])
         latents_per_second = float(self.config["audio_sampling_rate"]) / float(self.config["audio_hop_length"]) / float(self.config["audio_scale_factor"])
         audio_frames = round(duration * latents_per_second)
 
@@ -411,6 +408,12 @@ class LTX2Runner(DefaultRunner):
         )
 
         return video_latent_shape, audio_latent_shape
+
+    def prepare_stage1_size(self):
+        """Convert the requested final size to the first-stage size."""
+        if self.config.get("use_upsampler", False):
+            height, width = self.input_info.size
+            self.input_info.size = [height // 2, width // 2]
 
     def _clear_ltx2_reference_audio_state(self) -> None:
         """Avoid leaking ltx2_s2v audio conditioning into t2av/i2av runs on a reused runner."""
@@ -424,6 +427,7 @@ class LTX2Runner(DefaultRunner):
         self._clear_ltx2_reference_video_state()
         self.video_denoise_mask = None
         self.initial_video_latent = None
+        self.prepare_stage1_size()
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()  # Important: set latent_shape in input_info
         text_encoder_output = self.run_text_encoder(self.input_info)
         self.maybe_empty_cache()
@@ -437,23 +441,24 @@ class LTX2Runner(DefaultRunner):
         if isinstance(info.image_strength, str):
             p = [float(x.strip()) for x in info.image_strength.split(",") if x.strip()]
             info.image_strength = 1.0 if not p else (p[0] if len(p) == 1 else p)
-        if isinstance(info.image_frame_idx, str):
-            p = [int(x.strip()) for x in info.image_frame_idx.split(",") if x.strip()]
-            info.image_frame_idx = p or None
+        if isinstance(info.image_frame_indices, str):
+            p = [int(x.strip()) for x in info.image_frame_indices.split(",") if x.strip()]
+            info.image_frame_indices = p or None
         n = len(_ltx2_parse_image_paths(info.image_path or ""))
         if n == 0:
             return
-        st, fi = info.image_strength, info.image_frame_idx
+        st, fi = info.image_strength, info.image_frame_indices
         if isinstance(st, list) and len(st) not in (1, n):
             raise ValueError(f"i2av image_strength: need 1 or {n} values, got {len(st)}")
         if fi is not None and len(fi) != n:
-            raise ValueError(f"i2av image_frame_idx: need {n} indices, got {len(fi)}")
+            raise ValueError(f"i2av image_frame_indices: need {n} indices, got {len(fi)}")
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_i2av(self):
         self._clear_ltx2_reference_audio_state()
         self._clear_ltx2_reference_video_state()
         self._normalize_i2av_input_fields()
+        self.prepare_stage1_size()
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
         text_encoder_output = self.run_text_encoder(self.input_info)
         self.video_denoise_mask, self.initial_video_latent = self.run_vae_encoder()
@@ -467,9 +472,6 @@ class LTX2Runner(DefaultRunner):
         """Avoid leaking reference-video latents into non-v2av runs on a reused runner,
         and avoid re-appending reference tokens in stage-2 upsampling."""
         self._ref_video_latent = None
-        self._v2a_source_video = None
-        self._v2a_mux_tempo = 1.0
-        self._v2a_src_duration = None
 
     def _get_ref_downscale_factor(self) -> float:
         """Read IC-LoRA reference-video downscale factor.
@@ -504,48 +506,16 @@ class LTX2Runner(DefaultRunner):
             logger.warning(f"  ⚠ Could not probe pose-video resolution from {path!r}: {e}")
         return None
 
-    @staticmethod
-    def _probe_video_fps_duration(path: str) -> tuple[float | None, float | None]:
-        """
-        Return (average_fps, duration_seconds) of the first video stream in ``path``;
-        either element is None when it cannot be determined.
-        """
-        if not path or not os.path.exists(path):
-            return None, None
-        fps = None
-        duration = None
-        try:
-            import av  # noqa: PLC0415 - lazy import; PyAV is already required.
+    def _override_size_from_ref_video(self) -> None:
+        """v2av: set ``input_info.size`` from the source control video.
 
-            with av.open(path) as container:
-                for stream in container.streams:
-                    if stream.type == "video":
-                        if stream.average_rate and float(stream.average_rate) > 0:
-                            fps = float(stream.average_rate)
-                        # Prefer the VIDEO stream's own duration: it defines the length of
-                        # the stream-copied picture. Container duration can exceed it when
-                        # the source has a longer audio track / edit list, which would make
-                        # the v2a mux -t cap over-pad silence past the last frame. Fall back
-                        # to container duration below only when the stream omits its own.
-                        if stream.duration and stream.time_base:
-                            duration = float(stream.duration * stream.time_base)
-                        break
-                if duration is None and container.duration:
-                    duration = float(container.duration) / av.time_base
-        except Exception as e:  # noqa: BLE001 - probing must never break inference.
-            logger.warning(f"  ⚠ Could not probe video fps/duration from {path!r}: {e}")
-        return fps, duration
-
-    def _override_target_hw_from_ref_video(self) -> None:
-        """v2av: set ``input_info.target_shape`` from probed ``video_path`` (control mp4).
-
-        Skip if ``target_shape`` already set. Base H/W = final//2 when upsampler else final;
+        Skip if ``size`` already set. Base H/W = final//2 when upsampler else final;
         snap to VAE grid (spatial 32) vs ``ref_downscale_factor``. Probe/config miss → no-op.
         """
-        if self.input_info.target_shape:
+        if self.input_info.size:
             return
 
-        ref_path = (getattr(self.input_info, "video_path", None) or "").strip()
+        ref_path = (self.input_info.video_path or "").strip()
         hw = self._probe_video_hw(ref_path)
         if hw is None:
             return
@@ -567,8 +537,7 @@ class LTX2Runner(DefaultRunner):
         base_h = _snap_nearest(base_h, base_div)
         base_w = _snap_nearest(base_w, base_div)
 
-        old_h = int(self.config.get("target_height", 0) or 0)
-        old_w = int(self.config.get("target_width", 0) or 0)
+        old_h, old_w = (int(value or 0) for value in self.config.get("size", (0, 0)))
         eff_final_h = base_h * 2 if use_upsampler else base_h
         eff_final_w = base_w * 2 if use_upsampler else base_w
         logger.info(
@@ -577,7 +546,7 @@ class LTX2Runner(DefaultRunner):
             f"base-gen {base_w}x{base_h}, base_div={base_div}, "
             f"ref_downscale_factor={ref_factor}, use_upsampler={use_upsampler})."
         )
-        self.input_info.target_shape = [base_h, base_w]
+        self.input_info.size = [eff_final_h, eff_final_w]
 
     @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_v2av(self):
@@ -586,36 +555,28 @@ class LTX2Runner(DefaultRunner):
         """
         self._clear_ltx2_reference_audio_state()
         self._normalize_i2av_input_fields()
-        self._override_target_hw_from_ref_video()
-        if not self.input_info.target_shape:
-            if self.config.get("use_upsampler", False):
-                self.input_info.target_shape = [
-                    self.config["target_height"] // 2,
-                    self.config["target_width"] // 2,
-                ]
-            else:
-                self.input_info.target_shape = [
-                    self.config["target_height"],
-                    self.config["target_width"],
-                ]
+        self._override_size_from_ref_video()
+        if not self.input_info.size:
+            self.input_info.size = self.config["size"]
+        self.prepare_stage1_size()
 
         # Reference/control video → pixel tensor, then align temporal length with
         # the clip (official-style: decode up to ``num_frames`` cap, actual length
         # follows the shorter of cap vs. on-disk frames). Only then derive
-        # ``target_video_length`` / latent shapes so audio and denoising match.
-        ref_path = (getattr(self.input_info, "video_path", None) or "").strip()
+        # ``num_frames`` / latent shapes so audio and denoising match.
+        ref_path = (self.input_info.video_path or "").strip()
         if not ref_path:
             raise ValueError("v2av requires a non-empty video_path (pre-processed control / reference video).")
 
         ref_downscale_factor = self._get_ref_downscale_factor()
-        target_h = self.input_info.target_shape[0]
-        target_w = self.input_info.target_shape[1]
+        target_h = self.input_info.size[0]
+        target_w = self.input_info.size[1]
         ref_h = max(int(round(target_h * ref_downscale_factor)), 1)
         ref_w = max(int(round(target_w * ref_downscale_factor)), 1)
         ref_h = ref_h - (ref_h % 2)
         ref_w = ref_w - (ref_w % 2)
 
-        length_cap = int(self.input_info.target_video_length or self.config.get("target_video_length", 1))
+        length_cap = int(self.input_info.num_frames or self.config.get("num_frames", 1))
         ref_extra = getattr(self.input_info, "reference_video_frame_cap", None)
         if ref_extra and int(ref_extra) > 0:
             read_cap = min(length_cap, int(ref_extra))
@@ -644,9 +605,9 @@ class LTX2Runner(DefaultRunner):
             raise ValueError(f"v2av: reference video {ref_path!r} produced no usable frames (decoded {ref_T}, snapped to {snapped_T}).")
 
         if snapped_T != length_cap:
-            logger.info(f"  ↪ v2av: setting target_video_length={snapped_T} from reference (decoded {ref_T} frame(s) within read_cap={read_cap}; configured max was {length_cap}).")
+            logger.info(f"  ↪ v2av: setting num_frames={snapped_T} from reference (decoded {ref_T} frame(s) within read_cap={read_cap}; configured max was {length_cap}).")
         # Config is a LockableDict and is locked after init_modules; only mutate input_info.
-        self.input_info.target_video_length = snapped_T
+        self.input_info.num_frames = snapped_T
 
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
 
@@ -689,351 +650,18 @@ class LTX2Runner(DefaultRunner):
         }
 
     @ProfilingContext4DebugL2("Run Encoders")
-    def _run_input_encoder_local_v2a(self):
-        """
-        LTX-2.3 pure video-to-audio (dubbing): freeze the ENTIRE input video latent
-        (denoise_mask = 0 for every frame) and denoise ONLY the audio. The saved video
-        reuses the ORIGINAL file's pixels via stream-copy mux, so the picture is
-        pixel-identical; only a generated audio track is added.
-
-        Mirror image of ``_run_input_encoder_local_ltx2_s2v`` (which freezes audio and
-        denoises video). No IC-LoRA reference / re-render is used.
-        """
-        self._clear_ltx2_reference_audio_state()
-        self._clear_ltx2_reference_video_state()
-        self._normalize_i2av_input_fields()
-        # Derive encode resolution from the source video (snapped to VAE grid). Output
-        # pixels come from the original file untouched, so this only sizes the
-        # conditioning latent.
-        self._override_target_hw_from_ref_video()
-        if not self.input_info.target_shape:
-            self.input_info.target_shape = [
-                self.config["target_height"],
-                self.config["target_width"],
-            ]
-
-        src_path = (getattr(self.input_info, "video_path", None) or "").strip()
-        if not src_path:
-            raise ValueError("v2a requires a non-empty video_path (the source video to dub).")
-        # Fail fast: the pixel-identical guarantee relies on stream-copying the source
-        # FILE; it cannot be expressed as a decoded tensor (which would be a lossy
-        # VAE re-render, possibly with padded frames).
-        if getattr(self.input_info, "return_result_tensor", False):
-            raise ValueError("v2a is file-based: set save_result_path; return_result_tensor is unsupported (pixel-identical output requires stream-copying the source file).")
-        # File output is the ONLY sink for v2a — without a save path the whole
-        # encode/denoise run would complete and then silently produce nothing.
-        if not (getattr(self.input_info, "save_result_path", None) or "").strip():
-            raise ValueError("v2a requires a non-empty save_result_path (file output is the only supported sink).")
-        # Full-resolution conditioning (no ref downscale): audio must attend to the
-        # real picture, and we want frame count aligned with the source.
-        target_h = self.input_info.target_shape[0]
-        target_w = self.input_info.target_shape[1]
-        enc_h = max(int(target_h) - (int(target_h) % 2), 2)
-        enc_w = max(int(target_w) - (int(target_w) % 2), 2)
-
-        # v2a dubs the WHOLE clip by default. ``target_video_length`` cannot serve as a
-        # cap here: argparse always injects its default (81), indistinguishable from
-        # user intent, and any partial cap leaves the stream-copied tail silent. The
-        # only explicit cap is --reference_video_frame_cap.
-        ref_extra = getattr(self.input_info, "reference_video_frame_cap", None)
-        # frame_cap <= 0 never hits the decrement-break in decode_video_from_file → reads all frames.
-        read_cap = int(ref_extra) if ref_extra and int(ref_extra) > 0 else 0
-
-        src_fps, src_duration = self._probe_video_fps_duration(src_path)
-
-        logger.info(f"  🎞️  Loading source video for dubbing: {src_path} resize=({enc_w}x{enc_h}) read_cap={read_cap if read_cap > 0 else 'FULL CLIP'}")
-
-        pixels = load_video_conditioning(
-            video_path=src_path,
-            height=enc_h,
-            width=enc_w,
-            frame_cap=read_cap,
-            dtype=GET_DTYPE(),
-            device=AI_DEVICE,
-        )
-        if pixels is None:
-            raise ValueError(f"v2a: failed to decode source video from {src_path!r}.")
-
-        src_T = pixels.shape[2]
-        if src_T > 361:
-            logger.warning(
-                f"  ⚠ v2a: {src_T} frames (~{src_T / (src_fps or float(self.config['fps'])):.1f}s) will be VAE-encoded and jointly attended in one pass — "
-                f"long clips can exhaust GPU memory; if this OOMs, dub a shorter span via --reference_video_frame_cap."
-            )
-        if src_T < 1:
-            raise ValueError(f"v2a: source video {src_path!r} produced no usable frames.")
-        # Round UP to the VAE's 1+8k pixel-length grid by repeating the last frame:
-        # flooring would leave the copied tail undubbed (silent). The extra audio
-        # generated beyond the real clip is trimmed at mux time, where the copied
-        # video stream is the -shortest one.
-        snapped_T = ((src_T - 1 + 7) // 8) * 8 + 1
-        if snapped_T != src_T:
-            pad_T = snapped_T - src_T
-            logger.info(f"  ↪ Source video has {src_T} decoded frame(s); padding to {snapped_T} (repeat last frame ×{pad_T}) for LTX-2.3 VAE (pixel length must be 1 + 8k).")
-            pixels = torch.cat([pixels, pixels[:, :, -1:].expand(-1, -1, pad_T, -1, -1)], dim=2)
-
-        # Config is a LockableDict and is locked after init_modules; only mutate input_info.
-        self.input_info.target_video_length = snapped_T
-        self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
-
-        # Timeline alignment: BOTH modalities stay on the model's config-fps timeline
-        # (the scheduler positions video tokens as frame/config_fps), so they are
-        # exactly aligned in model space. For a non-config-fps source the generated
-        # audio is tempo-scaled at mux time (atempo = src_fps/config_fps) instead:
-        # an audio event for frame f sits at model time f/config_fps and lands at
-        # real time f/src_fps after scaling — exact sync for any fps, no drift.
-        cfg_fps = float(self.config["fps"])
-        self._v2a_mux_tempo = 1.0
-        if src_fps is not None and abs(src_fps - cfg_fps) > 0.01:
-            self._v2a_mux_tempo = src_fps / cfg_fps
-            logger.warning(
-                f"  ⚠ v2a: source fps {src_fps:.3f} != model fps {cfg_fps:g}; generated audio will be tempo-scaled ×{self._v2a_mux_tempo:.4f} "
-                f"at mux time for exact sync. The model still 'sees' the clip at {cfg_fps:g}fps (motion appears "
-                f"{'slower' if src_fps > cfg_fps else 'faster'} than real) — ~{cfg_fps:g}fps sources give the best results."
-            )
-
-        # Honest-tail check: the muxed output copies the FULL source video, so any span
-        # we did not dub (explicit frame cap) plays silent. The 1+8k grid no longer
-        # trims: it pads up, so uncapped runs always cover the whole clip.
-        dubbed_seconds = float(snapped_T) / (src_fps or cfg_fps)
-        if src_duration is not None and src_duration - dubbed_seconds > 0.5:
-            logger.warning(
-                f"  ⚠ v2a: dubbing covers only the first {dubbed_seconds:.2f}s but the copied video lasts {src_duration:.2f}s — "
-                f"the remaining {src_duration - dubbed_seconds:.2f}s tail stays SILENT. Remove/raise --reference_video_frame_cap to dub the whole clip."
-            )
-
-        b, c, t, h, w = pixels.shape
-        logger.info(f"  ⏳ VAE-encoding source video to freeze the picture: pixels BCHW=({b},{c},{t},{h},{w}), cpu_offload={getattr(self.video_vae, 'cpu_offload', False)}")
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            video_latent = self.video_vae.encode(pixels)
-        if video_latent.dim() == 5:
-            video_latent = video_latent.squeeze(0)
-        logger.info(f"  ✓ Source VAE encode finished in {time.perf_counter() - t0:.1f}s → latent {tuple(video_latent.shape)}")
-
-        # Align the encoded latent with the target latent grid, then freeze every frame.
-        C, F, Hl, Wl = self.input_info.video_latent_shape
-        if tuple(video_latent.shape[-2:]) != (Hl, Wl) or video_latent.shape[0] != C:
-            raise ValueError(f"v2a: encoded video latent {tuple(video_latent.shape)} incompatible with target latent shape {(C, F, Hl, Wl)}.")
-        f_enc = video_latent.shape[1]
-        if f_enc < F:
-            pad = video_latent[:, -1:, :, :].expand(C, F - f_enc, Hl, Wl)
-            video_latent = torch.cat([video_latent, pad], dim=1)
-        elif f_enc > F:
-            video_latent = video_latent[:, :F, :, :]
-
-        self.initial_video_latent = video_latent.to(dtype=GET_DTYPE(), device=AI_DEVICE)
-        # denoise_mask 0 → keep clean (frozen) for every video token across all steps.
-        self.video_denoise_mask = torch.zeros(1, F, Hl, Wl, dtype=torch.float32, device=AI_DEVICE)
-        self._i2av_guiding_keyframe_meta = None
-
-        # Audio denoises fully (mask defaults to ones in the scheduler).
-        self.initial_audio_latent = None
-        self.audio_denoise_mask = None
-
-        # Remember the source so the saved mp4 reuses its pixels via stream-copy.
-        # ``src_duration`` bounds the mux output (``-t``) so the copied video is never
-        # truncated and the padded audio never runs away (see mux_generated_audio_onto_video).
-        self._v2a_source_video = src_path
-        self._v2a_src_duration = src_duration
-
-        text_encoder_output = self.run_text_encoder(self.input_info)
-
-        torch_device_module.empty_cache()
-        gc.collect()
-        return {
-            "text_encoder_output": text_encoder_output,
-        }
-
-    @ProfilingContext4DebugL2("Run Encoders")
-    def _run_input_encoder_local_v2a(self):
-        """
-        LTX-2.3 pure video-to-audio (dubbing): freeze the ENTIRE input video latent
-        (denoise_mask = 0 for every frame) and denoise ONLY the audio. The saved video
-        reuses the ORIGINAL file's pixels via stream-copy mux, so the picture is
-        pixel-identical; only a generated audio track is added.
-
-        Mirror image of ``_run_input_encoder_local_ltx2_s2v`` (which freezes audio and
-        denoises video). No IC-LoRA reference / re-render is used.
-        """
-        self._clear_ltx2_reference_audio_state()
-        self._clear_ltx2_reference_video_state()
-        self._normalize_i2av_input_fields()
-        # Derive encode resolution from the source video (snapped to VAE grid). Output
-        # pixels come from the original file untouched, so this only sizes the
-        # conditioning latent.
-        self._override_target_hw_from_ref_video()
-        if not self.input_info.target_shape:
-            self.input_info.target_shape = [
-                self.config["target_height"],
-                self.config["target_width"],
-            ]
-
-        # v2a conditioning downscale (memory guard for long / high-res clips).
-        # The audio only needs the frozen video as a conditioning signal, and the OUTPUT
-        # pixels are stream-copied (-c:v copy) from the untouched source — so we may
-        # VAE-encode the conditioning at a lower resolution to bound the single-pass
-        # encode/denoise activation. v2a encodes the WHOLE clip in one forward, so a long
-        # or 720p clip's activation can push a gemma-resident card past 40GB; capping the
-        # conditioning's long side keeps it bounded with ZERO output-quality loss.
-        # Controlled by config "v2a_cond_max_side" (max spatial side in px; None/<=0 = off).
-        cond_cap = self.config.get("v2a_cond_max_side")
-        if cond_cap and int(cond_cap) > 0:
-            th, tw = int(self.input_info.target_shape[0]), int(self.input_info.target_shape[1])
-            long_side = max(th, tw)
-            if long_side > int(cond_cap):
-                scale = int(cond_cap) / long_side
-                snap = 32  # VAE spatial stride
-                th2 = max(snap, int(round(th * scale / snap)) * snap)
-                tw2 = max(snap, int(round(tw * scale / snap)) * snap)
-                logger.info(f"  ↪ v2a: conditioning downscaled {tw}x{th} → {tw2}x{th2} (cap {cond_cap}px); output pixels unchanged (-c:v copy).")
-                self.input_info.target_shape = [th2, tw2]
-
-        src_path = (getattr(self.input_info, "video_path", None) or "").strip()
-        if not src_path:
-            raise ValueError("v2a requires a non-empty video_path (the source video to dub).")
-        # Fail fast: the pixel-identical guarantee relies on stream-copying the source
-        # FILE; it cannot be expressed as a decoded tensor (which would be a lossy
-        # VAE re-render, possibly with padded frames).
-        if getattr(self.input_info, "return_result_tensor", False):
-            raise ValueError("v2a is file-based: set save_result_path; return_result_tensor is unsupported (pixel-identical output requires stream-copying the source file).")
-        # File output is the ONLY sink for v2a — without a save path the whole
-        # encode/denoise run would complete and then silently produce nothing.
-        if not (getattr(self.input_info, "save_result_path", None) or "").strip():
-            raise ValueError("v2a requires a non-empty save_result_path (file output is the only supported sink).")
-        # Full-resolution conditioning (no ref downscale): audio must attend to the
-        # real picture, and we want frame count aligned with the source.
-        target_h = self.input_info.target_shape[0]
-        target_w = self.input_info.target_shape[1]
-        enc_h = max(int(target_h) - (int(target_h) % 2), 2)
-        enc_w = max(int(target_w) - (int(target_w) % 2), 2)
-
-        # v2a dubs the WHOLE clip by default. ``target_video_length`` cannot serve as a
-        # cap here: argparse always injects its default (81), indistinguishable from
-        # user intent, and any partial cap leaves the stream-copied tail silent. The
-        # only explicit cap is --reference_video_frame_cap.
-        ref_extra = getattr(self.input_info, "reference_video_frame_cap", None)
-        # frame_cap <= 0 never hits the decrement-break in decode_video_from_file → reads all frames.
-        read_cap = int(ref_extra) if ref_extra and int(ref_extra) > 0 else 0
-
-        src_fps, src_duration = self._probe_video_fps_duration(src_path)
-
-        logger.info(f"  🎞️  Loading source video for dubbing: {src_path} resize=({enc_w}x{enc_h}) read_cap={read_cap if read_cap > 0 else 'FULL CLIP'}")
-
-        pixels = load_video_conditioning(
-            video_path=src_path,
-            height=enc_h,
-            width=enc_w,
-            frame_cap=read_cap,
-            dtype=GET_DTYPE(),
-            device=AI_DEVICE,
-        )
-        if pixels is None:
-            raise ValueError(f"v2a: failed to decode source video from {src_path!r}.")
-
-        src_T = pixels.shape[2]
-        if src_T > 361:
-            logger.warning(
-                f"  ⚠ v2a: {src_T} frames (~{src_T / (src_fps or float(self.config['fps'])):.1f}s) will be VAE-encoded and jointly attended in one pass — "
-                f"long clips can exhaust GPU memory; if this OOMs, dub a shorter span via --reference_video_frame_cap."
-            )
-        if src_T < 1:
-            raise ValueError(f"v2a: source video {src_path!r} produced no usable frames.")
-        # Round UP to the VAE's 1+8k pixel-length grid by repeating the last frame:
-        # flooring would leave the copied tail undubbed (silent). The extra audio
-        # generated beyond the real clip is trimmed at mux time, where the copied
-        # video stream is the -shortest one.
-        snapped_T = ((src_T - 1 + 7) // 8) * 8 + 1
-        if snapped_T != src_T:
-            pad_T = snapped_T - src_T
-            logger.info(f"  ↪ Source video has {src_T} decoded frame(s); padding to {snapped_T} (repeat last frame ×{pad_T}) for LTX-2.3 VAE (pixel length must be 1 + 8k).")
-            pixels = torch.cat([pixels, pixels[:, :, -1:].expand(-1, -1, pad_T, -1, -1)], dim=2)
-
-        # Config is a LockableDict and is locked after init_modules; only mutate input_info.
-        self.input_info.target_video_length = snapped_T
-        self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
-
-        # Timeline alignment: BOTH modalities stay on the model's config-fps timeline
-        # (the scheduler positions video tokens as frame/config_fps), so they are
-        # exactly aligned in model space. For a non-config-fps source the generated
-        # audio is tempo-scaled at mux time (atempo = src_fps/config_fps) instead:
-        # an audio event for frame f sits at model time f/config_fps and lands at
-        # real time f/src_fps after scaling — exact sync for any fps, no drift.
-        cfg_fps = float(self.config["fps"])
-        self._v2a_mux_tempo = 1.0
-        if src_fps is not None and abs(src_fps - cfg_fps) > 0.01:
-            self._v2a_mux_tempo = src_fps / cfg_fps
-            logger.warning(
-                f"  ⚠ v2a: source fps {src_fps:.3f} != model fps {cfg_fps:g}; generated audio will be tempo-scaled ×{self._v2a_mux_tempo:.4f} "
-                f"at mux time for exact sync. The model still 'sees' the clip at {cfg_fps:g}fps (motion appears "
-                f"{'slower' if src_fps > cfg_fps else 'faster'} than real) — ~{cfg_fps:g}fps sources give the best results."
-            )
-
-        # Honest-tail check: the muxed output copies the FULL source video, so any span
-        # we did not dub (explicit frame cap) plays silent. The 1+8k grid no longer
-        # trims: it pads up, so uncapped runs always cover the whole clip.
-        dubbed_seconds = float(snapped_T) / (src_fps or cfg_fps)
-        if src_duration is not None and src_duration - dubbed_seconds > 0.5:
-            logger.warning(
-                f"  ⚠ v2a: dubbing covers only the first {dubbed_seconds:.2f}s but the copied video lasts {src_duration:.2f}s — "
-                f"the remaining {src_duration - dubbed_seconds:.2f}s tail stays SILENT. Remove/raise --reference_video_frame_cap to dub the whole clip."
-            )
-
-        b, c, t, h, w = pixels.shape
-        logger.info(f"  ⏳ VAE-encoding source video to freeze the picture: pixels BCHW=({b},{c},{t},{h},{w}), cpu_offload={getattr(self.video_vae, 'cpu_offload', False)}")
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            video_latent = self.video_vae.encode(pixels)
-        if video_latent.dim() == 5:
-            video_latent = video_latent.squeeze(0)
-        logger.info(f"  ✓ Source VAE encode finished in {time.perf_counter() - t0:.1f}s → latent {tuple(video_latent.shape)}")
-
-        # Align the encoded latent with the target latent grid, then freeze every frame.
-        C, F, Hl, Wl = self.input_info.video_latent_shape
-        if tuple(video_latent.shape[-2:]) != (Hl, Wl) or video_latent.shape[0] != C:
-            raise ValueError(f"v2a: encoded video latent {tuple(video_latent.shape)} incompatible with target latent shape {(C, F, Hl, Wl)}.")
-        f_enc = video_latent.shape[1]
-        if f_enc < F:
-            pad = video_latent[:, -1:, :, :].expand(C, F - f_enc, Hl, Wl)
-            video_latent = torch.cat([video_latent, pad], dim=1)
-        elif f_enc > F:
-            video_latent = video_latent[:, :F, :, :]
-
-        self.initial_video_latent = video_latent.to(dtype=GET_DTYPE(), device=AI_DEVICE)
-        # denoise_mask 0 → keep clean (frozen) for every video token across all steps.
-        self.video_denoise_mask = torch.zeros(1, F, Hl, Wl, dtype=torch.float32, device=AI_DEVICE)
-        self._i2av_guiding_keyframe_meta = None
-
-        # Audio denoises fully (mask defaults to ones in the scheduler).
-        self.initial_audio_latent = None
-        self.audio_denoise_mask = None
-
-        # Remember the source so the saved mp4 reuses its pixels via stream-copy.
-        # ``src_duration`` bounds the mux output (``-t``) so the copied video is never
-        # truncated and the padded audio never runs away (see mux_generated_audio_onto_video).
-        self._v2a_source_video = src_path
-        self._v2a_src_duration = src_duration
-
-        text_encoder_output = self.run_text_encoder(self.input_info)
-
-        torch_device_module.empty_cache()
-        gc.collect()
-        return {
-            "text_encoder_output": text_encoder_output,
-        }
-
-    @ProfilingContext4DebugL2("Run Encoders")
     def _run_input_encoder_local_ltx2_s2v(self):
         """Reference audio (frozen in latent) + optional reference images; mux original waveform when saving."""
         self._clear_ltx2_reference_video_state()
         self._normalize_i2av_input_fields()
+        self.prepare_stage1_size()
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
 
         ap = (getattr(self.input_info, "audio_path", None) or "").strip()
         if not ap:
             raise ValueError("ltx2_s2v requires a non-empty audio_path.")
 
-        num_frames = self.input_info.target_video_length or self.config.get("target_video_length", 1)
+        num_frames = self.input_info.num_frames or self.config.get("num_frames", 1)
         fps = float(self.config["fps"])
         max_duration = num_frames / fps
 
@@ -1116,8 +744,8 @@ class LTX2Runner(DefaultRunner):
         # Get latent shape
         C, F, H, W = self.input_info.video_latent_shape
 
-        target_height = self.input_info.target_shape[0]
-        target_width = self.input_info.target_shape[1]
+        target_height = self.input_info.size[0]
+        target_width = self.input_info.size[1]
         # Initialize denoise mask (1 = denoise, 0 = keep original)
         # Shape: [1, F, H, W]
         video_denoise_mask = torch.ones(
@@ -1150,9 +778,9 @@ class LTX2Runner(DefaultRunner):
             self._i2av_first_frame_meta = None
             return video_denoise_mask, initial_video_latent
 
-        num_frames = self.input_info.target_video_length or self.config.get("target_video_length", 1)
+        num_frames = self.input_info.num_frames or self.config.get("num_frames", 1)
         strengths = _ltx2_normalize_image_strengths(self.input_info.image_strength, n)
-        raw_frame_idx = getattr(self.input_info, "image_frame_idx", None)
+        raw_frame_idx = getattr(self.input_info, "image_frame_indices", None)
         pixel_frame_indices = _ltx2_resolve_pixel_frame_indices(raw_frame_idx, n, num_frames)
         temporal_scale = int(self.config["vae_scale_factors"][0])
 
@@ -1211,11 +839,11 @@ class LTX2Runner(DefaultRunner):
         return video_denoise_mask, initial_video_latent
 
     def _build_i2av_video_guiding_latents(self):
-        """Encode guiding keyframe images at current target_shape for scheduler.append (stage 1 / 2)."""
+        """Encode guiding keyframe images at current size for scheduler.append (stage 1 / 2)."""
         meta = getattr(self, "_i2av_guiding_keyframe_meta", None)
         if not meta:
             return None
-        th, tw = self.input_info.target_shape[0], self.input_info.target_shape[1]
+        th, tw = self.input_info.size[0], self.input_info.size[1]
         out = []
         for path, pixel_idx, strength in meta:
             image = load_image_conditioning(
@@ -1238,7 +866,7 @@ class LTX2Runner(DefaultRunner):
             return None
 
         path, _strength = meta
-        th, tw = self.input_info.target_shape[0], self.input_info.target_shape[1]
+        th, tw = self.input_info.size[0], self.input_info.size[1]
         image = load_image_conditioning(
             image_path=path,
             height=th,
@@ -1267,19 +895,12 @@ class LTX2Runner(DefaultRunner):
             self.text_encoders = self.load_text_encoder()
 
         prompt = input_info.prompt
-        neg_prompt = input_info.negative_prompt
+        neg_prompt = input_info.negative_prompt if self.scheduler.needs_negative_prompt else None
 
-        if self.config.get("enable_cfg", False):
-            v_context_p, a_context_p, v_context_n, a_context_n = self.text_encoders[0].infer(
-                prompt=prompt,
-                negative_prompt=neg_prompt,
-            )
-        else:
-            # CFG disabled (distilled models): the negative context is never consumed during
-            # denoising (see pre_infer infer_condition branch). Skip encoding the negative prompt
-            # to halve the text-encoder time. The placeholders below are never used.
-            ((v_context_p, a_context_p),) = self.text_encoders[0].encode_text([prompt])
-            v_context_n, a_context_n = v_context_p, a_context_p
+        v_context_p, a_context_p, v_context_n, a_context_n = self.text_encoders[0].infer(
+            prompt=prompt,
+            negative_prompt=neg_prompt,
+        )
         text_encoder_output = {
             "v_context_p": v_context_p,
             "a_context_p": a_context_p,
@@ -1303,9 +924,6 @@ class LTX2Runner(DefaultRunner):
         """Decode video and audio latents to frames and waveform."""
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             self.video_vae, self.audio_vae = self.load_vae()
-
-        _ltx2_debug_tensor_stats("before_vae_video_latent", v_latent)
-        _ltx2_debug_tensor_stats("before_vae_audio_latent", a_latent)
 
         # Decode video latents (returns iterator)
         video = self.video_vae.decode(
@@ -1344,14 +962,12 @@ class LTX2Runner(DefaultRunner):
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             self.upsampler = self.load_upsampler()
 
-        _ltx2_debug_tensor_stats("before_upsampler_video_latent", v_latent)
         upsampled_v_latent = self.upsampler.upsample(v_latent, self.video_vae.encoder).squeeze(0)
-        _ltx2_debug_tensor_stats("after_upsampler_video_latent", upsampled_v_latent)
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             del self.upsampler
             self.maybe_empty_cache()
 
-        self.input_info.target_shape = [self.input_info.target_shape[0] * 2, self.input_info.target_shape[1] * 2]
+        self.input_info.size = [self.input_info.size[0] * 2, self.input_info.size[1] * 2]
         self.input_info.video_latent_shape, self.input_info.audio_latent_shape = self.get_latent_shape_with_target_hw()
         _, _, stage2_h, stage2_w = self.input_info.video_latent_shape
         stage2_video_denoise_mask = None
@@ -1488,14 +1104,10 @@ class LTX2Runner(DefaultRunner):
                 self.init_run_segment(segment_idx)
                 # 2. main inference loop
                 v_latent, a_latent = self.run_segment(segment_idx)
-                _ltx2_debug_tensor_stats("after_stage1_video_latent", v_latent)
-                _ltx2_debug_tensor_stats("after_stage1_audio_latent", a_latent)
 
                 ## upsample latent
                 if self.config.get("use_upsampler", False):
                     v_latent, a_latent = self.run_upsampler(v_latent, a_latent)
-                    _ltx2_debug_tensor_stats("after_stage2_video_latent", v_latent)
-                    _ltx2_debug_tensor_stats("after_stage2_audio_latent", a_latent)
                 # 3. vae decoder
                 self.gen_video, self.gen_audio = self.run_vae_decoder(v_latent, a_latent)
 
@@ -1518,29 +1130,10 @@ class LTX2Runner(DefaultRunner):
         elif self.input_info.save_result_path is not None:
             if not dist.is_initialized() or dist.get_rank() == 0:
                 logger.info(f"🎬 Start to save video 🎬")
-                out_path = self.input_info.save_result_path
-
-                # v2a (pure dubbing): keep the ORIGINAL pixels byte-for-byte by
-                # stream-copying the source video and adding only the generated audio.
-                src_video = getattr(self, "_v2a_source_video", None)
-                if self.config.get("task") == "v2a" and src_video:
-                    muxed = mux_generated_audio_onto_video(
-                        src_video,
-                        self.gen_audio_final,
-                        out_path,
-                        tempo=getattr(self, "_v2a_mux_tempo", 1.0),
-                        duration=getattr(self, "_v2a_src_duration", None),
-                    )
-                    if not muxed:
-                        # No fallback: a VAE-decoded save would silently violate the
-                        # pixel-identical contract that defines this task.
-                        raise RuntimeError("v2a: stream-copy mux failed (see warnings above); refusing to fall back to lossy VAE-decoded output.")
-                    logger.info(f"✅ v2a: dubbed audio muxed onto original video (pixels unchanged): {out_path} ✅")
-                    return {"video": None}
-
                 save_audio = self.gen_audio_final
                 if self.config.get("task") == "ltx2_s2v" and getattr(self, "_ltx2_s2v_mux_audio", None) is not None:
                     save_audio = self._ltx2_s2v_mux_audio
+                out_path = self.input_info.save_result_path
                 save_video(
                     video=self.gen_video_final,
                     fps=self.config.get("fps", 24),
@@ -1619,177 +1212,3 @@ class LTX2Runner(DefaultRunner):
             self.maybe_empty_cache()
 
         return self.model.scheduler.video_latent_state.latent, self.model.scheduler.audio_latent_state.latent
-
-
-@RUNNER_REGISTER("ltx2_ar")
-class LTX2ARRunner(LTX2Runner):
-    """Chunkwise autoregressive LTX2.3 runner for teacher-forcing checkpoints."""
-
-    def init_scheduler(self):
-        self.scheduler = LTX2ARScheduler(self.config)
-
-    def load_transformer(self, use_distilled_lora=False):
-        model_kwargs = {
-            "model_path": self.config["model_path"],
-            "config": self.config,
-            "device": self.init_device,
-        }
-        model = LTX2ARModel(**model_kwargs)
-        lora_configs = self.config.get("lora_configs")
-        if lora_configs:
-            LoraAdapter(model, model_prefix="model.diffusion_model.").apply_lora(lora_configs)
-        return model
-
-    def get_video_segment_num(self):
-        self.video_segment_num = 1
-
-    def init_run(self):
-        self._validate_ar_config()
-        super().init_run()
-        self._prepare_ar_states()
-
-    def _validate_ar_config(self):
-        if self.config.get("task") != "t2av":
-            raise NotImplementedError("ltx2_ar currently supports task=t2av only.")
-        if self.config.get("use_upsampler", False):
-            raise NotImplementedError("ltx2_ar does not support the latent upsampler.")
-        chunk = int(self.config.get("ar_config", {}).get("num_frame_per_chunk", 0))
-        if chunk <= 0:
-            raise ValueError("ltx2_ar requires ar_config.num_frame_per_chunk > 0.")
-
-    @staticmethod
-    def _slice_latent_state(state, start, end, *, clone_latent=True):
-        latent = state.latent[start:end]
-        return LatentState(
-            latent=latent.clone() if clone_latent else latent,
-            denoise_mask=state.denoise_mask[start:end],
-            positions=state.positions[..., start:end, :],
-            clean_latent=state.clean_latent[start:end],
-        )
-
-    def _prepare_ar_states(self):
-        scheduler = self.model.scheduler
-        video_state = scheduler.video_latent_state
-        audio_state = scheduler.audio_latent_state
-        _, video_frames, video_height, video_width = scheduler.video_latent_shape_orig
-        audio_channels, _, audio_mel_bins = scheduler.audio_latent_shape_orig
-        chunk_frames = int(self.config["ar_config"]["num_frame_per_chunk"])
-
-        video_main_tokens = int(getattr(scheduler, "_video_main_num_tokens", video_state.latent.shape[0]))
-        if video_main_tokens != video_state.latent.shape[0]:
-            raise NotImplementedError("ltx2_ar does not support appended guiding/reference video tokens.")
-        if video_main_tokens % video_frames != 0:
-            raise ValueError(f"Video token count {video_main_tokens} is not divisible by latent frames {video_frames}.")
-
-        keep_video_frames = (video_frames // chunk_frames) * chunk_frames
-        if keep_video_frames <= 0:
-            raise ValueError(f"LTX2 AR latent frames={video_frames} is smaller than chunk size={chunk_frames}.")
-        video_tokens_per_frame = video_main_tokens // video_frames
-        keep_video_tokens = keep_video_frames * video_tokens_per_frame
-        keep_audio_tokens = max(1, audio_state.latent.shape[0] * keep_video_frames // video_frames)
-
-        if keep_video_frames != video_frames:
-            output_frames = 1 + (keep_video_frames - 1) * int(scheduler.video_scale_factors[0])
-            logger.warning(
-                f"ltx2_ar trims latent frames from {video_frames} to {keep_video_frames} so they are divisible by num_frame_per_chunk={chunk_frames}; decoded video length becomes {output_frames}."
-            )
-            self.input_info.target_video_length = output_frames
-
-        self._ar_video_state = self._slice_latent_state(video_state, 0, keep_video_tokens, clone_latent=False)
-        self._ar_audio_state = self._slice_latent_state(audio_state, 0, keep_audio_tokens, clone_latent=False)
-        self._ar_video_frames = keep_video_frames
-        self._ar_video_tokens_per_frame = video_tokens_per_frame
-        self._ar_num_chunks = keep_video_frames // chunk_frames
-        if keep_audio_tokens < self._ar_num_chunks:
-            raise ValueError(f"LTX2 AR audio tokens={keep_audio_tokens} is smaller than chunk count={self._ar_num_chunks}.")
-        self._ar_chunk_ranges = []
-        for chunk_idx in range(self._ar_num_chunks):
-            video_start = chunk_idx * chunk_frames * video_tokens_per_frame
-            video_end = (chunk_idx + 1) * chunk_frames * video_tokens_per_frame
-            audio_start, audio_end = causal_chunk_token_range(chunk_idx, self._ar_num_chunks, keep_audio_tokens)
-            self._ar_chunk_ranges.append((video_start, video_end, audio_start, audio_end))
-
-        scheduler.video_latent_shape_orig = (
-            scheduler.video_latent_shape_orig[0],
-            keep_video_frames,
-            video_height,
-            video_width,
-        )
-        scheduler.audio_latent_shape_orig = (audio_channels, keep_audio_tokens, audio_mel_bins)
-        self.input_info.video_latent_shape = scheduler.video_latent_shape_orig
-        self.input_info.audio_latent_shape = scheduler.audio_latent_shape_orig
-        if self.config.get("distilled_sigma_values") is None:
-            scheduler.set_timesteps(infer_steps=scheduler.infer_steps, latent=self._ar_video_state.latent)
-
-        max_audio_chunk_tokens = max(audio_end - audio_start for _, _, audio_start, audio_end in self._ar_chunk_ranges)
-        audio_tokens_per_frame = max(1, (keep_audio_tokens + keep_video_frames - 1) // keep_video_frames)
-        self.model.configure_ar_cache(
-            video_total_tokens=keep_video_tokens,
-            audio_total_tokens=keep_audio_tokens,
-            video_chunk_tokens=chunk_frames * video_tokens_per_frame,
-            audio_chunk_tokens=max_audio_chunk_tokens,
-            video_tokens_per_frame=video_tokens_per_frame,
-            audio_tokens_per_frame=audio_tokens_per_frame,
-            dtype=self._ar_video_state.latent.dtype,
-            device=self._ar_video_state.latent.device,
-        )
-        logger.info(
-            f"LTX2 AR initialized: chunks={self._ar_num_chunks}, latent_frames_per_chunk={chunk_frames}, "
-            f"video_tokens_per_chunk={chunk_frames * video_tokens_per_frame}, audio_tokens={keep_audio_tokens}"
-        )
-
-    def _load_ar_chunk(self, video_start, video_end, audio_start, audio_end):
-        self.model.scheduler.video_latent_state = self._slice_latent_state(self._ar_video_state, video_start, video_end)
-        self.model.scheduler.audio_latent_state = self._slice_latent_state(self._ar_audio_state, audio_start, audio_end)
-        self.model.scheduler.mm_last_v_pred = None
-        self.model.scheduler.mm_last_a_pred = None
-        self.model.set_ar_chunk(video_start=video_start, audio_start=audio_start)
-
-    def run_segment(self, segment_idx=0, stage_name=None, cleanup_inputs=None):
-        infer_steps = self.model.scheduler.infer_steps
-        video_chunks = []
-        audio_chunks = []
-
-        for chunk_idx, (video_start, video_end, audio_start, audio_end) in enumerate(self._ar_chunk_ranges):
-            self.check_stop()
-            self._load_ar_chunk(video_start, video_end, audio_start, audio_end)
-            logger.info(f"LTX2 AR chunk {chunk_idx + 1}/{self._ar_num_chunks}")
-
-            for step_index in range(infer_steps):
-                logger.info(f"==> chunk: {chunk_idx + 1}/{self._ar_num_chunks}, step: {step_index + 1}/{infer_steps}")
-                with ProfilingContext4DebugL1("step_pre"):
-                    self.model.scheduler.step_pre(step_index=step_index, is_rerun=False)
-                with ProfilingContext4DebugL1("infer_main"):
-                    self.model.infer(self.inputs)
-                with ProfilingContext4DebugL1("step_post"):
-                    self.model.scheduler.step_post()
-
-                if self.progress_callback:
-                    current_step = chunk_idx * infer_steps + step_index + 1
-                    total_steps = self._ar_num_chunks * infer_steps
-                    self.progress_callback((current_step / total_steps) * 100, 100)
-
-            with ProfilingContext4DebugL1("step_pre_in_rerun"):
-                self.model.scheduler.step_pre(step_index=infer_steps - 1, is_rerun=True)
-            with ProfilingContext4DebugL1("infer_main_in_rerun"):
-                self.model.infer(self.inputs)
-
-            video_chunks.append(self.model.scheduler.video_latent_state.latent)
-            audio_chunks.append(self.model.scheduler.audio_latent_state.latent)
-
-        video_tokens = torch.cat(video_chunks, dim=0)
-        audio_tokens = torch.cat(audio_chunks, dim=0)
-        video_shape = self.model.scheduler.video_latent_shape_orig
-        audio_shape = self.model.scheduler.audio_latent_shape_orig
-        video_latent = self.model.scheduler.video_patchifier.unpatchify(
-            video_tokens,
-            frames=video_shape[1],
-            height=video_shape[2],
-            width=video_shape[3],
-        )
-        audio_latent = self.model.scheduler.audio_patchifier.unpatchify(
-            audio_tokens,
-            channels=audio_shape[0],
-            mel_bins=audio_shape[2],
-        )
-        return video_latent, audio_latent

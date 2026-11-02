@@ -1,7 +1,7 @@
 from .fifo import FIFOKVCachePool
 from .manager import KVCacheManager
-from .quant import KIVIQuantRollingKVCachePool, StepKiviQuantRollingKVCachePool
-from .rolling import HybridStepRollingKVCachePool, RollingKVCachePool, SpatialRollingKVCachePool
+from .rolling import HybridStepRollingKVCachePool, RollingKVCachePool, StepRollingKVCachePool
+from .rolling_offload import OffloadedHybridStepRollingKVCachePool, OffloadedRollingKVCachePool, OffloadedStepRollingKVCachePool
 from .static import StaticKVCachePool
 
 __all__ = [
@@ -9,8 +9,9 @@ __all__ = [
     "HybridStepRollingKVCachePool",
     "KVCacheManager",
     "RollingKVCachePool",
-    "SpatialRollingKVCachePool",
-    "KIVIQuantRollingKVCachePool",
-    "StepKiviQuantRollingKVCachePool",
+    "StepRollingKVCachePool",
+    "OffloadedRollingKVCachePool",
+    "OffloadedStepRollingKVCachePool",
+    "OffloadedHybridStepRollingKVCachePool",
     "StaticKVCachePool",
 ]

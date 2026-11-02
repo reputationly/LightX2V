@@ -25,7 +25,6 @@ from lightx2v_train.runtime.distributed import (
 )
 from lightx2v_train.runtime.sequence_parallel import broadcast_sequence_parallel_value
 from lightx2v_train.schedulers import DMDFlowMatchingScheduler
-from lightx2v_train.schedulers.flow_matching import CausalForcingFlowMatchScheduler
 from lightx2v_train.tricks import (
     DiversitySetupContext,
     DiversityStepContext,
@@ -38,6 +37,7 @@ from lightx2v_train.tricks import (
 from lightx2v_train.utils.registry import TRAINER_REGISTER
 
 from .config import DmdScheduleConfig
+from .rollout import full_rollout_with_ste
 from .runtime import _DmdRuntime
 from .score_sampling import ScoreSigmaContext, build_score_sigma_sampler
 
@@ -49,35 +49,30 @@ class DmdTrainer(_DmdRuntime):
     trainer_name = "dmd"
     supports_diversity_loss = True
     supports_real_data_fake = True
+    rollout_use_ste = False
 
     def __init__(self, config):
         super().__init__(config)
+        self.rollout_use_ste = self.parsed_dmd_config.rollout_use_ste
+        if self.rollout_use_ste:
+            if self.trainer_name != "dmd":
+                raise ValueError(f"{self.trainer_name} does not support training.dmd.rollout.use_ste; use training.method=dmd.")
+            logger.info("[dmd] STE rollout: full endpoint for student/fake; one selected step supplies the student gradient.")
         parsed = DmdScheduleConfig.from_mapping(
             config,
             dmd_config=self.dmd_config,
             student_config=self.student_config,
-            model_config=self.model_config,
             num_inference_steps=self.num_inference_steps,
         )
         self.parsed_dmd_schedule_config = parsed
         self.num_train_timestep = parsed.num_train_timestep
-        self.denoising_step_list = parsed.denoising_step_list
-        self.num_inference_steps = len(self.denoising_step_list)
-        self.warp_denoising_step = parsed.warp_denoising_step
-        self.min_step = parsed.min_step
-        self.max_step = parsed.max_step
-        self.score_timestep_shift = parsed.score_timestep_shift
+        self.warp_denoising_step = self.noise_scheduler.do_time_shift
         self.ts_schedule = parsed.ts_schedule
         self.ts_schedule_max = parsed.ts_schedule_max
-        self.min_score_timestep = parsed.min_score_timestep
         self.student_checkpoint_path = parsed.student_checkpoint_path
         self.student_checkpoint_strict = parsed.student_checkpoint_strict
         self.score_sigma_sampler = build_score_sigma_sampler(
             self.dmd_config.get("score_sampling"),
-            sample_min_timestep=self.min_score_timestep,
-            clamp_min_timestep=self.min_step,
-            clamp_max_timestep=self.max_step,
-            timestep_shift=self.score_timestep_shift,
             use_rollout_min=self.ts_schedule,
             use_rollout_max=self.ts_schedule_max,
         )
@@ -90,14 +85,7 @@ class DmdTrainer(_DmdRuntime):
             ),
             self.trainer_name,
         )
-        diversity_scheduler = (
-            DMDFlowMatchingScheduler(
-                self.config,
-                self.dmd_config,
-            )
-            if self.diversity_trick.enabled
-            else None
-        )
+        diversity_scheduler = DMDFlowMatchingScheduler(self.config) if self.diversity_trick.enabled else None
         self.diversity_trick.setup(DiversitySetupContext(scheduler=diversity_scheduler))
         self.real_data_fake_trick = RealDataFakeTrick.from_mappings(
             {
@@ -139,19 +127,11 @@ class DmdTrainer(_DmdRuntime):
             )
 
         time_shift_settings = self.config["scheduler"].get("time_shift_settings", {})
-        self.denoising_scheduler = CausalForcingFlowMatchScheduler(
-            num_train_timesteps=self.config["scheduler"].get("num_train_timesteps", 1000),
-            time_shift_settings=time_shift_settings,
-        )
-        self.denoising_steps = self._build_denoising_steps(self.student.device)
-        self.denoising_sigmas = (self.denoising_steps / self.num_train_timestep).to(dtype=torch.float32)
+        self.denoising_scheduler = DMDFlowMatchingScheduler(self.config)
+        self._dynamic_denoising_shift = self.scheduler.do_time_shift and bool((time_shift_settings or {}).get("dynamic_shift", False))
+        if not self._dynamic_denoising_shift:
+            self._prepare_timestep_lookup()
         self.real_data_fake_trick.setup(self._real_data_fake_setup_context())
-        logger.info(
-            "[train] {} denoising_steps={} warped={}",
-            self.trainer_name,
-            [round(float(step), 4) for step in self.denoising_steps.detach().cpu()],
-            self.warp_denoising_step,
-        )
 
     def _setup_fake_real_resources(self):
         self.fake_real_model = None
@@ -467,19 +447,14 @@ class DmdTrainer(_DmdRuntime):
             }
         return loss_value
 
-    def _build_denoising_steps(self, device):
-        raw_steps = torch.tensor(self.denoising_step_list, dtype=torch.long, device=device)
-        if not self.warp_denoising_step:
-            return raw_steps.to(dtype=torch.float32)
-
-        timesteps = torch.cat(
-            [
-                self.denoising_scheduler.timesteps.to(device=device, dtype=torch.float32),
-                torch.zeros(1, device=device, dtype=torch.float32),
-            ]
-        )
-        indices = self.denoising_scheduler.num_train_timesteps - raw_steps
-        return timesteps[indices]
+    def _prepare_timestep_lookup(self, latent_hw=None, num_steps=None):
+        """Refresh the dense lookup used by score windows and real-data noise."""
+        num_steps = self.num_inference_steps if num_steps is None else num_steps
+        key = (tuple(latent_hw) if self._dynamic_denoising_shift and latent_hw is not None else None, num_steps)
+        if getattr(self, "_timestep_lookup_key", None) == key:
+            return
+        self.denoising_scheduler.set_training_timesteps(latent_hw=latent_hw, num_steps=num_steps)
+        self._timestep_lookup_key = key
 
     def _extract_real_latents(self, sample):
         return self.student.extract_real_latents(
@@ -564,10 +539,7 @@ class DmdTrainer(_DmdRuntime):
             denoising_scheduler=self.denoising_scheduler,
             num_train_timestep=self.num_train_timestep,
             warp_denoising_step=self.warp_denoising_step,
-            score_timestep_shift=self.score_timestep_shift,
-            min_step=self.min_step,
-            max_step=self.max_step,
-            min_score_timestep=self.min_score_timestep,
+            num_inference_steps=self.num_inference_steps,
         )
 
     def _real_data_fake_context(self, sample, conditions, region="main"):
@@ -580,6 +552,7 @@ class DmdTrainer(_DmdRuntime):
             device=self.student.device,
             dtype=self.latent_dtype,
             extract_real_latents=self._extract_real_latents,
+            prepare_timestep_lookup=self._prepare_timestep_lookup,
             sample_synced_int=self._sample_synced_int,
             broadcast_noise=broadcast_sequence_parallel_value,
             predict_student_velocity=self._predict_real_student_velocity,
@@ -620,6 +593,7 @@ class DmdTrainer(_DmdRuntime):
             denoised_timestep_to=denoised_timestep_to,
             device=self.student.device,
             dtype=self.latent_dtype,
+            latent_hw=self.student.latent_hw(latent_shape),
         )
         noise = self.student.random_noise_like(
             generated,
@@ -694,20 +668,39 @@ class DmdTrainer(_DmdRuntime):
             self.scheduler.num_inference_steps,
         )
 
-    def run_back_simulation(self, condition, latent_shape, grad_enabled, xt=None):
-        if self.random_schedule_enabled:
-            self._prepare_sampling_schedule(latent_shape)
-            self._active_denoising_steps = self.scheduler.timesteps
-        else:
-            self.scheduler.set_timesteps(
-                self.num_inference_steps,
-                sigmas=[float(sigma) for sigma in self.denoising_sigmas.detach().cpu()],
-                latent_hw=self.student.latent_hw(latent_shape),
+    def _run_full_rollout_with_ste(self, condition, xt, gradient_step_idx=None):
+        def predict_velocity(latents, idx):
+            sigma = self.scheduler.sigma_at(
+                idx,
                 device=self.student.device,
+                dtype=self.latent_dtype,
             )
-            self._active_denoising_steps = self.denoising_steps
+            return self._predict_velocity(self.student, latents, sigma, condition)
+
+        return full_rollout_with_ste(
+            xt,
+            self.scheduler.num_inference_steps,
+            predict_velocity,
+            partial(self.student.step, self.scheduler),
+            gradient_step_idx=gradient_step_idx,
+        )
+
+    def run_back_simulation(self, condition, latent_shape, grad_enabled, xt=None):
+        latent_hw = self.student.latent_hw(latent_shape)
+        self._prepare_sampling_schedule(latent_shape)
+        self._prepare_timestep_lookup(latent_hw, num_steps=self.scheduler.num_inference_steps)
         if xt is None:
             xt = self.sample_initial_latents(latent_shape)
+
+        # Zoe runs every DMD role in eval mode. Gradients are controlled by
+        # autograd contexts, not by module.train(), which keeps rollout
+        # dropout and other training-only behavior deterministic.
+        self.student.set_training(False)
+        if self.rollout_use_ste:
+            gradient_step_idx = self.sample_end_step() if grad_enabled else None
+            x0, _, _ = self._run_full_rollout_with_ste(condition, xt, gradient_step_idx)
+            # Score sampling follows the full endpoint, not the gradient step.
+            return self.student.to_dtype(x0, self.latent_dtype), *self._denoised_timestep_window(self.scheduler.num_inference_steps - 1)
 
         end_step_idx = (
             self.sample_end_step()
@@ -718,10 +711,6 @@ class DmdTrainer(_DmdRuntime):
             )
         )
         x0 = None
-        # Zoe runs every DMD role in eval mode. Gradients are controlled by
-        # autograd contexts, not by module.train(), which keeps rollout
-        # dropout and other training-only behavior deterministic.
-        self.student.set_training(False)
         for idx in range(end_step_idx + 1):
             sigma = self.scheduler.sigma_at(
                 idx,
@@ -747,24 +736,23 @@ class DmdTrainer(_DmdRuntime):
             self.latent_dtype,
         ), *self._denoised_timestep_window(end_step_idx)
 
-    def _sample_score_sigma(self, denoised_timestep_from, denoised_timestep_to, device, dtype):
+    def _sample_score_sigma(self, denoised_timestep_from, denoised_timestep_to, device, dtype, latent_hw=None):
         sigma = self.score_sigma_sampler.sample(
             ScoreSigmaContext(
                 denoised_timestep_from=denoised_timestep_from,
                 denoised_timestep_to=denoised_timestep_to,
                 num_train_timesteps=self.num_train_timestep,
                 device=device,
+                scheduler=self.scheduler,
+                latent_hw=latent_hw,
+                num_steps=self.scheduler.num_inference_steps,
             )
         )
         return broadcast_sequence_parallel_value(sigma).to(dtype=dtype)
 
     def _denoised_timestep_window(self, exit_idx):
         exit_idx = int(exit_idx)
-        steps = getattr(
-            self,
-            "_active_denoising_steps",
-            self.denoising_steps,
-        )
+        steps = self.scheduler.timesteps
         denoised_timestep_from = self._raw_timestep_from_warped_step(steps[exit_idx])
         if exit_idx == len(steps) - 1:
             denoised_timestep_to = 0

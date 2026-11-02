@@ -18,6 +18,7 @@
 **.swp
 .vscode/
 .env
+.venvs/
 .log
 *.pid
 *.ipynb*
@@ -25,7 +26,6 @@ build/
 dist/
 .cache/
 server_cache/
-app/.gradio/
 *.pkl
 save_results/*
 *.egg-info/
@@ -40,3 +40,4 @@ lightx2v_ros/log
 
 # 本地跑出来的视频/图片产物，只在机器上留一份
 outputs/
+lightx2v_kernel/intel_xpu/_cmake_build

@@ -30,6 +30,11 @@ import torch
 import torch.nn as nn
 from safetensors import safe_open
 
+from lightx2v.models.video_encoders.hf.minimax_h3.fp8_encoder_conv_policy import (
+    FP8_ENCODER_CONV_PROFILE_METADATA_KEY,
+    FP8_ENCODER_CONV_WEIGHT_QMAX_METADATA_KEY,
+)
+
 
 @dataclass(frozen=True)
 class SafetensorsSubsetReport:
@@ -37,6 +42,15 @@ class SafetensorsSubsetReport:
     files: tuple[Path, ...]
     loaded_keys: tuple[str, ...]
     ignored_keys: int
+
+
+@dataclass(frozen=True)
+class Fp8EncoderConvCheckpointInfo:
+    """FP8 Conv3D weights and optional numerical constraints in a checkpoint."""
+
+    quantized_module_names: tuple[str, ...]
+    checkpoint_profile: str | None
+    weight_qmax: float | None
 
 
 def _component_files(component_dir: str | Path) -> tuple[Path, ...]:
@@ -51,16 +65,9 @@ def _component_files(component_dir: str | Path) -> tuple[Path, ...]:
     return files
 
 
-def _get_parent(module: nn.Module, key: str) -> tuple[nn.Module, str]:
-    parts = key.split(".")
-    parent: nn.Module = module
-    for part in parts[:-1]:
-        parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
-    return parent, parts[-1]
-
-
 def _assign_tensor(module: nn.Module, key: str, tensor: torch.Tensor) -> None:
-    parent, name = _get_parent(module, key)
+    parent_name, _, name = key.rpartition(".")
+    parent = module.get_submodule(parent_name) if parent_name else module
     if name in parent._parameters:
         old_parameter = parent._parameters[name]
         requires_grad = False if old_parameter is None else old_parameter.requires_grad
@@ -90,10 +97,48 @@ def _expected_specs(module: nn.Module) -> dict[str, tuple[tuple[int, ...], torch
     return {key: (tuple(value.shape), value.dtype) for key, value in module.state_dict().items()}
 
 
-def validate_safetensors_subset(module: nn.Module, component_dir: str | Path) -> SafetensorsSubsetReport:
-    """Validate exact key and shape parity without materializing checkpoint tensors."""
+def inspect_fp8_encoder_conv_checkpoint(
+    checkpoint_path: str | Path,
+) -> Fp8EncoderConvCheckpointInfo | None:
+    """Find quantized H3 Encoder Conv3D weights without loading them."""
+
+    checkpoint_path = Path(checkpoint_path)
+    if not checkpoint_path.is_file():
+        return None
+    with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
+        metadata = checkpoint.metadata() or {}
+        checkpoint_profile = metadata.get(FP8_ENCODER_CONV_PROFILE_METADATA_KEY)
+        try:
+            weight_qmax = float(metadata[FP8_ENCODER_CONV_WEIGHT_QMAX_METADATA_KEY])
+        except (KeyError, TypeError, ValueError):
+            weight_qmax = None
+
+        keys = set(checkpoint.keys())
+        quantized_module_names = []
+        scale_keys = sorted(key for key in keys if key.startswith("encoder.") and key.endswith(".weight_scale"))
+        for scale_key in scale_keys:
+            weight_key = scale_key.removesuffix("_scale")
+            if weight_key not in keys:
+                raise KeyError(f"MiniMax-H3 FP8 Encoder Conv3D checkpoint is missing {weight_key!r}")
+            weight = checkpoint.get_slice(weight_key)
+            if len(weight.get_shape()) != 5 or str(weight.get_dtype()) != "F8_E4M3":
+                raise TypeError(f"MiniMax-H3 FP8 Encoder Conv3D weight {weight_key!r} must be 5D float8_e4m3fn")
+            module_name = weight_key.removeprefix("encoder.").removesuffix(".weight")
+            quantized_module_names.append(module_name)
+    if not quantized_module_names:
+        return None
+    return Fp8EncoderConvCheckpointInfo(
+        tuple(quantized_module_names),
+        checkpoint_profile,
+        weight_qmax,
+    )
+
+
+def validate_safetensors_subset(module: nn.Module, component_dir: str | Path, *, key_mapping: dict[str, str] | None = None) -> SafetensorsSubsetReport:
+    """Validate keys, shapes and dtypes, optionally mapping checkpoint keys to module names."""
 
     files = _component_files(component_dir)
+    key_mapping = key_mapping or {}
     expected = _expected_specs(module)
     expected_roots = {key.partition(".")[0] for key in expected}
     found: set[str] = set()
@@ -103,23 +148,24 @@ def validate_safetensors_subset(module: nn.Module, component_dir: str | Path) ->
     for filename in files:
         with safe_open(filename, framework="pt", device="cpu") as checkpoint:
             for key in checkpoint.keys():
-                if key not in expected:
-                    if key.partition(".")[0] in expected_roots:
+                parameter_key = key_mapping.get(key, key)
+                if parameter_key not in expected:
+                    if parameter_key.partition(".")[0] in expected_roots:
                         unexpected.append(key)
                     else:
                         ignored += 1
                     continue
                 tensor_slice = checkpoint.get_slice(key)
                 shape = tuple(tensor_slice.get_shape())
-                expected_shape, expected_dtype = expected[key]
+                expected_shape, expected_dtype = expected[parameter_key]
                 if shape != expected_shape:
                     raise ValueError(f"Shape mismatch for {key!r}: model expects {expected_shape}, checkpoint contains {shape}")
                 checkpoint_dtype = str(tensor_slice.get_dtype())
                 if checkpoint_dtype != _SAFETENSORS_DTYPES.get(expected_dtype):
                     raise TypeError(f"Dtype mismatch for {key!r}: model expects {expected_dtype}, checkpoint contains {checkpoint_dtype}")
-                if key in found:
+                if parameter_key in found:
                     unexpected.append(f"duplicate:{key}")
-                found.add(key)
+                found.add(parameter_key)
 
     missing = sorted(set(expected) - found)
     if missing or unexpected:
@@ -133,25 +179,28 @@ def validate_safetensors_subset(module: nn.Module, component_dir: str | Path) ->
     return SafetensorsSubsetReport(Path(component_dir), files, tuple(sorted(found)), ignored)
 
 
-def load_safetensors_subset(module: nn.Module, component_dir: str | Path) -> SafetensorsSubsetReport:
+def load_safetensors_subset(module: nn.Module, component_dir: str | Path, *, key_mapping: dict[str, str] | None = None) -> SafetensorsSubsetReport:
     """Load exactly ``module.state_dict()`` from one or more original H3 shards.
 
+    ``key_mapping`` maps checkpoint keys to module parameter/buffer names.
     This also supports a module constructed on the ``meta`` device: each meta
     parameter is replaced directly by its CPU checkpoint tensor, avoiding a
     second full-size initialized copy of the VAE.
     """
 
-    report = validate_safetensors_subset(module, component_dir)
+    key_mapping = key_mapping or {}
+    report = validate_safetensors_subset(module, component_dir, key_mapping=key_mapping)
     expected = set(module.state_dict())
     loaded: set[str] = set()
 
     for filename in report.files:
         with safe_open(filename, framework="pt", device="cpu") as checkpoint:
             for key in checkpoint.keys():
-                if key not in expected:
+                parameter_key = key_mapping.get(key, key)
+                if parameter_key not in expected:
                     continue
-                _assign_tensor(module, key, checkpoint.get_tensor(key))
-                loaded.add(key)
+                _assign_tensor(module, parameter_key, checkpoint.get_tensor(key))
+                loaded.add(parameter_key)
 
     # validate_safetensors_subset already checked this, but keep the invariant
     # local to the mutating operation as well.
@@ -159,3 +208,30 @@ def load_safetensors_subset(module: nn.Module, component_dir: str | Path) -> Saf
     if missing:
         raise RuntimeError(f"Failed to load MiniMax-H3 tensors: {missing[:20]}")
     return SafetensorsSubsetReport(report.component_dir, report.files, tuple(sorted(loaded)), report.ignored_keys)
+
+
+def load_shared_video_vae(module, component_dir, config):
+    """Convert directly into shared CPU storage using the existing dtype policy."""
+    from lightx2v.common.offload.shared_weight_coordinator import coordinate_rank_local_error
+    from lightx2v.common.offload.shared_weight_map import validate_shared_operator_views
+    from lightx2v.models.networks.minimax_h3.shared_block_weights import load_h3_shared_weights
+
+    expected = _expected_specs(module)
+    # Still on meta: determine final parameter dtypes without any payload copy.
+    module._prepare_inference_weights(use_channels_last_encoder=False)
+    runtime_dtypes = {name: dtype for name, (_, dtype) in _expected_specs(module).items()}
+    weights = load_h3_shared_weights(component_dir, config, "video_vae", expected=expected, runtime_dtypes=runtime_dtypes)
+    error = None
+    try:
+        for name in expected:
+            _assign_tensor(module, name, weights.take(name))
+        validate_shared_operator_views(weights, module.state_dict())
+    except Exception as exc:
+        error = exc
+    try:
+        coordinate_rank_local_error("H3 video VAE parameter binding", error)
+    except BaseException:
+        weights.owner.close()
+        raise
+    module.shared_cpu_weight_owner = weights.owner
+    return SafetensorsSubsetReport(Path(component_dir), _component_files(component_dir), tuple(sorted(expected)), 0)

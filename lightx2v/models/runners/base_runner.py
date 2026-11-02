@@ -7,17 +7,9 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 
+from lightx2v.utils.input_info import INPUT_INFO_TYPES, InputInfo
+from lightx2v.utils.utils import seed_all
 from lightx2v_platform.base.global_var import AI_DEVICE
-
-
-class TaskStopped(Exception):
-    """Raised by check_stop() when a cancellation/pause is observed.
-
-    A subclass of Exception so the existing broad `except Exception` handlers
-    still catch it, but a distinct type so callers can tell "the user cancelled"
-    apart from "inference blew up" — the former must not be logged or reported
-    as a failure, and check_stop() has already run end_run() teardown.
-    """
 
 
 class BaseRunner(ABC):
@@ -26,8 +18,15 @@ class BaseRunner(ABC):
     Defines interface methods that all subclasses must implement
     """
 
+    input_info_cls_by_task: dict[str, type[InputInfo]] = {}
+    supported_request_fields_by_task: dict[str, frozenset[str]] = {}
+
     def __init__(self, config):
         self.config = config
+        task = config.get("task")
+        if task is not None and task not in self.supported_request_fields_by_task:
+            raise ValueError(f"{type(self).__name__} does not support task {task!r}")
+        self.supported_tasks = self.get_supported_tasks()
         self.vae_encoder_need_img_original = False
         self.input_info = None
         self.enable_reuse = config.get("enable_reuse", False)
@@ -36,17 +35,6 @@ class BaseRunner(ABC):
         self._gc_frozen = False  # one-shot guard for _maybe_freeze_gc()
         self._init_modules_depth = 0
         self._warmup_done = False
-
-        self.input_broadcast_group = None
-
-        # Read once, off the hot path: check_stop() no longer routes the
-        # stop/pause flag through a designated rank, so these two select
-        # nothing any more. Say so instead of letting someone tune a knob
-        # that is not wired to anything.
-        for var in ("WORKER_RANK", "READER_RANK"):
-            value = os.getenv(var, "0")
-            if value not in ("", "0"):
-                logger.info(f"{var}={value} no longer selects a rank: check_stop() all-reduces the stop/pause flag across every rank")
 
     def __init_subclass__(cls, **kwargs):
         """Install common lifecycle hooks around runner entry points."""
@@ -89,6 +77,74 @@ class BaseRunner(ABC):
         if self.config.get("warmup", False):
             raise NotImplementedError(f"Warmup is not supported for {type(self).__name__}")
 
+    def close(self):
+        """Release resources after the last request."""
+        close_weights = getattr(getattr(self, "model", None), "close_numa_cpu_weights", None)
+        if close_weights is not None:
+            close_weights()
+
+    def get_supported_tasks(self):
+        """Return tasks accepted by this initialized runner."""
+        task = self.config.get("task")
+        if task is None:
+            raise ValueError("task must be set when the runner is created")
+        return (task,)
+
+    def create_input_info(self, request_data):
+        """Apply startup defaults, then explicit request values, to a fresh context.
+
+        Subclasses can validate merged values or resolve model-specific defaults
+        here. Internal warmup also uses this method, without task admission checks.
+        """
+        task = request_data["task"]
+        input_info_cls = self.input_info_cls_by_task.get(task) or INPUT_INFO_TYPES[task]
+        input_info = input_info_cls()
+        input_info.update(self.config)
+        input_info.update(request_data)
+
+        if "aspect_ratio" in request_data and "size" not in request_data:
+            input_info.size = []
+
+        input_info.seed = self.resolve_request_seed(request_data)
+        return input_info
+
+    def resolve_request_seed(self, request_data):
+        return request_data.get("seed", 42)
+
+    def get_supported_request_fields(self, task):
+        """Return supported request fields for the given task."""
+        supported_request_fields = self.supported_request_fields_by_task[task]
+        if not self.config.get("enable_cfg", False):
+            supported_request_fields = supported_request_fields - {"negative_prompt"}
+        return supported_request_fields
+
+    def prepare_request(self, request_data):
+        """Validate explicit fields before merging startup defaults.
+
+        None means omitted; false, zero and empty containers remain explicit.
+        A startup field need not be supported as a per-request override.
+        """
+        request_data = {key: value for key, value in request_data.items() if value is not None}
+        task = request_data.get("task")
+        if task is None:
+            if len(self.supported_tasks) > 1:
+                raise ValueError("task is required when the runner supports multiple tasks")
+            task = self.supported_tasks[0]
+        request_data["task"] = task
+        if task not in self.supported_tasks:
+            task_names = ", ".join(self.supported_tasks)
+            raise ValueError(f"Task {task!r} is not supported by this runner; expected one of: {task_names}")
+        unsupported_fields = set(request_data) - self.get_supported_request_fields(task)
+        if unsupported_fields:
+            raise ValueError(f"{type(self).__name__} ({task}) does not support request fields: {', '.join(sorted(unsupported_fields))}")
+        return self.create_input_info(request_data)
+
+    def run_request(self, input_info):
+        """Run a request that has already passed request preparation."""
+        if input_info.seed is not None:
+            seed_all(input_info.seed)
+        return self.run_pipeline(input_info)
+
     def set_reuse(self, reuse, reuse_prefix_segments=0):
         if reuse and not self.enable_reuse:
             raise ValueError(f"This {type(self).__name__} service does not enable reuse")
@@ -127,110 +183,6 @@ class BaseRunner(ABC):
         gc.freeze()
         self._gc_frozen = True
         logger.info(f"[GC] gc.collect() reclaimed {collected} objects; gc.freeze() moved ~{n} live tracked objects out of future GC walks")
-
-    def set_input_broadcast_group(self, group):
-        """Attach the server-owned CPU process group used for encoder outputs."""
-        self.input_broadcast_group = group
-
-    # Every field apply_disagg_request_overrides may write, as (container, key)
-    # where container is "config" or "disagg_config". Kept next to the writes so
-    # the two cannot drift: anything added below must be added here as well.
-    _DISAGG_REQUEST_FIELDS = (
-        ("config", "data_bootstrap_room"),
-        ("config", "disagg_phase1_receiver_engine_rank"),
-        ("disagg_config", "bootstrap_room"),
-        ("disagg_config", "decoder_bootstrap_room"),
-        ("disagg_config", "receiver_engine_rank"),
-    )
-
-    def _revert_disagg_request_fields(self, disagg_config):
-        """Undo the previous request's disagg overrides before applying this one.
-
-        DefaultRunner.set_config rolls back the flat keys a request actually sent,
-        but that is not enough here for two reasons:
-
-          * DERIVED writes. ``disagg_bootstrap_room=111`` also writes
-            ``config["data_bootstrap_room"]``; a later request that omits the flat
-            key reverts only the flat key, leaving the derived one at 111.
-          * NESTED writes. ``disagg_config["bootstrap_room"]`` and friends are not
-            top-level config keys at all, so the flat rollback never sees them.
-
-        Either way a request that says nothing about rooms inherits the previous
-        caller's transfer room / receiver rank, which is then used for transfer
-        setup (disagg_mixin.py). Snapshot once, restore every time.
-        """
-        if not hasattr(self, "_disagg_request_baseline"):
-            self._disagg_request_baseline = {}
-            # Careful with the top-level fields: this runs AFTER
-            # DefaultRunner.set_config already applied config_modify, so reading
-            # them from self.config now would snapshot request A's value as the
-            # "baseline" and pin it forever. DefaultRunner recorded the real
-            # pre-request value, so take it from there when it has one.
-            flat_keys = getattr(self, "_config_request_keys", set())
-            flat_baseline = getattr(self, "_config_request_baseline", {})
-            for container_name, key in self._DISAGG_REQUEST_FIELDS:
-                if container_name == "config" and key in flat_keys:
-                    entry = (key in flat_baseline, flat_baseline.get(key))
-                else:
-                    # Nested disagg_config keys are never written by
-                    # config.update(config_modify), so reading them here is safe.
-                    container = self.config if container_name == "config" else disagg_config
-                    entry = (key in container, container.get(key))
-                self._disagg_request_baseline[(container_name, key)] = entry
-
-        for container_name, key in self._DISAGG_REQUEST_FIELDS:
-            container = self.config if container_name == "config" else disagg_config
-            existed, value = self._disagg_request_baseline[(container_name, key)]
-            if existed:
-                container[key] = value
-            else:
-                container.pop(key, None)
-
-    def apply_disagg_request_overrides(self, config_modify):
-        """Mirror flat disagg request fields into ``disagg_config`` in disagg mode only."""
-        if not isinstance(config_modify, dict):
-            return
-        if not self.config.get("disagg_mode"):
-            return
-        disagg_config = self.config.get("disagg_config")
-        if not isinstance(disagg_config, dict):
-            return
-
-        def _safe_int(key):
-            value = config_modify.get(key)
-            if value is None:
-                return None
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return None
-
-        with self.config.temporarily_unlocked():
-            self._revert_disagg_request_fields(disagg_config)
-            data_bootstrap_room = _safe_int("data_bootstrap_room")
-            if data_bootstrap_room is not None:
-                self.config["data_bootstrap_room"] = data_bootstrap_room
-
-            disagg_bootstrap_room = _safe_int("disagg_bootstrap_room")
-            if disagg_bootstrap_room is not None:
-                disagg_config["bootstrap_room"] = disagg_bootstrap_room
-                self.config["data_bootstrap_room"] = disagg_bootstrap_room
-
-            decoder_bootstrap_room = _safe_int("disagg_decoder_bootstrap_room")
-            if decoder_bootstrap_room is not None:
-                disagg_config["decoder_bootstrap_room"] = decoder_bootstrap_room
-
-            phase1_receiver_engine_rank = _safe_int("disagg_phase1_receiver_engine_rank")
-            if phase1_receiver_engine_rank is not None:
-                self.config["disagg_phase1_receiver_engine_rank"] = phase1_receiver_engine_rank
-
-            for flat_key, disagg_key in (
-                ("disagg_phase1_receiver_engine_rank", "receiver_engine_rank"),
-                ("disagg_phase2_sender_engine_rank", "receiver_engine_rank"),
-            ):
-                value = _safe_int(flat_key)
-                if value is not None:
-                    disagg_config[disagg_key] = value
 
     def load_transformer(self):
         """Load transformer model
@@ -350,7 +302,7 @@ class BaseRunner(ABC):
     def end_run(self):
         pass
 
-    def compute_usage(self, prompt: str, target_shape: list[int], has_input_image: bool = False) -> dict | None:
+    def compute_usage(self, prompt: str, size: list[int], has_input_image: bool = False) -> dict | None:
         """Compute token usage for the current generation.
 
         Returns a dict with fields matching the OpenAI Usage schema, or None if
@@ -363,8 +315,8 @@ class BaseRunner(ABC):
             text_tokens = self._get_text_token_count(prompt)
 
             output_image_tokens = 0
-            if target_shape and len(target_shape) >= 2:
-                h, w = target_shape[0], target_shape[1]
+            if size and len(size) >= 2:
+                h, w = size[0], size[1]
                 patched_h = max(1, h // stride_h // patch_h)
                 patched_w = max(1, w // stride_w // patch_w)
                 output_image_tokens = patched_h * patched_w
@@ -431,52 +383,40 @@ class BaseRunner(ABC):
         return 0
 
     def check_stop(self):
-        """Check if a stop/pause signal is received, and agree on it across ranks.
+        """Check if the stop signal is received"""
 
-        Whichever rank holds the flag propagates it. This used to broadcast from
-        a fixed source rank (WORKER_RANK/READER_RANK), which meant the holder and
-        the reader had to be configured to the same rank or the signal was
-        silently dropped: the server path can only set stop_signal on rank 0
-        (that is the only process holding the task's stop_event), while the
-        worker hub sets it on its own target rank. A MAX all-reduce covers both
-        without either side knowing what the other picked, and it collapses the
-        two per-step collectives into one.
-
-        Every rank must reach this together — a rank aborting unilaterally would
-        hang the others on the next collective. That premise fails under data
-        parallelism, where the ranks run different amounts of work: set
-        ``_rank_local_collectives`` for the duration and each rank decides on
-        its own flags instead, agreeing once at a rendezvous the owner arranges.
-        SeedVR segment parallelism does exactly that (see
-        ``SeedVRRunner._sr_seg_rendezvous``) — without it a request whose
-        segment count is not a multiple of the world size deadlocks here, since
-        the ranks holding no segment never reach the all-reduce.
-        """
         rank, world_size = 0, 1
         if dist.is_initialized():
             rank = dist.get_rank()
             world_size = dist.get_world_size()
+        stop_rank = int(os.getenv("WORKER_RANK", "0")) % world_size  # same as worker hub target_rank
+        pause_rank = int(os.getenv("READER_RANK", "0")) % world_size  # same as va_reader target_rank
 
         stopped, paused = 0, 0
-        if hasattr(self, "stop_signal") and self.stop_signal:
+        if rank == stop_rank and hasattr(self, "stop_signal") and self.stop_signal:
             stopped = 1
-        if hasattr(self, "pause_signal") and self.pause_signal:
+        if rank == pause_rank and hasattr(self, "pause_signal") and self.pause_signal:
             paused = 1
 
-        if world_size > 1 and not getattr(self, "_rank_local_collectives", False):
-            signals = torch.tensor([stopped, paused], dtype=torch.int32, device=AI_DEVICE)
-            dist.all_reduce(signals, op=dist.ReduceOp.MAX)
-            stopped, paused = int(signals[0].item()), int(signals[1].item())
+        if world_size > 1:
+            if rank == stop_rank:
+                t1 = torch.tensor([stopped], dtype=torch.int32).to(device=AI_DEVICE)
+            else:
+                t1 = torch.zeros(1, dtype=torch.int32, device=AI_DEVICE)
+            if rank == pause_rank:
+                t2 = torch.tensor([paused], dtype=torch.int32).to(device=AI_DEVICE)
+            else:
+                t2 = torch.zeros(1, dtype=torch.int32, device=AI_DEVICE)
+            dist.broadcast(t1, src=stop_rank)
+            dist.broadcast(t2, src=pause_rank)
+            stopped = t1.item()
+            paused = t2.item()
 
         if stopped == 1:
             try:
                 self.end_run()
             except Exception as e:
                 print(f"end_run failed: {e}")
-            raise TaskStopped(f"find rank: {rank} stop_signal, stop running, it's an expected behavior")
+            raise Exception(f"find rank: {rank} stop_signal, stop running, it's an expected behavior")
         if paused == 1:
-            try:
-                self.end_run()
-            except Exception as e:
-                print(f"end_run failed: {e}")
-            raise TaskStopped(f"find rank: {rank} pause_signal, pause running, it's an expected behavior")
+            raise Exception(f"find rank: {rank} pause_signal, pause running, it's an expected behavior")

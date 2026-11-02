@@ -18,6 +18,7 @@ A powerful model weight conversion tool that supports format conversion, quantiz
 - `wan_dit`: Wan DiT series models (default)
 - `wan_animate_dit`: Wan Animate DiT models
 - `qwen_image_dit`: Qwen Image DiT models
+- `qwen_image_21_dit`: Qwen-Image-2.1 DiT block linears; preserves non-quantized tensors and their dtypes
 - `wan_t5`: Wan T5 text encoder
 - `wan_clip`: Wan CLIP vision encoder
 
@@ -49,6 +50,8 @@ A powerful model weight conversion tool that supports format conversion, quantiz
   - `mxfp4`: MXFP4 quantization
   - `mxfp6`: MXFP6 quantization
   - `mxfp8`: MXFP8 quantization
+- `--quantization_profile`: Optional model-specific policy. `h3-fp8-f16-accum` supports `h3` and
+  `h3_video_vae_decoder` with `--quantized --linear_type fp8 --single_file`.
 - `--non_linear_dtype`: Non-linear layer data type
   - `torch.bfloat16`: BF16
   - `torch.float16`: FP16
@@ -56,7 +59,7 @@ A powerful model weight conversion tool that supports format conversion, quantiz
 - `--device`: Device for quantization, `cpu` or `cuda` (default)
 - `--comfyui_mode`: ComfyUI compatible mode (only int8 and fp8)
 - `--full_quantized`: Full quantization mode (effective in ComfyUI mode)
-For nvfp4, mxfp4, mxfp6 and mxfp8, please install them fllowing LightX2V/lightx2v_kernel/README.md.
+For nvfp4, mxfp4, mxfp6 and mxfp8, please install them fllowing LightX2V/lightx2v_kernel/nvidia/README.md.
 
 ### LoRA Parameters
 
@@ -443,3 +446,52 @@ python converter.py \
     --output_name merged_model \
     --single_file
 ```
+
+## Qwen-Image-2.1 FP8 linears
+
+Set the source and output paths, then convert:
+
+```bash
+python tools/convert/converter.py \
+    --source /path/to/Qwen-Image-2.1/transformer \
+    --output /path/to/Qwen-Image-2.1-fp8 \
+    --output_name qwen_image_21_fp8 \
+    --model_type qwen_image_21_dit \
+    --quantized --linear_type fp8 --device cuda:0 --single_file
+```
+
+This quantizes the 224 block Q/K/V/out and FFN gate/up/down matrices while preserving other tensors and their dtypes.
+Inference uses the existing `fp8-sgl` backend with per-channel E4M3 weights and dynamic per-token activation quantization.
+Install sgl-kernel with support for your GPU.
+
+Copy `configs/qwen_image_21/qwen_image_21.json` to a local config and add these fields for ordinary FP8 DiT weights:
+
+```json
+{
+    "attn_type": "flash_attn2",
+    "text_encoder_cpu_offload": true,
+    "dit_quantized": true,
+    "dit_quant_scheme": "fp8-sgl",
+    "dit_quantized_ckpt": "/path/to/Qwen-Image-2.1-fp8/qwen_image_21_fp8.safetensors"
+}
+```
+
+Set the project and original model paths in `scripts/qwen_image_21/qwen_image_21_t2i_5090_1k.sh`, then select the local config with `CONFIG_JSON=/path/to/local.json`. For I2I, use `qwen_image_21_i2i_5090_1k.sh`. The scripts read JSON directly; keep `model_path` pointed at the original model directory.
+
+### FP16 accumulation on SM120
+
+Use the reduced-range profile when converting weights for `fp8-f16-accum`:
+
+```bash
+python tools/convert/converter.py \
+    --source /path/to/Qwen-Image-2.1/transformer \
+    --output /path/to/Qwen-Image-2.1-fp8-f16-accum \
+    --output_name qwen_image_21_fp8_f16_accum \
+    --model_type qwen_image_21_dit \
+    --quantization_profile qwen-image-21-fp8-f16-accum \
+    --quantized --linear_type fp8 --device cuda:0 --single_file
+```
+
+This profile uses weight qmax=14. The `qwen_image_21_5090_1k.json` config selects `fp8-f16-accum` and activation qmax=7 through `dit_fp8_activation_qmax`. Set its checkpoint path and the project/model paths in `qwen_image_21_t2i_5090_1k.sh`.
+The recommended config also requires `text_encoder_quantized_ckpt`; see the `convert_qwen_image_21_text_encoder_fp8` docstring in [converter.py](converter.py) for its conversion command.
+Requires the SM120 FP16 accumulation op in lightx2v-kernel-nvidia (or a compatible legacy lightx2v-kernel wheel). Startup rejects ordinary FP8 checkpoints and unavailable kernels. Raising activation qmax can overflow FP16 accumulation; validate numerical and image quality when changing it.

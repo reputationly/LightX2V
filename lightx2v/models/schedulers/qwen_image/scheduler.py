@@ -1,5 +1,4 @@
 import inspect
-import json
 import math
 import os
 from math import prod
@@ -439,8 +438,7 @@ class QwenImageScheduler(BaseScheduler):
             self.layers = config.get("layers", 4)
         scheduler_path = config.get("scheduler_path", os.path.join(config["model_path"], "scheduler"))
         self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
-        with open(os.path.join(config["model_path"], "scheduler", "scheduler_config.json"), "r") as f:
-            self.scheduler_config = json.load(f)
+        self.scheduler_config = self.scheduler.config
         self.dtype = torch.bfloat16
         self.sample_guide_scale = self.config.get("sample_guide_scale", None)
         self.zero_cond_t = config.get("zero_cond_t", False)
@@ -581,7 +579,7 @@ class QwenImageScheduler(BaseScheduler):
         if self.latents.shape[0] != 1:
             raise ValueError(f"i2i_denoise_strength currently supports single-image single-output editing only, got output latent batch {self.latents.shape[0]}.")
 
-        shape = input_info.target_shape
+        shape = input_info.latent_shape
         target_height, target_width = shape[-2], shape[-1]
         num_channels_latents = self.latents.shape[-1] // 4
         image_latents = self._resize_i2i_image_latents(image_latents, target_height, target_width, num_channels_latents)
@@ -592,7 +590,7 @@ class QwenImageScheduler(BaseScheduler):
 
     def prepare_latents(self, input_info):
         self.input_info = input_info
-        shape = input_info.target_shape
+        shape = input_info.latent_shape
         # shape: [B, T, C, H, W]
         width, height = shape[-1], shape[-2]
         num_channels_latents = self.config.get("num_channels_latents", 16)
@@ -629,7 +627,7 @@ class QwenImageScheduler(BaseScheduler):
             image_seq_len = self.latents.shape[1]
             if self.is_layered:
                 base_seqlen = 256 * 256 / 16 / 16
-                image_seq_len = self.latents.shape[1] // 5
+                image_seq_len = self.latents.shape[1] // (self.layers + 1)
                 mu = (image_seq_len / base_seqlen) ** 0.5
             else:
                 mu = calculate_shift(

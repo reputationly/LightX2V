@@ -1,9 +1,7 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
 import gc
 import os
-import random
 import subprocess
-import sys
 
 import numpy as np
 import torch
@@ -14,7 +12,8 @@ from torchvision import transforms
 from lightx2v.models.input_encoders.hf.wan.s2v.audio_encoder import AudioEncoder
 from lightx2v.models.networks.wan.s2v_model import WanS2VModel
 from lightx2v.models.networks.wan.s2v_utils import get_size_less_than_area
-from lightx2v.models.runners.wan.wan_runner import MultiModelStruct, WanRunner
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
+from lightx2v.models.runners.wan.wan_runner import WanRunner
 from lightx2v.models.schedulers.wan.s2v.s2v_scheduler import WanS2VScheduler
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import GET_DTYPE
@@ -55,12 +54,17 @@ def merge_video_audio(video_path: str, audio_path: str):
 
 @RUNNER_REGISTER("wan2.2_s2v")
 class WanS2VRunner(WanRunner):
+    supported_request_fields_by_task = {
+        "s2v": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"audio_path", "image_path", "pose_video_path"},
+    }
+
     def __init__(self, config):
+        config.setdefault("fps", 16)
         self.vae_name = "Wan2.1_VAE.pth"
         super().__init__(config)
         assert self.config["task"] == "s2v"
         self.param_dtype = GET_DTYPE()
-        self.fps = self.config["target_fps"]
+        self.fps = self.config["fps"]
         self.audio_sample_m = 0
 
     def init_scheduler(self):
@@ -119,7 +123,7 @@ class WanS2VRunner(WanRunner):
     @staticmethod
     def read_pose_video_frames(video_path, n_frames, target_fps=16, reverse=False):
         if VideoReader is None:
-            raise ImportError("decord is required for src_pose_path (pip install decord)")
+            raise ImportError("decord is required for pose_video_path (pip install decord)")
         vr = VideoReader(video_path)
         original_fps = vr.get_avg_fps()
         total_frames = len(vr)
@@ -137,7 +141,7 @@ class WanS2VRunner(WanRunner):
     def load_pose_cond(self, pose_video, num_repeat, infer_frames, height, width):
         """Align with Wan2.2 WanS2V.load_pose_cond: VAE-encoded pose latents per clip."""
         offload = self.config.get("cpu_offload", False)
-        fps = self.config["target_fps"]
+        fps = self.config["fps"]
         resize_op = transforms.Resize(min(height, width))
         crop_op = transforms.CenterCrop((height, width))
 
@@ -199,15 +203,6 @@ class WanS2VRunner(WanRunner):
             num_repeat = audio_num_repeat
         else:
             num_repeat = int(cfg_repeat)
-            if num_repeat < audio_num_repeat:
-                # The muxed track is cut with -shortest, so a capped num_repeat silently
-                # returns a video shorter than the audio the caller sent. Say so.
-                clip_seconds = self.config["infer_frames"] / self.config["target_fps"]
-                logger.warning(
-                    f"num_repeat={num_repeat} caps this request at {num_repeat * clip_seconds:.1f}s; "
-                    f"the audio needs {audio_num_repeat} clips ({audio_num_repeat * clip_seconds:.1f}s) "
-                    f"and will be truncated. Set num_repeat to null to follow the audio."
-                )
 
         model_pic = crop_op(resize_op(Image.fromarray(ref_image)))
 
@@ -217,7 +212,6 @@ class WanS2VRunner(WanRunner):
         motion_frames = self.config["motion_frames"]
         motion_latents = torch.zeros([1, 3, motion_frames, height, width], dtype=self.param_dtype, device=AI_DEVICE)
 
-        neg_prompt = self.input_info.negative_prompt or self.config.get("sample_neg_prompt", "")
         with ProfilingContext4DebugL1(
             "Run Text Encoder",
             recorder_mode=GET_RECORDER_MODE(),
@@ -225,26 +219,13 @@ class WanS2VRunner(WanRunner):
             metrics_labels=["WanS2VRunner"],
         ):
             text_encoder_output = self.run_text_encoder(self.input_info)
-        context = text_encoder_output["context"]
-        context_null = text_encoder_output.get("context_null")
-
-        if context_null is None:
-            with ProfilingContext4DebugL1("Run Text Encoder (negative)"):
-                t5_offload = self.config.get("t5_cpu_offload", self.config.get("cpu_offload", False))
-                text_encoder = self.text_encoders[0]
-                if not t5_offload:
-                    text_encoder.model.to(AI_DEVICE)
-                context_null = text_encoder.infer([neg_prompt])
-                if t5_offload:
-                    text_encoder.model.cpu()
 
         return {
             "ref_pixel_values": ref_pixel_values,  # check
             "motion_latents": motion_latents,  # todo in pose
             "audio_emb": audio_emb,  # check diff: grade_fn
             "num_repeat": num_repeat,  # check
-            "context": context,  # check
-            "context_null": context_null,  # check
+            "text_encoder_output": text_encoder_output,
             "height": height,  # check
             "width": width,  # check
             "seed": self.input_info.seed,
@@ -260,27 +241,6 @@ class WanS2VRunner(WanRunner):
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
         return images
-
-    def stabilize_first_frame(self, video):
-        """Replace the VAE boundary frame with its immediate successor.
-
-        Causal Wan VAE decoding can leave a one-frame bright/ghosted transition
-        where the prepended reference latent meets the generated latent stream.
-        This opt-in correction changes only 1/fps seconds and keeps the full
-        output duration and audio timeline intact.
-
-        The seam only exists on the first clip of a drop_first_motion run, where
-        the ref latent is what gets prepended before decoding. Without
-        drop_first_motion the first clip decodes [motion_latents, latents] and
-        frame 0 is an ordinary frame, so leave it alone.
-        """
-        if not self.config.get("s2v_stabilize_first_frame", False) or video.shape[2] < 2:
-            return video
-        if not self.config["drop_first_motion"]:
-            return video
-        video = video.clone()
-        video[:, :, 0] = video[:, :, 1]
-        return video
 
     def run_dit_clip(self, dit_inputs):
         infer_steps = self.scheduler.infer_steps
@@ -309,28 +269,25 @@ class WanS2VRunner(WanRunner):
                 self.vae_encoder.to_cuda()
 
             with torch.amp.autocast(str(AI_DEVICE), dtype=self.vae_encoder.dtype):
-                # cpu_offload: inputs were staged on the VAE's original (cpu) device but the
-                # VAE itself was just moved to cuda -- mixed-device conv3d dispatches to
-                # slow_conv3d_forward which has no CUDA kernel.
-                ref_latents = self.vae_encoder.encode(inputs["ref_pixel_values"].to(AI_DEVICE)).unsqueeze(0)
-                motion_latents = self.vae_encoder.encode(inputs["motion_latents"].to(AI_DEVICE)).unsqueeze(0)
+                ref_latents = self.vae_encoder.encode(inputs["ref_pixel_values"]).unsqueeze(0)
+                motion_latents = self.vae_encoder.encode(inputs["motion_latents"]).unsqueeze(0)
             if offload:
                 self.vae_encoder.to_cpu()
 
         videos_last_frames = inputs["motion_latents"].detach()
         out_clips = []
-        seed = inputs["seed"] if inputs["seed"] >= 0 else random.randint(0, sys.maxsize)
+        seed = inputs["seed"]
 
         num_repeat = inputs["num_repeat"]
-        src_pose_path = getattr(self.input_info, "src_pose_path", None) or ""
-        if src_pose_path and os.path.isfile(src_pose_path):
+        pose_video_path = getattr(self.input_info, "pose_video_path", None) or ""
+        if pose_video_path and os.path.isfile(pose_video_path):
             with ProfilingContext4DebugL1("Load pose cond"):
-                pose_conds = self.load_pose_cond(src_pose_path, num_repeat, infer_frames, height, width)
-            logger.info(f"Loaded pose cond from {src_pose_path} ({len(pose_conds)} clips)")
+                pose_conds = self.load_pose_cond(pose_video_path, num_repeat, infer_frames, height, width)
+            logger.info(f"Loaded pose cond from {pose_video_path} ({len(pose_conds)} clips)")
         else:
             pose_conds = None
-            if src_pose_path:
-                logger.warning(f"src_pose_path not found, ignoring: {src_pose_path}")
+            if pose_video_path:
+                logger.warning(f"pose_video_path not found, ignoring: {pose_video_path}")
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=self.param_dtype):
             for r in range(num_repeat):
@@ -356,10 +313,7 @@ class WanS2VRunner(WanRunner):
                     audio_input = inputs["audio_emb"][..., left_idx:right_idx]
 
                     dit_inputs = {
-                        "text_encoder_output": {
-                            "context": inputs["context"],
-                            "context_null": inputs["context_null"],
-                        },
+                        "text_encoder_output": inputs["text_encoder_output"],
                         "s2v": {
                             "ref_latents": ref_latents,
                             "motion_latents": motion_latents.clone(),
@@ -370,8 +324,6 @@ class WanS2VRunner(WanRunner):
                             "add_last_motion": 2,
                         },
                     }
-                    if self.config.get("s2v_context_latents", False):
-                        dit_inputs["s2v"]["context_latents"] = [ref_latents]
 
                     with ProfilingContext4DebugL2("Run DiT"):
                         latents = self.run_dit_clip(dit_inputs)
@@ -386,8 +338,6 @@ class WanS2VRunner(WanRunner):
                     image = image[:, :, -infer_frames:]
                     if drop_first_motion and r == 0:
                         image = image[:, :, 3:]
-                    if r == 0:
-                        image = self.stabilize_first_frame(image)
 
                     overlap = min(motion_frames, image.shape[2])
                     image = image.to(AI_DEVICE)
@@ -426,7 +376,7 @@ class WanS2VRunner(WanRunner):
         if self.input_info.save_result_path is not None and is_main_process():
             out_path = self.input_info.save_result_path
             os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-            save_to_video(self.gen_video_final, out_path, fps=self.config["target_fps"], method="ffmpeg")
+            save_to_video(self.gen_video_final, out_path, fps=self.config["fps"], method="ffmpeg")
             audio_path = getattr(self.input_info, "audio_path", None)
             if audio_path and os.path.isfile(audio_path):
                 try:
@@ -456,100 +406,3 @@ class WanS2VRunner(WanRunner):
         if GET_RECORDER_MODE():
             monitor_cli.lightx2v_worker_request_success.inc()
         return result
-
-
-class S2VMultiModelStruct(MultiModelStruct):
-    """Lazy single-resident high/low expert router for Wan2.2 S2V."""
-
-    def __init__(self, config, boundary, num_train_timesteps, paths, init_device):
-        super().__init__([None, None], config, boundary, num_train_timesteps)
-        self.paths = paths
-        self.init_device = init_device
-
-    @property
-    def device(self):
-        model = self.model[self.cur_model_index] if self.cur_model_index >= 0 else None
-        return model.device if model is not None else self.init_device
-
-    def _build(self, index):
-        tag = "HIGH" if index == 0 else "LOW"
-        logger.info(f"[s2v-moe] loading {tag}-noise expert from {self.paths[index]}")
-        model = WanS2VModel(self.paths[index], self.config, self.init_device)
-        model.set_scheduler(self.scheduler)
-        return model
-
-    def _free(self, index):
-        if self.model[index] is not None:
-            logger.info(f"[s2v-moe] releasing {'HIGH' if index == 0 else 'LOW'}-noise expert")
-            self.model[index] = None
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    def get_current_model_index(self):
-        # Deliberately does NOT reproduce the parent's per-expert
-        # `scheduler.sample_guide_scale = config["sample_guide_scale"][index]`:
-        # WanS2VScheduler reads that key as a scalar (float(...)), so a per-expert
-        # list would fail at scheduler construction. WanS2VMoeRunner rejects a list
-        # up front; both experts therefore share one guidance scale.
-        index = 0 if self.scheduler.timesteps[self.scheduler.step_index] >= self.boundary_timestep else 1
-        self.cur_model_index = index
-        return index
-
-    def infer(self, inputs):
-        index = self.get_current_model_index()
-        if self.model[index] is None:
-            # Single-resident: release the other expert before building this one, so peak
-            # footprint stays at one expert. Cost is one full expert load from disk at each
-            # high->low crossing, i.e. two loads per clip. See docs/bernini_s2v.md.
-            self._free(1 - index)
-            self.model[index] = self._build(index)
-        self.model[index].infer(inputs)
-
-    # Residency is handled by build/free above, so the parent's model-level moves are
-    # never needed here -- and would hit None for the non-resident expert. Keep them
-    # harmless rather than letting a stray caller raise AttributeError.
-    def offload_cpu(self, model_index):
-        if self.model[model_index] is not None:
-            self.model[model_index].to_cpu()
-
-    def to_cuda(self, model_index):
-        if self.model[model_index] is not None:
-            self.model[model_index].to_cuda()
-
-
-@RUNNER_REGISTER("wan2.2_s2v_moe")
-class WanS2VMoeRunner(WanS2VRunner):
-    """Bernini-R-S2V dual-expert runner with explicit asset validation."""
-
-    def __init__(self, config):
-        # Before super(): DefaultRunner.__init__ builds WanS2VScheduler, which does
-        # float(config["sample_guide_scale"]) and would raise an opaque TypeError first.
-        if isinstance(config.get("sample_guide_scale"), (list, tuple)):
-            raise ValueError("wan2.2_s2v_moe shares one guidance scale across both experts; sample_guide_scale must be a scalar, not a per-expert list.")
-        # S2VMultiModelStruct overrides get_current_model_index and so never runs the
-        # parent's model-level to_cuda/offload_cpu dance. Under cpu_offload the experts
-        # are built on cpu (DefaultRunner.set_init_device) and would silently stay there.
-        # Block granularity is fine -- it offloads inside the resident expert.
-        if config.get("cpu_offload", False) and config.get("offload_granularity", "block") == "model":
-            raise ValueError("wan2.2_s2v_moe manages expert residency itself; use offload_granularity 'block', not 'model'.")
-        super().__init__(config)
-        self.high_noise_model_path = config.get("high_noise_original_ckpt") or os.path.join(config["model_path"], "high_noise_model")
-        self.low_noise_model_path = config.get("low_noise_original_ckpt") or os.path.join(config["model_path"], "low_noise_model")
-        self._validate_expert(self.high_noise_model_path, "high")
-        self._validate_expert(self.low_noise_model_path, "low")
-
-    @staticmethod
-    def _validate_expert(path, label):
-        required = ["config.json", "diffusion_pytorch_model.safetensors.index.json", "non_block.safetensors"]
-        required.extend(f"block_{index}.safetensors" for index in range(40))
-        missing = [name for name in required if not os.path.exists(os.path.join(path, name))]
-        if missing:
-            preview = ", ".join(missing[:5])
-            raise FileNotFoundError(f"{label}-noise S2V expert is incomplete at {path}: {preview}")
-
-    def load_transformer(self):
-        boundary = self.config.get("boundary", 0.875)
-        num_train_timesteps = self.config.get("num_train_timesteps", 1000)
-        paths = {0: self.high_noise_model_path, 1: self.low_noise_model_path}
-        logger.info(f"[s2v-moe] high={paths[0]} low={paths[1]} boundary={boundary}")
-        return S2VMultiModelStruct(self.config, boundary, num_train_timesteps, paths, self.init_device)

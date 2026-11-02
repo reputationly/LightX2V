@@ -1,5 +1,4 @@
 import asyncio
-import gc
 import os
 import time
 from pathlib import Path
@@ -8,28 +7,11 @@ from typing import Any, Dict
 import torch
 from loguru import logger
 
-from lightx2v.infer import init_runner
-from lightx2v.models.runners.base_runner import TaskStopped
-from lightx2v.utils.input_info import init_empty_input_info, update_input_info_from_dict
-from lightx2v.utils.set_config import set_config, set_parallel_config
+from lightx2v.models.runners.runner_factory import build_runner
+from lightx2v.utils.set_config import build_startup_config, init_parallel
 
-from ...task_manager import task_manager
 from ..distributed_utils import DistributedManager
 from .pipeline_image_encode import encode_pipeline_return_to_png_bytes
-
-
-class _EventFlag:
-    """Adapter for check_stop(), which tests ``runner.stop_signal`` for plain
-    truthiness on every denoise step. A bare threading.Event defines no
-    __bool__, so it would read as permanently set — delegate to is_set()."""
-
-    __slots__ = ("_event",)
-
-    def __init__(self, event):
-        self._event = event
-
-    def __bool__(self) -> bool:
-        return self._event.is_set()
 
 
 class TorchrunInferenceWorker:
@@ -63,19 +45,24 @@ class TorchrunInferenceWorker:
                 else:
                     logger.info(f"LoRA directory set to: {self.lora_dir}")
 
-            config = set_config(args)
+            config = build_startup_config(
+                {
+                    "config_json": args.config_json,
+                    "model_cls": args.model_cls,
+                    "model_variant": args.model_variant,
+                    "model_path": args.model_path,
+                    "task": args.task,
+                }
+            )
 
             if config["parallel"]:
-                set_parallel_config(config)
+                init_parallel(config)
 
             if self.rank == 0:
                 logger.info(f"Config:\n {config}")
 
-            self.runner = init_runner(config)
-            self.runner.set_input_broadcast_group(self.dist_manager.task_pg)
-            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed")
-
-            self.input_info = init_empty_input_info(args.task)
+            self.runner = build_runner(config)
+            logger.info(f"Rank {self.rank}/{self.world_size - 1} initialization completed; supported tasks: {', '.join(self.runner.supported_tasks)}")
 
             return True
 
@@ -83,59 +70,18 @@ class TorchrunInferenceWorker:
             logger.exception(f"Rank {self.rank} initialization failed: {str(e)}")
             return False
 
-    def _attach_progress_callback(self, task_id: Any) -> None:
-        """Feed the runner's per-step progress into the task manager so
-        /v1/tasks/{id}/status can report it (the GPUStack facade folds phase +
-        phase_progress into a global percentage).
-
-        Re-attached per request so a callback can never write into a previous
-        task's row. Only rank 0 serves the status API; other ranks would be
-        writing to a task manager nobody reads.
-        """
-        setter = getattr(self.runner, "set_progress_callback", None)
-        if setter is None:
-            return
-        if not task_id or self.rank != 0:
-            setter(None)
-            return
-
-        def _report(current: float, total: float) -> None:
-            # The runner reports (percent, 100) across all segments; that whole
-            # span is the denoise phase as far as the contract is concerned.
-            task_manager.update_progress(task_id, "denoise", (current * 100.0 / total) if total else 0.0)
-
-        setter(_report)
-
-    def _attach_stop_signal(self, stop_event: Any) -> None:
-        """Wire the task's cancellation flag into the runner so check_stop()
-        can abort the denoise loop.
-
-        Only rank 0 has the task's stop_event; check_stop() all-reduces the flag
-        so every rank breaks out on the same step — a rank aborting unilaterally
-        would hang the others on the next collective.
-
-        Re-attached per request, and cleared when there is no event, so a stale
-        flag can never abort the following task.
-        """
-        self.runner.stop_signal = _EventFlag(stop_event) if stop_event is not None else None
-
-    async def process_request(self, task_data: Dict[str, Any], stop_event: Any = None) -> Dict[str, Any]:
+    async def process_request(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         has_error = False
-        was_stopped = False
         error_msg = ""
         error_type = ""
         pipeline_return = None
-        return_pipeline_result = False
+        task_id = task_data.get("task_id", "unknown")
 
         try:
-            # Attached before anything else can raise: leaving a previous task's
-            # (already set) flag on the runner would abort this one instantly.
-            self._attach_stop_signal(stop_event)
-
             if self.world_size > 1 and self.rank == 0:
                 task_data = self.dist_manager.broadcast_task_data(task_data)
 
-            return_pipeline_result = bool(task_data.pop("_return_pipeline_result", False))
+            task_id = task_data.pop("task_id", "unknown")
 
             # Handle dynamic LoRA loading
             lora_name = task_data.pop("lora_name", None)
@@ -143,88 +89,28 @@ class TorchrunInferenceWorker:
             reuse = task_data.pop("reuse", False)
             reuse_prefix_segments = task_data.pop("reuse_prefix_segments", 0)
 
+            input_info = self.runner.prepare_request(task_data)
             if self.lora_dir:
                 self.switch_lora(lora_name, lora_strength)
 
-            task_data["task"] = self.runner.config["task"]
-            task_data["return_result_tensor"] = bool(task_data.get("return_result_tensor", False))
-            task_data["negative_prompt"] = task_data.get("negative_prompt", "")
-
-            target_fps = task_data.pop("target_fps", None)
-            if target_fps is not None:
-                vfi_cfg = self.runner.config.get("video_frame_interpolation")
-                if vfi_cfg:
-                    task_data["video_frame_interpolation"] = {**vfi_cfg, "target_fps": target_fps}
-                else:
-                    logger.warning(f"Target FPS {target_fps} is set, but video frame interpolation is not configured")
-
-            # 每个请求都重建 input_info。上游只对 {sensenova_vision, swiftvr} 重置,
-            # 但 update_input_info_from_dict 只覆盖客户端显式传的字段,复用旧对象会让
-            # 媒体路径(src_video/src_ref_images/...)和标量(sr_ratio)跨请求泄漏 —— VACE/SR
-            # 实测踩过。无条件重置是上游做法的超集,同样覆盖它关心的那两个 model_cls。
-            self.input_info = init_empty_input_info(self.runner.config["task"])
-            update_input_info_from_dict(self.input_info, task_data)
-
             self.runner.set_reuse(reuse, reuse_prefix_segments)
-            self.runner.set_config(task_data)
-            self._attach_progress_callback(task_data.get("task_id"))
-            pipeline_return = self.runner.run_pipeline(self.input_info)
+            pipeline_return = self.runner.run_request(input_info)
 
             await asyncio.sleep(0)
-
-        except TaskStopped as e:
-            # Expected path, not a failure: the user cancelled and every rank
-            # agreed to break out on the same step. check_stop() already ran
-            # end_run(), so skip that here — but still hand the allocator its
-            # memory back, or the next task inherits a half-full GPU.
-            was_stopped = True
-            logger.info(f"Rank {self.rank} inference stopped: {e}")
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-            except Exception:
-                pass
 
         except Exception as e:
             has_error = True
             error_msg = str(e)
             error_type = type(e).__name__
             logger.exception(f"Rank {self.rank} inference failed: {error_msg}")
-            # A failed task (e.g. CUDA OOM) leaves scheduler latents, text-encoder
-            # outputs and reserved allocator memory on the GPU because run_main's
-            # end_run() is skipped on exception. In a persistent worker that
-            # "poisons" the process — every subsequent task then OOMs. Run the same
-            # teardown end_run() does so the GPU returns to idle after any failure.
-            try:
-                self.runner.end_run()
-            except Exception as cleanup_err:
-                logger.warning(f"Rank {self.rank} post-failure end_run cleanup raised: {cleanup_err}")
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-            except Exception:
-                pass
-
-        finally:
-            # Never let this request's flag outlive it — the next task gets a
-            # fresh one, and an already-set leftover would abort it on step 1.
-            self.runner.stop_signal = None
 
         if self.world_size > 1:
             self.dist_manager.barrier()
 
         if self.rank == 0:
-            if was_stopped:
-                return {
-                    "task_id": task_data.get("task_id", "unknown"),
-                    "status": "cancelled",
-                    "message": "Inference cancelled by user",
-                }
             if has_error:
                 return {
-                    "task_id": task_data.get("task_id", "unknown"),
+                    "task_id": task_id,
                     "status": "failed",
                     "error": error_msg,
                     "error_type": error_type,
@@ -232,7 +118,7 @@ class TorchrunInferenceWorker:
                 }
             else:
                 out: Dict[str, Any] = {
-                    "task_id": task_data["task_id"],
+                    "task_id": task_id,
                     "status": "success",
                     "save_result_path": task_data.get("save_result_path"),
                     "message": "Inference completed",
@@ -241,18 +127,16 @@ class TorchrunInferenceWorker:
                     encode_start = time.perf_counter()
                     png = encode_pipeline_return_to_png_bytes(pipeline_return)
                     encode_elapsed_ms = (time.perf_counter() - encode_start) * 1000
-                    logger.info(f"Task {task_data.get('task_id')} encode result_png cost {encode_elapsed_ms:.2f} ms")
+                    logger.info(f"Task {task_id} encode result_png cost {encode_elapsed_ms:.2f} ms")
                     if png:
                         out["result_png"] = png
                     usage = self.runner.compute_usage(
                         prompt=task_data.get("prompt", ""),
-                        target_shape=task_data.get("target_shape", []),
+                        size=task_data.get("size", []),
                         has_input_image=bool(task_data.get("image_path")),
                     )
                     if usage:
                         out["usage"] = usage
-                if return_pipeline_result:
-                    out["pipeline_return"] = pipeline_return
                 return out
         else:
             return None
@@ -324,4 +208,8 @@ class TorchrunInferenceWorker:
                 continue
 
     def cleanup(self):
-        self.dist_manager.cleanup()
+        try:
+            if self.runner is not None:
+                self.runner.close()
+        finally:
+            self.dist_manager.cleanup()

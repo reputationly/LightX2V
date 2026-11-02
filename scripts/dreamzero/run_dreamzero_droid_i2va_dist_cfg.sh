@@ -1,9 +1,9 @@
 #!/bin/bash
 
 # set path firstly
-lightx2v_path=/data/nvme1/yongyang/nb/LightX2V
-model_path=/data/nvme1/yongyang/nb/models/GEAR-Dreams/DreamZero-DROID
-input_path=/data/nvme1/yongyang/nb/dreamzero/debug_image
+lightx2v_path=/path/to/LightX2V
+model_path=/path/to/DreamZero-DROID
+input_path=/path/to/camera_inputs
 
 export CUDA_VISIBLE_DEVICES=6,7
 
@@ -17,6 +17,7 @@ torchrun --nproc_per_node=2 -m lightx2v.infer \
 --config_json ${lightx2v_path}/configs/dreamzero/dreamzero_droid_i2va_dist_cfg.json \
 --seed 1140 \
 --prompt "Move the pan forward and use the brush in the middle of the plates to brush the inside of the pan" \
+--negative_prompt "Vibrant colors, overexposed, static, blurry details, text, subtitles, style, artwork, painting, image, still, grayscale, dull, worst quality, low quality, JPEG artifacts, ugly, mutilated, extra fingers, bad hands, bad face, deformed, disfigured, mutated limbs, fused fingers, stagnant image, cluttered background, three legs, many people in the background, walking backwards." \
 --image_path $input_path \
 --save_result_path ${lightx2v_path}/save_results/output_lightx2v_dreamzero_droid_i2va_dist_cfg.mp4 \
 --save_action_path ${lightx2v_path}/save_results/output_lightx2v_dreamzero_droid_i2va_dist_cfg_actions.npy

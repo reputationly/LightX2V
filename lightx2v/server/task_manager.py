@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 
 from .metrics import monitor_cli
+from .schema import Usage
 
 
 def _env_positive_int(name: str, default: int) -> int:
@@ -35,13 +36,6 @@ class TaskStatus(Enum):
     CANCELLED = "cancelled"
 
 
-# Once a task reaches one of these it must never move again. The inference
-# pipeline does not observe stop_event mid-denoise, so a cancelled task keeps
-# running and still reports a result minutes later — without this guard that
-# late result would overwrite CANCELLED with COMPLETED.
-TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
-
-
 @dataclass
 class TaskInfo:
     task_id: str
@@ -53,14 +47,7 @@ class TaskInfo:
     error_type: Optional[str] = None
     save_result_path: Optional[str] = None
     result_png: Optional[bytes] = None
-    usage: Optional[dict] = None
-    result_data: Optional[dict] = None
-    # Progress contract shared with the GPUStack facade: the phase we are in and
-    # how far through it. The facade owns the stage weights and folds these into
-    # a global percentage, so nothing here needs to know what fraction of a job
-    # denoising represents.
-    phase: Optional[str] = None
-    phase_progress: float = 0.0
+    usage: Usage | dict | None = None
     stop_event: threading.Event = field(default_factory=threading.Event)
     thread: Optional[threading.Thread] = None
 
@@ -111,12 +98,6 @@ class TaskManager:
                 raise KeyError(f"Task {task_id} not found")
 
             task = self._tasks[task_id]
-            if task.status in TERMINAL_STATUSES:
-                # Cancelled between the scheduler picking this id off the pending
-                # queue and us getting here — don't resurrect it into PROCESSING.
-                logger.info(f"Task {task_id} already {task.status.value}, not starting")
-                return task
-
             task.status = TaskStatus.PROCESSING
             task.start_time = datetime.now()
 
@@ -125,29 +106,12 @@ class TaskManager:
 
             return task
 
-    def update_progress(self, task_id: str, phase: str, phase_progress: float):
-        """Record where a running task is. Called from the inference thread on
-        every denoise step, so it stays a plain dict write under the existing
-        lock — no logging, no allocation.
-
-        Terminal tasks are ignored on purpose: cancel_task() flips the status
-        while the pipeline is still running (stop_event never reaches the
-        denoise loop), so late callbacks would otherwise keep advancing the
-        progress of an already-cancelled task for minutes."""
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if task is None or task.status is not TaskStatus.PROCESSING:
-                return
-            task.phase = phase
-            task.phase_progress = max(0.0, min(100.0, float(phase_progress)))
-
     def complete_task(
         self,
         task_id: str,
         save_result_path: Optional[str] = None,
         result_png: Optional[bytes] = None,
-        usage: Optional[dict] = None,
-        result_data: Optional[dict] = None,
+        usage: Usage | dict | None = None,
     ):
         with self._lock:
             if task_id not in self._tasks:
@@ -155,22 +119,11 @@ class TaskManager:
                 return
 
             task = self._tasks[task_id]
-            if task.status in TERMINAL_STATUSES:
-                logger.info(f"Task {task_id} already {task.status.value}, ignoring completion")
-                return
-
             task.status = TaskStatus.COMPLETED
             task.end_time = datetime.now()
             task.save_result_path = save_result_path
             task.result_png = result_png
             task.usage = usage
-            task.result_data = result_data
-
-            # Settle the progress contract: no phase left to report, and the
-            # facade should fold this into a full bar rather than whatever the
-            # last denoise step happened to write.
-            task.phase = None
-            task.phase_progress = 100.0
 
             if result_png is not None:
                 self._evict_old_result_png_unlocked()
@@ -185,17 +138,10 @@ class TaskManager:
                 return
 
             task = self._tasks[task_id]
-            if task.status in TERMINAL_STATUSES:
-                logger.info(f"Task {task_id} already {task.status.value}, ignoring failure: {error}")
-                return
-
             task.status = TaskStatus.FAILED
             task.end_time = datetime.now()
             task.error = error
             task.error_type = error_type
-            # phase_progress is left frozen at wherever it died — useful for
-            # telling "failed on step 3" from "failed after the last step".
-            task.phase = None
 
             self.failed_tasks += 1
             self._emit_queue_metrics_unlocked()
@@ -214,13 +160,9 @@ class TaskManager:
             task.status = TaskStatus.CANCELLED
             task.end_time = datetime.now()
             task.error = "Task cancelled by user"
-            # Same as fail_task: freeze phase_progress at the cancellation point.
-            task.phase = None
 
-            # No join here: nothing ever assigns TaskInfo.thread, and joining
-            # while holding self._lock would block the inference thread's
-            # update_progress() calls. stop_event is what actually stops the
-            # run — the worker hands it to check_stop() in the denoise loop.
+            if task.thread and task.thread.is_alive():
+                task.thread.join(timeout=5)
 
             self._emit_queue_metrics_unlocked()
             return True
@@ -242,19 +184,12 @@ class TaskManager:
                 return None
             return task.result_png
 
-    def get_task_result_usage(self, task_id: str) -> Optional[dict]:
+    def get_task_result_usage(self, task_id: str) -> Usage | dict | None:
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
                 return None
             return task.usage
-
-    def get_task_result_data(self, task_id: str) -> Optional[dict]:
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if not task:
-                return None
-            return task.result_data
 
     def get_task_status(self, task_id: str) -> Optional[Dict[str, Any]]:
         task = self.get_task(task_id)
@@ -269,8 +204,6 @@ class TaskManager:
             "error": task.error,
             "error_type": task.error_type or "",
             "save_result_path": task.save_result_path,
-            "phase": task.phase,
-            "phase_progress": task.phase_progress,
         }
 
     def get_all_tasks(self):

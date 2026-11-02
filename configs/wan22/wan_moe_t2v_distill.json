@@ -1,13 +1,11 @@
 {
     "infer_steps": 4,
-    "target_video_length": 81,
+    "num_frames": 81,
     "text_len": 512,
-    "target_height": 480,
-    "target_width": 832,
+    "size": [480, 832],
     "distill_method": "dmd2",
     "self_attn_1_type": "flash_attn3",
     "cross_attn_1_type": "flash_attn3",
-    "cross_attn_2_type": "flash_attn3",
     "sample_guide_scale": [
         4.0,
         3.0
@@ -25,6 +23,6 @@
         500,
         250
     ],
-    "high_noise_original_ckpt": "Wan2.2-T2V-A14B/distill_models/high_noise_model/distill_model.safetensors",
-    "low_noise_original_ckpt": "Wan2.2-T2V-A14B/distill_models/low_noise_model/distill_model.safetensors"
+    "high_noise_original_ckpt": "/path/to/Wan2.2-T2V-A14B/distill_models/high_noise_model/distill_model.safetensors",
+    "low_noise_original_ckpt": "/path/to/Wan2.2-T2V-A14B/distill_models/low_noise_model/distill_model.safetensors"
 }

@@ -85,29 +85,37 @@ Multiple configuration options are provided in the [configs/distill/](https://gi
 | Configuration File | Purpose | Model Address |
 |-------------------|---------|---------------|
 | [wan_t2v_distill_model_4step_cfg.json](https://github.com/ModelTC/lightx2v/blob/main/configs/distill/wan21/wan_t2v_distill_model_4step_cfg.json) | Load T2V 4-step distillation complete model | [hugging-face](https://huggingface.co/lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v/blob/main/distill_models/distill_model.safetensors) |
-| [wan_i2v_distill_4step_cfg.json](https://github.com/ModelTC/lightx2v/blob/main/configs/distill/wan_i2v_distill_4step_cfg.json) | Load I2V 4-step distillation complete model | [hugging-face](https://huggingface.co/lightx2v/Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/blob/main/distill_models/distill_model.safetensors) |
+| [wan_i2v_distill_model_4step_cfg.json](https://github.com/ModelTC/lightx2v/blob/main/configs/distill/wan21/wan_i2v_distill_model_4step_cfg.json) | Load I2V 4-step distillation complete model | [hugging-face](https://huggingface.co/lightx2v/Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/blob/main/distill_models/distill_model.safetensors) |
 | [wan_t2v_distill_lora_4step_cfg.json](https://github.com/ModelTC/lightx2v/blob/main/configs/distill/wan21/wan_t2v_distill_lora_4step_cfg.json) | Load Wan-T2V model and step distillation LoRA | [hugging-face](https://huggingface.co/lightx2v/Wan2.1-T2V-14B-StepDistill-CfgDistill-Lightx2v/blob/main/loras/Wan21_T2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors) |
 | [wan_i2v_distill_lora_4step_cfg.json](https://github.com/ModelTC/lightx2v/blob/main/configs/distill/wan21/wan_i2v_distill_lora_4step_cfg.json) | Load Wan-I2V model and step distillation LoRA | [hugging-face](https://huggingface.co/lightx2v/Wan2.1-I2V-14B-480P-StepDistill-CfgDistill-Lightx2v/blob/main/loras/Wan21_I2V_14B_lightx2v_cfg_step_distill_lora_rank64.safetensors) |
 
 ### Key Configuration Parameters
 
-- Since DMD distillation only trains a few fixed timesteps, we recommend using `LCM Scheduler` for inference. In [WanStepDistillScheduler](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/models/schedulers/wan/step_distill/scheduler.py), `LCM Scheduler` is already fixed in use, requiring no user configuration.
+- Set `distill_method` to `"dmd2"` to use [WanStepDistillScheduler](https://github.com/ModelTC/LightX2V/blob/main/lightx2v/models/schedulers/wan/step_distill/scheduler.py).
 - `infer_steps`, `denoising_step_list` and `sample_shift` are set to parameters matching those during training, and are generally not recommended for user modification.
-- `enable_cfg` must be set to `false` (equivalent to setting `sample_guide_scale = 1`), otherwise the video may become completely blurred.
-- `lora_configs` supports merging multiple LoRAs with different strengths. When `lora_configs` is not empty, the original `Wan2.1` model is loaded by default. Therefore, when using `lora_config` and wanting to use step distillation, please set the path and strength of the step distillation LoRA.
+- Keep `enable_cfg` consistent with the selected model configuration. The Wan2.1 examples here use `false`.
+- When using a distilled LoRA, set its path and strength in `lora_configs` while keeping `distill_method: "dmd2"`. Omit `lora_configs` when loading a complete distilled model without an additional LoRA.
+
+The following is a fragment to merge into the complete config for the selected weights. `infer_steps` is the inference step count, `denoising_step_list` lists the denoising timesteps, and `sample_shift` is the scheduler's timestep shift.
 
 ```json
 {
-  "infer_steps": 4,                              // Inference steps
-  "denoising_step_list": [1000, 750, 500, 250],  // Denoising timestep list
-  "sample_shift": 5,                             // Scheduler timestep shift
-  "enable_cfg": false,                           // Disable CFG for speed improvement
-  "lora_configs": [                              // LoRA weights path (optional)
-    {
-      "path": "path/to/distill_lora.safetensors",
-      "strength": 1.0
-    }
-  ]
+    "distill_method": "dmd2",
+    "infer_steps": 4,
+    "denoising_step_list": [
+        1000,
+        750,
+        500,
+        250
+    ],
+    "sample_shift": 5,
+    "enable_cfg": false,
+    "lora_configs": [
+        {
+            "path": "path/to/distill_lora.safetensors",
+            "strength": 1.0
+        }
+    ]
 }
 ```
 
@@ -116,28 +124,25 @@ Multiple configuration options are provided in the [configs/distill/](https://gi
 ### Model Preparation
 
 **Complete Model:**
-Place the downloaded model (`distill_model.pt` or `distill_model.safetensors`) in the `distill_models/` folder under the Wan model root directory:
-
-- For T2V: `Wan2.1-T2V-14B/distill_models/`
-- For I2V-480P: `Wan2.1-I2V-14B-480P/distill_models/`
+Set `--model_path` to the original Wan model directory containing `config.json` and encoder/VAE weights. Set `dit_original_ckpt` to the distilled safetensors file, or use `dit_quantized_ckpt` with `dit_quantized=true` and the matching `dit_quant_scheme` for quantized weights. If using `distill_model.pt`, remove `dit_original_ckpt` from the config and place the file directly under `--model_path`.
 
 **LoRA:**
 
 1. Place the downloaded LoRA in any location
-2. Modify the `lora_path` parameter in the configuration file to the LoRA storage path
+2. Modify the `lora_configs[].path` parameter in the configuration file to the LoRA storage path
 
 ### Inference Scripts
 
 **T2V Complete Model:**
 
 ```bash
-bash scripts/wan/distill/run_wan_t2v_distill_model_4step_cfg.sh
+bash scripts/wan/inference/distill/run_wan_t2v_distill_model.sh
 ```
 
 **I2V Complete Model:**
 
 ```bash
-bash scripts/wan/distill/run_wan_i2v_distill_4step_cfg.sh
+bash scripts/wan/inference/distill/run_wan_i2v_distill_model.sh
 ```
 
 ### Step Distillation LoRA Inference Scripts
@@ -145,13 +150,13 @@ bash scripts/wan/distill/run_wan_i2v_distill_4step_cfg.sh
 **T2V LoRA:**
 
 ```bash
-bash scripts/wan/distill/run_wan_t2v_distill_lora_4step_cfg.sh
+bash scripts/wan/inference/distill/run_wan_t2v_distill_lora.sh
 ```
 
 **I2V LoRA:**
 
 ```bash
-bash scripts/wan/distill/run_wan_i2v_distill_lora_4step_cfg.sh
+bash scripts/wan/inference/distill/run_wan_i2v_distill_lora.sh
 ```
 
 ## 🔧 Service Deployment
@@ -161,13 +166,12 @@ bash scripts/wan/distill/run_wan_i2v_distill_lora_4step_cfg.sh
 Modify the startup command in [scripts/server/start_server.sh](https://github.com/ModelTC/lightx2v/blob/main/scripts/server/start_server.sh):
 
 ```bash
-python -m lightx2v.api_server \
+python -m lightx2v.server \
   --model_cls wan2.1 \
   --task t2v \
   --model_path $model_path \
   --config_json ${lightx2v_path}/configs/distill/wan21/wan_t2v_distill_model_4step_cfg.json \
-  --port 8000 \
-  --nproc_per_node 1
+  --port 8000
 ```
 
 Run the service startup script:
@@ -180,4 +184,4 @@ For more details, see [Service Deployment](https://lightx2v-en.readthedocs.io/en
 
 ### Usage in Gradio Interface
 
-See [Gradio Documentation](https://lightx2v-en.readthedocs.io/en/latest/deploy_guides/deploy_gradio.html)
+See the separate [Gradio-Lightx2v repository](https://github.com/ModelTC/Gradio-Lightx2v) for installation and usage instructions.

@@ -11,13 +11,16 @@ from loguru import logger
 
 from lightx2v.common.kvcache import KVCacheManager
 from lightx2v.models.networks.wan.lingbot_va_model import WanLingbotVAModel
+from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS, PROMPT_FIELDS
+from lightx2v.models.runners.wan.streaming_vae import WanStreamingVAERunnerMixin
 from lightx2v.models.runners.wan.wan_runner import Wan22DenseRunner
 from lightx2v.models.schedulers.wan.lingbot_va.scheduler import LingbotVAFlowMatchScheduler
 from lightx2v.models.video_encoders.hf.wan.vae_2_2 import count_conv3d, patchify
 from lightx2v.server.metrics import monitor_cli
+from lightx2v.utils.async_vae import AsyncVAEChunkDecoder
 from lightx2v.utils.envs import GET_DTYPE, GET_RECORDER_MODE
 from lightx2v.utils.input_info import I2VAInputInfo
-from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2
+from lightx2v.utils.profiler import ProfilingContext4DebugL1, ProfilingContext4DebugL2, no_sync_profiling
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import save_to_video
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -63,7 +66,11 @@ class _StreamingVAEEncoder:
 
 
 @RUNNER_REGISTER("lingbot_va")
-class LingbotVARunner(Wan22DenseRunner):
+class LingbotVARunner(WanStreamingVAERunnerMixin, Wan22DenseRunner):
+    supported_request_fields_by_task = {
+        "i2va": COMMON_REQUEST_FIELDS | PROMPT_FIELDS | {"image_path"},
+    }
+
     def __init__(self, config):
         config["enable_cfg"] = config.get("enable_cfg", config.get("sample_guide_scale", 1.0) > 1)
         config["enable_action_cfg"] = config.get("enable_action_cfg", config.get("action_sample_guide_scale", 1.0) > 1)
@@ -189,7 +196,7 @@ class LingbotVARunner(Wan22DenseRunner):
         self.num_frame_per_chunk = ar_config["num_frame_per_chunk"]
         self.num_action_per_frame = ar_config["num_action_per_frame"]
         self.num_chunks = ar_config["num_chunks"]
-        self.height, self.width = self.config["target_height"], self.config["target_width"]
+        self.height, self.width = self.config["size"][0], self.config["size"][1]
         if self.config["env_type"] == "robotwin_tshape":
             self.latent_height = ((self.height // 16) * 3) // 2
             self.latent_width = self.width // 16
@@ -214,15 +221,19 @@ class LingbotVARunner(Wan22DenseRunner):
                 dtype=GET_DTYPE(),
             )
 
+        used_channels = self.config["used_action_channel_ids"]
         self.action_mask = torch.zeros([self.config["action_dim"]], dtype=torch.bool, device=AI_DEVICE)
-        self.action_mask[self.config["used_action_channel_ids"]] = True
+        self.action_mask[used_channels] = True
+        self.inverse_used_action_channel_ids = [len(used_channels)] * self.config["action_dim"]
+        for index, channel in enumerate(used_channels):
+            self.inverse_used_action_channel_ids[channel] = index
         self.actions_q01 = torch.tensor(self.config["norm_stat"]["q01"], dtype=torch.float32, device=AI_DEVICE).reshape(-1, 1, 1)
         self.actions_q99 = torch.tensor(self.config["norm_stat"]["q99"], dtype=torch.float32, device=AI_DEVICE).reshape(-1, 1, 1)
         text_encoder_output = self.inputs["text_encoder_output"]
-        self.prompt_embeds = text_encoder_output["context"].to(AI_DEVICE)
+        self.prompt_embeds = text_encoder_output["context"].to(device=AI_DEVICE, dtype=GET_DTYPE())
         self.negative_prompt_embeds = text_encoder_output.get("context_null")
         if self.negative_prompt_embeds is not None:
-            self.negative_prompt_embeds = self.negative_prompt_embeds.to(AI_DEVICE)
+            self.negative_prompt_embeds = self.negative_prompt_embeds.to(device=AI_DEVICE, dtype=GET_DTYPE())
         elif self.use_cache_cfg:
             raise ValueError("LingBot-VA CFG is enabled but text_encoder_output does not include context_null.")
 
@@ -254,10 +265,10 @@ class LingbotVARunner(Wan22DenseRunner):
                     1,
                     frame_st_id,
                 )[None].to(AI_DEVICE),
-                "text_emb": self.prompt_embeds.to(GET_DTYPE()).clone(),
+                "text_emb": self.prompt_embeds,
             }
             if self.use_cache_cfg:
-                latent_res["negative_text_emb"] = self.negative_prompt_embeds.to(GET_DTYPE()).clone()
+                latent_res["negative_text_emb"] = self.negative_prompt_embeds
             if latent_cond is not None:
                 latent_res["noisy_latents"][:, :, 0:1] = latent_cond[:, :, 0:1]
                 latent_res["timesteps"][:, 0:1] *= 0
@@ -276,10 +287,10 @@ class LingbotVARunner(Wan22DenseRunner):
                     frame_st_id,
                     action=True,
                 )[None].to(AI_DEVICE),
-                "text_emb": self.prompt_embeds.to(GET_DTYPE()).clone(),
+                "text_emb": self.prompt_embeds,
             }
             if self.use_cache_cfg:
-                action_res["negative_text_emb"] = self.negative_prompt_embeds.to(GET_DTYPE()).clone()
+                action_res["negative_text_emb"] = self.negative_prompt_embeds
             if action_cond is not None:
                 action_res["noisy_latents"][:, :, 0:1] = action_cond[:, :, 0:1]
                 action_res["timesteps"][:, 0:1] *= 0
@@ -456,9 +467,8 @@ class LingbotVARunner(Wan22DenseRunner):
             obs[key] = np.array(Image.open(file_path).convert("RGB"))
         return {"obs": [obs]}
 
-    def run_vae_decoder(self, pred_latent):
-        decoded = self.vae_decoder.decode(pred_latent.squeeze(0).to(GET_DTYPE()))
-        return decoded[0].permute(1, 2, 3, 0).add(1.0).mul(0.5).clamp(0, 1)
+    def decode_policy_chunk(self, latents, first, last):
+        return self.vae_decoder.cached_decode_withflag(latents[0].to(GET_DTYPE()), first, last)[0].permute(1, 2, 3, 0).add(1).mul(0.5).clamp(0, 1)
 
     def end_run_segment(self, segment_idx=None):
         pass
@@ -466,33 +476,36 @@ class LingbotVARunner(Wan22DenseRunner):
     @ProfilingContext4DebugL2("Run DiT")
     def run_main(self):
         self.init_run()
-        for chunk_id in range(self.num_chunks):
-            logger.info(f"LingBot-VA chunk {chunk_id + 1}/{self.num_chunks}")
-            with ProfilingContext4DebugL1(f"chunk end2end {chunk_id + 1}/{self.num_chunks}"):
-                self.check_stop()
-                self.init_run_segment(chunk_id)
-                actions, latents = self.run_segment(chunk_id)
-                self.pred_latent_lst.append(latents)
-                self.pred_action_lst.append(torch.from_numpy(actions))
-                self.end_run_segment(chunk_id)
-            if self.progress_callback:
-                self.progress_callback((chunk_id + 1) / self.num_chunks * 100, 100)
-
-        pred_latent = torch.cat(self.pred_latent_lst, dim=2)
+        decoder = AsyncVAEChunkDecoder.from_config(self.config, device=AI_DEVICE, vae_decoder=self.vae_decoder, dispatch_in_worker=True)
+        try:
+            with no_sync_profiling(enabled=decoder.is_async):
+                for chunk_id in range(self.num_chunks):
+                    logger.info(f"LingBot-VA chunk {chunk_id + 1}/{self.num_chunks}")
+                    with ProfilingContext4DebugL1(f"chunk end2end {chunk_id + 1}/{self.num_chunks}"):
+                        self.check_stop()
+                        self.init_run_segment(chunk_id)
+                        actions, latents = self.run_segment(chunk_id)
+                        self.pred_action_lst.append(torch.from_numpy(actions))
+                        self.end_run_segment(chunk_id)
+                    decoder.submit(self.decode_policy_chunk, latents, chunk_id == 0, chunk_id == self.num_chunks - 1)
+                    if self.progress_callback:
+                        self.progress_callback((chunk_id + 1) / self.num_chunks * 100, 100)
+                self.gen_video = torch.cat(decoder.finish(), dim=0)
+        finally:
+            decoder.finish()
         self.pred_action = torch.cat(self.pred_action_lst, dim=1)
-        self.gen_video = self.run_vae_decoder(pred_latent)
-        gen_video_final = self.process_images_after_vae_decoder()
+        result = self.process_images_after_vae_decoder()
         self.end_run()
-        return gen_video_final
+        return result
 
     def process_images_after_vae_decoder(self):
         self.gen_video_final = self.gen_video
-        video_path = getattr(self.input_info, "save_result_path", None)
+        video_path = self.input_info.save_result_path
         if not video_path:
             raise ValueError("LingBot-VA requires save_result_path from input_info.")
         video_path = str(video_path)
         action_path = str(Path(video_path).with_suffix(".actions.npy"))
-        save_to_video(self.gen_video_final, video_path, fps=self.config.get("target_fps", 10), method=self.config.get("save_video_method", "imageio"))
+        save_to_video(self.gen_video_final, video_path, fps=self.config.get("fps", 10), method=self.config.get("save_video_method", "imageio"))
         os.makedirs(os.path.dirname(action_path) or ".", exist_ok=True)
         np.save(action_path, self.pred_action.flatten(1).numpy())
         logger.info("Saved LingBot-VA video to {}", video_path)
@@ -502,14 +515,7 @@ class LingbotVARunner(Wan22DenseRunner):
         return {"video": None}
 
     def end_run(self):
-        self.model.clear_cache(self.cache_name)
-        if self.scheduler is not None:
-            self.scheduler.clear()
-        if self.action_scheduler is not None:
-            self.action_scheduler.clear()
-        if hasattr(self, "inputs"):
-            del self.inputs
-        self.input_info = None
+        self.clear_run_state()
         if self.config.get("lazy_load", False) or self.config.get("unload_modules", False):
             if hasattr(self.model.transformer_infer, "offload_manager"):
                 del self.model.transformer_infer.offload_manager
@@ -528,7 +534,7 @@ class LingbotVARunner(Wan22DenseRunner):
 
         # The inverse map uses one sentinel channel for every unused model channel.
         action = F.pad(action, (0, 0, 0, 0, 0, 1), mode="constant", value=0)
-        action = action[self.config["inverse_used_action_channel_ids"]]
+        action = action[self.inverse_used_action_channel_ids]
         action = (action - self.actions_q01) / (self.actions_q99 - self.actions_q01 + 1e-6) * 2.0 - 1.0
         return action.to(GET_DTYPE()).unsqueeze(0).unsqueeze(-1)
 
@@ -577,12 +583,29 @@ class LingbotVARunner(Wan22DenseRunner):
             self.frame_st_id,
         )
 
-    def reset_online_state(self):
+    def clear_run_state(self):
         self.model.clear_cache(self.cache_name)
         if hasattr(self, "_streaming_vae_encoder"):
             self._streaming_vae_encoder.reset()
         self.scheduler.clear()
         self.action_scheduler.clear()
+        self.pred_latent_lst = []
+        self.pred_action_lst = []
+        for name in (
+            "init_obs",
+            "init_latent",
+            "prompt_embeds",
+            "negative_prompt_embeds",
+            "action_mask",
+            "actions_q01",
+            "actions_q99",
+            "pred_action",
+            "gen_video",
+            "gen_video_final",
+            "inputs",
+            "input_info",
+        ):
+            setattr(self, name, None)
 
     def _run_pipeline_local(self):
         self.inputs = self.run_input_encoder()
@@ -637,7 +660,7 @@ class LingbotVAPolicy:
 
     def reset(self):
         if getattr(self, "_episode_started", False):
-            self.runner.reset_online_state()
+            self.runner.clear_run_state()
         self.pending_actions = deque()
         self._episode_started = False
         self._task_description = None

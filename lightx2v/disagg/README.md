@@ -58,6 +58,8 @@ bash scripts/disagg/run_dynamic.sh
 
 ### RDMA / Mooncake
 
+Mooncake 读取 `MOONCAKE_CONFIG_PATH` 指定的文件（脚本使用 `configs/mooncake_config.json`），对应的 `MOONCAKE_*` 环境变量优先。服务监听地址由 `disagg_config.local_hostname` 指定。
+
 | 变量 | 含义 | 默认值 |
 | --- | --- | --- |
 | `RDMA_IFACE` | 本机 RDMA / eRDMA 网卡名。 | `erdma_0` |
@@ -77,6 +79,8 @@ bash scripts/disagg/run_dynamic.sh
 | `CONTROLLER_POLL_INTERVAL_S` | controller 状态轮询间隔。 | `5` |
 
 ### 请求数量、调试与通信方式
+
+[默认 workload](../../configs/disagg/wan22_i2v_workload_stages.json) 沿用模型配置的采样参数。按阶段覆盖时，用 `DISAGG_WORKLOAD_STAGES_JSON` 指定阶段文件，并设置 `config_variants`。
 
 | 变量 | 含义 | 默认值 |
 | --- | --- | --- |
@@ -106,7 +110,12 @@ bash scripts/disagg/run_dynamic.sh
 | `SEED` | 随机种子。 | `42` |
 | `PROMPT` | 文本提示词。 | 脚本内置示例 prompt |
 | `NEGATIVE_PROMPT` | 负向提示词。 | 脚本内置示例 negative prompt |
-| `SAVE_RESULT_PATH` | 最终视频保存路径。 | `save_results/wan22_i2v_dynamic.mp4` |
+| `SAVE_RESULT_PATH` | 自动批次的输出基础路径，也作为 user 压测输出前缀的默认值。 | `save_results/wan22_i2v_dynamic.mp4` |
+| `DISAGG_WORKLOAD_SAVE_PREFIX` | user 压测输出基础路径；请求生成端追加阶段名称和请求编号。 | 脚本使用 `SAVE_RESULT_PATH` |
+
+独立 Disagg 服务通过文件交付结果，每个生成请求必须携带非空 `save_result_path`，缺失时会在派发前报错。自动批次缺少基础路径会直接失败；外部请求缺少路径会记录为该请求失败，并继续接收后续请求。只启动 Encoder、Transformer 或 Decoder 进程时无需提供输出路径，路径随请求传入。
+
+`LOAD_FROM_USER=0` 时，Controller 将基础路径按实际 `room` 编号展开，例如 `output.mp4` 对应 `output0.mp4`、`output1.mp4`。外部请求的显式路径保持原样；`LOAD_FROM_USER=1` 的脚本复用 workload 的前缀功能生成不同文件名，并将 prompt、图片和 seed 传给请求生成端。
 
 ## 推荐的常见组合
 
