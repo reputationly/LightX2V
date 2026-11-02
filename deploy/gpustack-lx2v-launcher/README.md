@@ -41,15 +41,16 @@ the `gpustack-lx2v-launcher` block added to `Dockerfile_aarch64_app`).
 
 ## Status
 
-- **z_image** — ready: `profiles.yaml` points at
-  `configs/z_image/z_image_a100_sage.json` (infer_steps=9, sage_attn2,
-  enable_cfg=false, rope=torch — A100-safe).
-- **wan2.2_moe (4-card int8)** — T2V uses
-  `configs/deploy/wan22_t2v_int8_4card_a100.json`.
-- **wan2.2_moe_distill (4-card int8)** — I2V and FLF2V are separate variants
-  selected by `--task i2v` / `--task flf2v`. FLF2V uses
-  `configs/deploy/wan22_flf2v_int8_4card_a100.json`, fixing the accepted
-  four-step `sample_shift=16` baseline at native 16fps (no RIFE).
+`profiles.yaml` 只提供两个 SR 能力（2026-11 上游同步后的范围）：
+
+- **seedvr2** — `seedvr2-3b/seg121-1card`（单卡，`configs/seedvr/a100/seedvr2_3b_seg121.json`）
+  与 `seedvr2-3b/seg121-4card`（4 卡段级数据并行，`seg_p_size: 4`）。
+- **swiftvr** — `swiftvr/1card`（反相双跑，`configs/swiftvr/a100/swiftvr_antiphase.json`）
+  与 `swiftvr/segp4`（4 卡，上游 `chunk_p_size: 4`；变体名保持不变，GPUStack 的
+  model 按 `--profile swiftvr/segp4` 引用它）。
+
+其余模型（视频生成/编辑、图像、数字人、V2A）已迁到 vLLM-Omni：本引擎不再提供它们的
+profile，按这些模型扩容会在 `_load_profile` 阶段明确报错退出，而不是静默起错服务。
 
 Every multi-GPU config carries its real `"parallel"` mesh in JSON. The launcher
 only runs `torchrun --nproc_per_node=N` and validates the GPU count; it does not
@@ -59,9 +60,9 @@ and cannot inject the mesh via top-level CLI arguments.
 
 ```
 CUDA_VISIBLE_DEVICES=0 python deploy/gpustack-lx2v-launcher/gpustack_lx2v_launcher.py \
-  --model /path/to/z_image --port 8080 --host 0.0.0.0
+  --model /path/to/SeedVR2-3B --port 8080 --host 0.0.0.0
 # GET  http://localhost:8080/ready        -> 503 then 200 after the engine serves
-# POST http://localhost:8080/v1/tasks/image/  (forwarded to the engine)
+# POST http://localhost:8080/v1/tasks/video/  (forwarded to the engine)
 ```
 
 ## Notes

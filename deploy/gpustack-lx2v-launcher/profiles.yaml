@@ -9,217 +9,24 @@
 #
 # The launcher keys on model_cls (inferred from the model path or --model-cls),
 # picks the variant whose `gpus` matches the container's GPU count, and asserts
-# cfg_p_size * seq_p_size (or tensor_p_size) == gpus.
-
-z_image:
-  variants:
-    - name: z-image/a100-sdpa
-      gpus: 1
-      task: t2i
-      # infer_steps=9, attn_type=torch_sdpa, enable_cfg=false, rope_type=torch.
-      # Uses torch_sdpa (NOT sage_attn2): the A100 image ships no compiled
-      # sageattention, so sage_attn2 falls back / gives no speedup — see the
-      # Z-Image experiment report §5.1 and commit a169c04a. z_image VRAM is
-      # ample (bf16 ~21.8G/40G), so int8/multi-card are unnecessary.
-      config_json: /opt/LightX2V/configs/z_image/z_image_a100_sdpa.json
-      # Warmup: the launcher fires this itself at startup so the first real
-      # request lands on a hot engine. What it absorbs is large and erratic —
-      # the cold first inference costs 22-78s and inflates BOTH the text
-      # encoder and the DiT (measured 2026-09-08: production replica 0004
-      # 23.8s, replica 0006 78.1s; reproduced on a debug box at 22.4s with a
-      # warm page cache and ~50s right after drop_caches). Those are TOTALS,
-      # not deltas — the warm end-to-end baseline is 16-17s, so the cold
-      # overhead itself ranges from ~7s to ~62s. Steady state afterwards is
-      # flat — 12 requests across 6 output resolutions stayed at
-      # text encoder 0.199-0.218s / DiT 14.4-16.2s — so one 512x512 warmup is
-      # enough and other shapes need no warmup of their own.
-      #
-      # This DOES gate traffic: the LightX2V backend row sets
-      # health_check_path=/ready, and the launcher keeps /ready at 503 until
-      # the warmup returns, so GPUStack never flips the instance to RUNNING
-      # (and never routes to it) while the cold cost is still being paid.
-      #
-      # Do not "verify" that by looking for /ready in `docker logs` or in a
-      # steady-state tcpdump — both are silent by design, and reading that as
-      # "GPUStack never polls /ready" is a trap (it cost a wrong conclusion on
-      # 2026-09-08). The proxy answers /ready itself and never forwards it to
-      # the engine, and its log_message() is a no-op, so probes never reach any
-      # log; and GPUStack stops probing once the instance is RUNNING
-      # (serve_manager.py returns early before is_ready() for RUNNING
-      # instances), so a running instance legitimately sees zero probes.
-      #
-      # infer_steps is deliberately OMITTED: the deploy config's value is used,
-      # which is the only step count guaranteed valid for that scheduler. Do NOT
-      # put `infer_steps: 1` here — on the merged-distill schedulers it raises
-      # `index 0 is out of bounds for dimension 0 with size 0` and the warmup
-      # silently fails (the launcher logs a warning and readies anyway, so the
-      # cold-start cost comes back without any obvious symptom).
-      warmup:
-        endpoint: /v1/tasks/image/sync
-        timeout: 600
-        body: {prompt: "warmup", target_shape: [512, 512]}
-
-# IMPORTANT (all multi-GPU variants): the parallel mesh MUST live in the config
-# JSON's "parallel" block — the engine reads config["parallel"], and top-level
-# CLI args do NOT configure parallelism (set_config.py). The seq_p_size /
-# cfg_p_size fields on a variant are ADVISORY (the launcher only uses them to
-# validate the GPU count); they must MIRROR the JSON. Never use the
-# disaggregated "sub_servers" layout (fixed ports 9000-9004) — those collide
-# across co-located instances on the shared host network; use a single
-# in-process torchrun server.
+# the declared parallel axes equal gpus: cfg_p_size * seq_p_size * tensor_p_size
+# for the mesh models, or seg_p_size (SeedVR2) / chunk_p_size (SwiftVR) alone for
+# the SR models — those two are exclusive with every mesh axis.
 #
-# GPUStack side: multi-GPU profiles must be deployed with
-# gpu_selector.gpus_per_replica (or pinned gpu_ids) — the LightX2V resource-fit
-# selector reads it to reserve whole GPUs (defaults to 1 GPU/replica otherwise).
-
-# Wan2.2 T2V (Wan2.2-T2V-A14B). Production calibration from the Wan2.2 T2V
-# runbook (gpustack docs/lightx2v-gpustack-部署实录.md §12.2, measured on
-# dev-gpustack-a100-0002): int8 4-card ulysses is the production optimum —
-# int8 single-card runs but is slow, bf16 multi-card CPU-OOMs (4 ranks ×
-# (57G+11G) > 256G). ~35G/GPU at seq_p=4; 480p long-form, 720p caps at 161
-# frames; frames must be 4n+1.
-wan2.2_moe:
-  variants:
-    - name: wan2.2-t2v/int8-4card
-      gpus: 4
-      task: t2v
-      config_json: /opt/LightX2V/configs/deploy/wan22_t2v_int8_4card_a100.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seq_p_size: 4
-      seq_p_attn_type: ulysses
-      cfg_p_size: 1
-
-    # Wan2.2 I2V / FLF2V —— 与 T2V 同一个 model_cls,靠 task 区分变体。
-    #
-    # ⚠️ 上游 #1455(23fc3d45)把 wan2.2_moe_distill 并进了 wan2.2_moe:蒸馏不再是
-    # 独立 runner,而是由 config 里的 `distill_method: dmd2` 选调度器
-    # (scheduler_factory.get_wan_distill_method -> WanStepDistillScheduler)。
-    # 所以三份 configs/deploy/wan22_*_int8_4card_a100.json 都补了该字段,
-    # 且 i2v/flf2v 从原来的 wan2.2_moe_distill 段移到这里。**别再传
-    # --model-cls wan2.2_moe_distill,那个注册名已经不存在。**
-    #
-    # 生产形态同 T2V:int8 4 卡 ulysses(~33-35G/卡),int8 单卡 720p 会 OOM,
-    # bf16 多卡会 CPU-OOM。int8 DiT ckpt 在共享 NFS(models-int8/)。
-    #
-    # DEPLOY NOTE: 没有独立的 I2V base 目录 —— I2V 管线的 VAE/T5 取自 T2V base
-    # (报告 §2),所以部署时:
-    #   Model Path = .../models/Wan-AI/Wan2.2-T2V-A14B
-    #   I2V   backend parameters: --task i2v
-    #   FLF2V backend parameters: --task flf2v
-    # (不传 task 的话 launcher 会从路径推出 t2v,然后响亮地失败。)
-    # FLF2V 用同一份权重但单独一个 task/profile,好让 sample_shift=16 是启动期的
-    # 生产设定,而不是每请求覆盖。与 T2V/I2V 一样原生 16fps + RIFE 出 32fps;
-    # 客户端可显式 target_fps=16 拿不插帧的原生帧。
-    - name: wan2.2-i2v/int8-4card
-      gpus: 4
-      task: i2v
-      config_json: /opt/LightX2V/configs/deploy/wan22_i2v_int8_4card_a100.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seq_p_size: 4
-      seq_p_attn_type: ulysses
-      cfg_p_size: 1
-    - name: wan2.2-flf2v/int8-4card-shift16
-      gpus: 4
-      task: flf2v
-      config_json: /opt/LightX2V/configs/deploy/wan22_flf2v_int8_4card_a100.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seq_p_size: 4
-      seq_p_attn_type: ulysses
-      cfg_p_size: 1
-
-# Qwen-Image-Edit-2511 (i2i editing). Production calibration from
-# docs/Qwen-Image-Edit实验测试报告.md: Lightning offline-merged 8-step +
-# qwen25vl_cpu_offload=false (text encoder stays on GPU — offloaded to the ARM
-# CPU the VLM forward takes ~7min and looks like a hang) = 21.6s/image hot,
-# single GPU, attn MUST be torch_sdpa (sage_attn2 black-images).
-# Deploy the MERGED model dir as Model Path; the merged DiT safetensors path is
-# pinned in the config JSON (shared NFS).
-# ⚠️ Host-memory red line: the block-offloaded DiT keeps ~60G Shmem per
-# instance — cap at 2 replicas per 251G node for mixed traffic (3 absolute
-# max, the 4th gets OOM-killed). This is a per-NODE cap the scheduler cannot
-# see (it books VRAM, not host Shmem) — enforce it at deploy time.
-# Both variants are 1-GPU, so the launcher disambiguates by TASK: model paths
-# containing "edit" resolve to i2i; otherwise pass --task t2i / --task i2i as a
-# backend parameter at deploy time (ambiguity fails loudly, never guesses).
-qwen_image:
-  variants:
-    - name: qwen-image-edit-2511/lightning-merged-8step
-      gpus: 1
-      task: i2i
-      config_json: /opt/LightX2V/configs/deploy/qwen_edit_2511_lightning_merged_a100.json
-      # See the z_image warmup note for why infer_steps is omitted. image_path
-      # must be a file baked into THIS image (profiles must not depend on NFS);
-      # assets/inputs/imgs/girl.png ships with the repo via Dockerfile `COPY .`.
-      warmup:
-        endpoint: /v1/tasks/image/sync
-        timeout: 600
-        body:
-          prompt: "warmup"
-          image_path: /opt/LightX2V/assets/inputs/imgs/girl.png
-          target_shape: [512, 512]
-    # Qwen-Image t2i (docs/Qwen-Image-实验测试报告.md): bf16 merged 8-step +
-    # qwen25vl_cpu_offload=false = 17.0s/image hot, single GPU, torch_sdpa only
-    # (sage_attn2 NaN-black-images). Same ~60G-Shmem-per-instance host-memory
-    # red line as edit: cap 2 replicas per 251G node for mixed traffic
-    # (3 absolute max; the 4th wedges the node — enforce at deploy time, the
-    # scheduler only books VRAM).
-    - name: qwen-image-2512/lightning-merged-8step
-      gpus: 1
-      task: t2i
-      config_json: /opt/LightX2V/configs/deploy/qwen_2512_lightning_merged_a100.json
-      # See the z_image warmup note for why infer_steps is omitted.
-      warmup:
-        endpoint: /v1/tasks/image/sync
-        timeout: 600
-        body: {prompt: "warmup", target_shape: [512, 512]}
-
-# InfiniteTalk digital human (audio-driven video, task=s2v). Production shapes
-# from the 现网部署清单 (2026-07-11): both tiers run 4-card ulysses × 1
-# instance/node (latency-first, user decision 2026-07-11). 480p ≈ 54.4s/5s
-# clip, 720p ≈ 136.7s/5s clip. Single-DiT model, so load_from_rank0 is safe
-# (MoE models must NOT use it) and speeds up loading.
-#
-# ⚠️ BOTH variants are (infinitetalk, 4 GPUs, s2v) — GPU count and task cannot
-# disambiguate them. Deploys MUST pin the tier explicitly:
-#   backend parameters: --model-cls infinitetalk --profile infinitetalk-480p/int8-4card
-#   (or .../infinitetalk-720p/int8-4card)
-# Duration red lines are enforced UPSTREAM (gateway/new-api limits per tier):
-# 480p ≤60-75s audio, 720p start at ≤25-30s (frame volume is 3×; config
-# video_duration=30 caps the default).
-# Model Path = the Wan2.1 distill base dir (VAE/T5/CLIP); the tier's int8 DiT
-# and the InfiniteTalk adapter are pinned inside the config JSON (shared NFS).
-infinitetalk:
-  variants:
-    - name: infinitetalk-480p/int8-4card
-      gpus: 4
-      task: s2v
-      config_json: /opt/LightX2V/configs/infinitetalk/a100/infinitetalk_480p_ul4_distilled_int8triton.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seq_p_size: 4
-      seq_p_attn_type: ulysses
-      cfg_p_size: 1
-    - name: infinitetalk-720p/int8-4card
-      gpus: 4
-      task: s2v
-      config_json: /opt/LightX2V/configs/deploy/infinitetalk_720p_4card_a100.json
-      # advisory (validated against gpus; real mesh lives in config_json.parallel)
-      seq_p_size: 4
-      seq_p_attn_type: ulysses
-      cfg_p_size: 1
+# 2026-11 上游同步后，本文件只保留两个模型：视频生成/编辑能力已迁到 vLLM-Omni，
+# 其余 LightX2V model 一律用上游实现、不再由本引擎提供 profile。按模型扩容会在
+# _load_profile 阶段明确报错退出（期望行为），不会静默起错服务。
 
 # SeedVR2-3B video super-resolution (task=sr). Atomic capability (ruling
 # upgraded 2026-07-11): single card, bf16, ≤121 frames per seamless segment
 # (longer inputs auto-segment; the PyAV segment-pts bug is fixed in this
 # release). 480p→2× ≈ 80s, 720p→2× ≈ 200s. sr_ratio is a request-level field
-# (default 2.0), output clamped by the config's target size (runner:114).
-# VFI: request target_fps > source fps triggers per-segment RIFE on the SR
-# output (boundary-stitched; target_fps <= source is a strict no-op, never
-# drops frames). Requires the config's video_frame_interpolation block and
-# the RIFE weights mounted at /nfs-data/models/rife-model/flownet.pkl —
-# startup fails fast if the block is present but weights are missing.
-# Resources: ~22.7G VRAM peak, ~42G host per instance — pairs with VACE on one
-# node (2×VACE + 2×SeedVR2; watch MemAvailable, that node runs near the line).
+# (default 2.0); the output is capped by the config's `size` area, and a request
+# may name its own `size` instead (upstream #1523) — see seedvr_runner's
+# _oriented_target/_build_video_transform.
+# Resources: ~22.7G VRAM peak, ~42G host per instance.
 # Input cap (≤720p in) is enforced upstream (gateway/new-api), not here.
+# RIFE/VFI 已随上游删除（D6）：帧率按源透传，需要更高帧率请走生成能力自带的插帧。
 seedvr2:
   variants:
     - name: seedvr2-3b/seg121-1card
@@ -245,10 +52,6 @@ seedvr2:
     # Host RAM runs ~145G of 251G with four ranks working, so requests MUST stay
     # serialized: server/task_manager.py's single _processing_lock is the only
     # thing enforcing that. Never place a second replica on the same box.
-    # No video_frame_interpolation block on purpose: RIFE's global target-frame
-    # grid is a real sequential dependency across segments, so enabling it makes
-    # the runner fall back to rank 0 and throw away all four cards. It is inert
-    # in the 1-card config too (target_fps 16 is never > source fps).
     - name: seedvr2-3b/seg121-4card
       gpus: 4
       task: sr
@@ -256,44 +59,16 @@ seedvr2:
       # advisory (validated against gpus; real mesh lives in config_json.parallel)
       seg_p_size: 4
 
-# Wan2.2 VACE video editing, atomic tier (task=vace): single-card offload,
-# int8-triton, 4-step Lightning LoRA (13× speedup, P8/P9), native 720p + RIFE
-# 32fps. ~418s single / ~485s per instance with two instances (measured under
-# load). Inputs: src_video / src_mask / src_ref_images (V2V / MV2V / R2V modes).
-# ⚠️ Host-memory red line: each instance pins ~55G host RAM (offload) — HARD
-# cap 2 instances/node (4-instance test: host at 61MB free + cold-start NFS
-# read storms, 3×T5 took 18min). Stagger instance starts ≥2min apart.
-# The scheduler books VRAM only — enforce the per-node cap at deploy time.
-# Model Path contains "vace" → model_cls infers wan2.2_moe_vace (checked before
-# the generic "wan" branch); the canvas-tier 480p config
-# (wan22_moe_vace_a100_int8_lora4step.json) is kept on file but NOT deployed
-# until the canvas ships.
-wan2.2_moe_vace:
-  variants:
-    - name: wan2.2-vace/int8-lora4step-720p-1card
-      gpus: 1
-      task: vace
-      config_json: /opt/LightX2V/configs/wan22/a100/wan22_moe_vace_a100_int8_lora4step_720p_rife.json
-
-# LTX-2.3 v2a pure dubbing (task=v2a): freeze the source-video latents, denoise
-# audio ONLY, then stream-copy the ORIGINAL pixels at mux (-c:v copy) — output
-# is the input video with an AI audio track, picture byte-identical.
-# Single card bf16: the 22B DiT OOMs on 40G A100 under both ulysses and TP
-# (measured); v2a skips the upsampler and never denoises video, so VRAM sits
-# below the generation tasks — exact peak/latency pending the M0 smoke run
-# (also feeds gpustack's lightx2v_model_latency_seconds entry and pricing).
-# Input red lines are enforced UPSTREAM (gateway VideoModelConfig): suggested
-# launch caps ≤720p in, ≤15s (engine warns >361 frames). Non-24fps sources are
-# tempo-aligned at mux (atempo) — sync is exact, but ~24fps material is best.
-
 # SwiftVR:实时一步式视频修复(骨架 Wan2.2-TI2V-5B)。
 # 目标分辨率由请求给,一个实例串行吃 1080p/2K/4K,切换不用重启(已实测,含跑完 4K
-# 再回 1080p 无劣化)。但两条路的封顶规则不同,配置里那四个尺寸字段管的就是这个:
+# 再回 1080p 无劣化)。三条尺寸路的优先级与封顶规则:
 #   - 只给 sr_ratio(网关默认路径,前端固定发 4.0 当"够不着的上限")
-#     → 封到 target_height/target_width 这一档(1080P),按源朝向配对长短边。
-#       这是现网 SR 的既有契约,SeedVR2 也是这么干的;不封的话 768p 源乘 4 会去出
-#       5376x3072,远超 4K/33G 的实测上限,必 OOM。
-#   - 显式给 target_shape(SwiftVR 独有,SeedVR2 不读这个字段)
+#     → 封到 sr_tier_size 这一档(1080P),按源朝向配对长短边,超档出精确档位尺寸。
+#       这是现网 SR 的既有契约;不封的话 768p 源乘 4 会去出 5376x3072,远超 4K/33G
+#       的实测上限,必 OOM。
+#   - target_short_edge(网关按"只有引擎知道源有多大"下发)
+#     → 输出按源的真实画幅等比放大,短边精确命中目标档,画幅零形变。
+#   - 显式给 size(SwiftVR 独有,SeedVR2 读的是同一字段但走自己的面积封顶)
 #     → 放行,2K/4K 就靠它;只过 max_target_* 的显存护栏(4K),超了等比压回并告警。
 # 显存(1080p / 2K / 4K):单卡 15.8G / 19.8G / 32.5G;四卡每卡 16.0G / 19.8G / 33.2G。
 # ⚠️ 混部按最高档 33G 算:PyTorch 缓存分配器不归还,实例处理过 4K 之后占用不再降。
@@ -323,21 +98,15 @@ swiftvr:
       gpus: 1
       task: sr
       config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_antiphase.json
-    # 段级数据并行:整段按 chunk **连续**切给各 rank(连续而非轮转,这样每个 rank 只需
-    # 在自己区间开头预热一次 ReAE 因果状态),末尾按块号 concat 并校验总帧数。
-    # 单请求 1080p 23s->11s、2K 37s->18s、4K 78s->32s(2.1~2.4x)。
-    # 注意:**吞吐上 4 个单卡实例仍然更划算**(线性 4x,零通信),四卡只赢单请求延迟。
-    # ⚠️ 反相双跑靠 carry 跨块传帧,各 rank 的首帧要与预热块产生的 carry 配对,
-    #    所以段并行下 seg_warmup_chunks 必须 >=1(配置里已设,runner 也会强制校验)。
+    # 多卡改用上游 chunk_p_size:块按 rank 轮转分配,ReAE 每一层的因果边界经 ring P2P
+    # 与相邻 rank 交换(数学上与单卡等价),不再有"每个 rank 在自己区间开头重跑预热块"
+    # 的冗余算力。变体名 swiftvr/segp4 保持不变 —— GPUStack 的 model(46)按
+    # --profile swiftvr/segp4 引用它。
+    # ⚠️ 反相双跑在块并行下靠**跨 rank carry** 传帧:块 k 在 rank k%P,解码后把本块
+    #    直相的最后一帧经 exchange_chunk_boundary 发给下一个 rank,rank0 收到的
+    #    (来自 rank P-1)留给下一个 batch 用。全局 chunk.index==0 的 carry 恒为 None。
     - name: swiftvr/segp4
       gpus: 4
       task: sr
       config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_antiphase_segp4.json
-      seg_p_size: 4
-
-ltx2:
-  variants:
-    - name: ltx2-v2a/bf16-1card
-      gpus: 1
-      task: v2a
-      config_json: /opt/LightX2V/configs/ltx2/a100/ltx2_3_v2a.json
+      chunk_p_size: 4

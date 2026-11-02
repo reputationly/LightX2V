@@ -2,8 +2,10 @@
     "attention_backend": "torch_sdpa",
     "cross_attention_backend": "torch_sdpa",
     "rope_type": "torch_real_rope",
-    "target_height": 1080,
-    "target_width": 1920,
+    "sr_tier_size": [
+        1080,
+        1920
+    ],
     "max_target_height": 2160,
     "max_target_width": 3840,
     "clip_len": 24,
@@ -17,7 +19,6 @@
     "antiphase_dual_pass": true,
     "antiphase_strength_gain": 1.4,
     "parallel": {
-        "seg_p_size": 4
-    },
-    "seg_warmup_chunks": 1
+        "chunk_p_size": 4
+    }
 }

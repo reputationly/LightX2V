@@ -41,6 +41,14 @@ class _NDArray:
         # 只在常规查找失败后才走到这里,不会遮蔽上面显式定义的成员。
         return getattr(self.__dict__["_arr"], name)
 
+    def to_dlpack(self):
+        # 真 decord 的 NDArray 有 to_dlpack(),上游 SwiftVR 用 frames.to_dlpack()
+        # 直接把解码结果送进 GPU(省一次 numpy→tensor 拷贝)。垫片是 numpy 实现,
+        # 这里走 torch 的 DLPack 导出;镜像里没有 torch 就是环境坏了,直接报错。
+        if torch is None:
+            raise ImportError("decord shim to_dlpack() requires torch")
+        return torch.utils.dlpack.to_dlpack(torch.from_numpy(self._arr))
+
     def __array__(self):
         return self._arr
 

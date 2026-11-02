@@ -18,6 +18,14 @@ on:
         # 回滚到 cu128:传 arronlee/lightx2v:arm64-cu128-a100-base
         description: "base 镜像(默认 cu130+py3.12;回滚传 arronlee/lightx2v:arm64-cu128-a100-base)"
         default: "arronlee/lightx2v:arm64-cu130-a100-base"
+      # ⚠️ arm64-a100-latest 是**浮动 tag**,现网 GPUStack backend 直接跟它:
+      # 任何容器重启都会拉到新镜像。所以默认**不推**它,只发不可变的 version tag,
+      # 验收通过后再用 push_latest=true 单独构建一次把它挪过去。
+      push_latest:
+        description: "同时推浮动 tag arm64-a100-latest(生产生效!验收通过后再用)"
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: write
@@ -59,8 +67,26 @@ jobs:
         run: |
           short_sha="${GITHUB_SHA::8}"
           build_time="$(date -u +'%Y%m%d-%H%M')"
-          echo "version_tag=arm64-a100-${build_time}-${short_sha}" >> "$GITHUB_OUTPUT"
-          echo "latest_tag=arm64-a100-latest" >> "$GITHUB_OUTPUT"
+          version_tag="arm64-a100-${build_time}-${short_sha}"
+          latest_tag="arm64-a100-latest"
+          echo "version_tag=${version_tag}" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+
+          # 浮动 latest 只在 push_latest=true 时才推(默认 false)。
+          tags="${ACR_REPO}:${version_tag}"$'\n'"${DOCKERHUB_REPO}:${version_tag}"
+          if [ "${{ github.event.inputs.push_latest }}" = "true" ]; then
+            tags="${tags}"$'\n'"${ACR_REPO}:${latest_tag}"$'\n'"${DOCKERHUB_REPO}:${latest_tag}"
+            echo "latest_pushed=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::pushing the FLOATING tag ${latest_tag} — production will pick this image up on next container restart"
+          else
+            echo "latest_pushed=false" >> "$GITHUB_OUTPUT"
+            echo "version tag only: ${version_tag} (push_latest=false)"
+          fi
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${tags}"
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push ARM64 A100 app image (ACR + Docker Hub)
         uses: docker/build-push-action@v6
@@ -77,11 +103,7 @@ jobs:
           sbom: false
           build-args: |
             BASE_IMAGE=${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu130-a100-base' }}
-          tags: |
-            ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.version_tag }}
-            ${{ env.ACR_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
-            ${{ env.DOCKERHUB_REPO }}:${{ steps.image_tags.outputs.version_tag }}
-            ${{ env.DOCKERHUB_REPO }}:${{ steps.image_tags.outputs.latest_tag }}
+          tags: ${{ steps.image_tags.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -90,6 +112,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           VERSION_TAG: ${{ steps.image_tags.outputs.version_tag }}
           LATEST_TAG: ${{ steps.image_tags.outputs.latest_tag }}
+          LATEST_PUSHED: ${{ steps.image_tags.outputs.latest_pushed }}
           BASE_IMAGE: ${{ github.event.inputs.base_image || 'arronlee/lightx2v:arm64-cu130-a100-base' }}
         shell: bash
         run: |
@@ -101,11 +124,11 @@ jobs:
 
           ACR:
           - \`${ACR_REPO}:${VERSION_TAG}\`
-          - \`${ACR_REPO}:${LATEST_TAG}\`
+          $([[ "${LATEST_PUSHED}" == "true" ]] && echo "- \`${ACR_REPO}:${LATEST_TAG}\`")
 
           Docker Hub:
           - \`${DOCKERHUB_REPO}:${VERSION_TAG}\`
-          - \`${DOCKERHUB_REPO}:${LATEST_TAG}\`
+          $([[ "${LATEST_PUSHED}" == "true" ]] && echo "- \`${DOCKERHUB_REPO}:${LATEST_TAG}\`")
 
           Build workflow: \`${GITHUB_WORKFLOW}\`
           EOF
