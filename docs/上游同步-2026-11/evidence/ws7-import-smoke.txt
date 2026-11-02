@@ -1,0 +1,4 @@
+=== import smoke (WS7.3)
+import smoke OK
+av 18.1.0
+x264+x265 encoders OK

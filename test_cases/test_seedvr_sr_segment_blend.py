@@ -1,7 +1,7 @@
 import datetime
 import inspect
-import re
 import os
+import re
 import tempfile
 import time
 import unittest

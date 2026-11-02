@@ -1,0 +1,7 @@
+$ git diff --name-only upstream/main HEAD -- lightx2v lightx2v_platform | grep -v -E '<whitelist>'
+(above empty = pass)
+
+$ git diff --stat upstream/main HEAD -- lightx2v lightx2v_platform
+ lightx2v/utils/set_config.py                      | 109 +--
+ lightx2v/utils/utils.py                           |  58 +-
+ 19 files changed, 1691 insertions(+), 176 deletions(-)

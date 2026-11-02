@@ -1,0 +1,6 @@
+checked 9 configs against code@HEAD
+
+== 代码里搜不到的键(人工判断:死键可删 / 漏迁移) ==
+
+== LEGACY 键(必须为空) ==
+audit rc=0
