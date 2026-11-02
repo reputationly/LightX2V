@@ -1216,7 +1216,10 @@ class SeedVRRunner(DefaultRunner):
         return vae_encoder, vae_decoder
 
     def _restore_target_size(self, sample):
-        if not self.input_info.match_target_size:
+        # 与上游一致:既没开 match_target_size、也没有 size 时什么都不做。
+        # 少了后半句,「开了 match 却没配 size」会掉到 _oriented_target 的 720/1280
+        # 兜底档位上去裁/缩 —— 那不是调用方要的尺寸。
+        if not self.input_info.match_target_size or not self.input_info.size:
             return sample
         # Same oriented target the upscale was sized against -- see
         # :meth:`_oriented_target` for why it must not be recomputed here.
