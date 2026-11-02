@@ -1,0 +1,5 @@
+configs/seedvr/4090/seedvr2_3b.json
+configs/seedvr/4090/seedvr2_7b.json
+configs/seedvr/seedvr2_3b.json
+configs/seedvr/seedvr2_7b.json
+configs/seedvr/seedvr2_7b_sp.json

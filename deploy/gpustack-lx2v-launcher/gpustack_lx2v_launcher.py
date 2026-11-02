@@ -234,7 +234,9 @@ def _load_profile(profiles_file: str, model_cls: str, gpu_count: int, task_hint:
     if solo > 1 and (tp > 1 or prod > 1):
         # init_parallel asserts the same thing at boot; catching it here names the
         # profile instead of dying inside torchrun 20 minutes later.
-        raise RuntimeError(f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: {solo_name} ({solo}) is exclusive with the tensor/seq/cfg meshes (tensor_p_size={tp}, cfg_p_size*seq_p_size={prod})")
+        raise RuntimeError(
+            f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: {solo_name} ({solo}) is exclusive with the tensor/seq/cfg meshes (tensor_p_size={tp}, cfg_p_size*seq_p_size={prod})"
+        )
     expected = solo if solo > 1 else (tp if tp > 1 else prod)
     if has_parallel and expected != gpu_count:
         raise RuntimeError(f"Profile '{model_cls}'/{gpu_count}-gpu is inconsistent: parallel product {expected} != gpu_count {gpu_count}")

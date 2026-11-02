@@ -1,5 +1,6 @@
 import datetime
 import inspect
+import re
 import os
 import tempfile
 import time
@@ -424,9 +425,9 @@ class SeedVRSegmentParallelTest(unittest.TestCase):
         # No seg_p_size in the config means the runner must not touch the
         # process group, whether or not one happens to be initialised.
         runner = _make_runner({})
-        self.assertEqual(runner._sr_seg_parallel_info(4, True, None), (0, 1))
+        self.assertEqual(runner._sr_seg_parallel_info(4, True), (0, 1))
         runner = _make_runner({"seg_parallel": False})
-        self.assertEqual(runner._sr_seg_parallel_info(4, True, None), (0, 1))
+        self.assertEqual(runner._sr_seg_parallel_info(4, True), (0, 1))
 
 
 class SeedVRCollectiveInvariantTest(unittest.TestCase):
@@ -448,7 +449,25 @@ class SeedVRCollectiveInvariantTest(unittest.TestCase):
         # paired a barrier against an all-reduce on the same gloo group and both
         # ranks waited out the two-hour timeout -- which is what a rank-0
         # failure to create the scratch dir did.
-        self.assertNotIn("dist.barrier", self._source(), "the rendezvous all-reduce is the only op allowed on the control group")
+        #
+        # 上游底版还给 VAE 序列并行(seq_p)留了 barrier,那条轴用自���的
+        # ``_seedvr_sp_group``(NCCL),与这里的 gloo 控制组无关(两轴互斥)。所以不变量
+        # 按**组**判定:控制组上只许有 rendezvous 的那一次 all-reduce。
+        runner = import_module("lightx2v.models.runners.seedvr.seedvr_runner").SeedVRRunner
+        body = inspect.getsource(runner._sr_seg_rendezvous)
+
+        collectives = [line.strip() for line in body.splitlines() if re.search(r"dist\.(all_reduce|all_gather|barrier|broadcast|gather|recv|reduce|scatter|send)\(", line)]
+        self.assertTrue(collectives, "the rendezvous must actually meet the other ranks")
+        for line in collectives:
+            # gloo 组没有 fallback 之外的第二种 op:两条 all_reduce 是同一 rendezvous 的
+            # 两个分支(group 可用 / 退回默认组),除此之外不许出现别的集合通信。
+            self.assertIn("dist.all_reduce(", line, f"only the rendezvous all-reduce may run on the control group, found: {line}")
+        self.assertIn("_sr_ctrl_group()", body, "the rendezvous must run on the control group")
+
+        # 任何 barrier 都只能挂在自己的轴(SP 组)上
+        for line in self._source().splitlines():
+            if "dist.barrier(" in line:
+                self.assertIn("_seedvr_sp_group", line, f"a barrier on another group can pair against the rendezvous all-reduce: {line.strip()}")
 
     def test_the_teardown_does_not_release_an_in_flight_tail(self):
         # A gloo SendWork owns the only reference to its payload, so dropping

@@ -1,0 +1,232 @@
+# §8.1 字面门禁输出(2026-11-02T13:49:50Z)
+$ git grep -n -E 'target_height|target_width|target_shape|target_video_length|video_frame_interpolation|rife|seg_warmup_chunks' -- lightx2v configs deploy
+configs/platforms/mlu/wan_animate.json:5:    "auto_target_shape": false,
+configs/platforms/mlu/wan_animate_dist.json:5:    "auto_target_shape": false,
+configs/swiftvr/a100/swiftvr.json:9:    "max_target_height": 2160,
+configs/swiftvr/a100/swiftvr.json:10:    "max_target_width": 3840,
+configs/swiftvr/a100/swiftvr_antiphase.json:9:    "max_target_height": 2160,
+configs/swiftvr/a100/swiftvr_antiphase.json:10:    "max_target_width": 3840,
+configs/swiftvr/a100/swiftvr_antiphase_segp4.json:9:    "max_target_height": 2160,
+configs/swiftvr/a100/swiftvr_antiphase_segp4.json:10:    "max_target_width": 3840,
+configs/swiftvr/a100/swiftvr_segp4.json:9:    "max_target_height": 2160,
+configs/swiftvr/a100/swiftvr_segp4.json:10:    "max_target_width": 3840,
+lightx2v/disagg/disagg_mixin.py:85:    target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/disagg_mixin.py:88:    h_prime = int(math.ceil(target_height / stride_h))
+lightx2v/disagg/disagg_mixin.py:89:    w_prime = int(math.ceil(target_width / stride_w))
+lightx2v/disagg/disagg_mixin.py:777:        target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/disagg_mixin.py:780:        h_prime = int(math.ceil(target_height / stride_h))
+lightx2v/disagg/disagg_mixin.py:781:        w_prime = int(math.ceil(target_width / stride_w))
+lightx2v/disagg/disagg_mixin.py:943:        target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/disagg_mixin.py:946:        h_prime = int(math.ceil(target_height / int(vae_stride[1])))
+lightx2v/disagg/disagg_mixin.py:947:        w_prime = int(math.ceil(target_width / int(vae_stride[2])))
+lightx2v/disagg/services/decoder.py:246:            target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/services/decoder.py:249:            h_prime = int(math.ceil(target_height / stride_h))
+lightx2v/disagg/services/decoder.py:250:            w_prime = int(math.ceil(target_width / stride_w))
+lightx2v/disagg/utils.py:392:    target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/utils.py:395:    h_prime = int(math.ceil(target_height / stride_h))
+lightx2v/disagg/utils.py:396:    w_prime = int(math.ceil(target_width / stride_w))
+lightx2v/disagg/utils.py:431:    target_height, target_width = map(int, config.get("size", (480, 832)))
+lightx2v/disagg/utils.py:434:    h_prime = int(math.ceil(target_height / stride_h))
+lightx2v/disagg/utils.py:435:    w_prime = int(math.ceil(target_width / stride_w))
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:176:    target_frame_grid, target_width_grid = _frame_position_grid(latent_height, latent_width, patch_h, patch_w)
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:193:            _fill_audio_positions(position_ids, rows, reference.num_audio_latents, rotary_time, target_width_grid)
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:212:    _fill_audio_positions(position_ids, slice(audio_start, video_start), num_audio_latents, rotary_time, target_width_grid)
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:239:    target_width: int,
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:240:    target_height: int,
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:247:    if target_width <= 0 or target_height <= 0:
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:248:        raise ValueError(f"The target canvas must be positive, got {target_width}x{target_height}")
+lightx2v/models/networks/minimax_h3/packing_ref2av.py:253:        scale = min(1.0, math.sqrt((target_width * target_height) / (width * height)))
+lightx2v/models/networks/motus/image_utils.py:6:    target_height, target_width = target_size
+lightx2v/models/networks/motus/image_utils.py:9:    scale = min(target_height / original_height, target_width / original_width)
+lightx2v/models/networks/motus/image_utils.py:14:    padded_frame = np.zeros((target_height, target_width, frame.shape[2]), dtype=frame.dtype)
+lightx2v/models/networks/motus/image_utils.py:16:    y_offset = (target_height - new_height) // 2
+lightx2v/models/networks/motus/image_utils.py:17:    x_offset = (target_width - new_width) // 2
+lightx2v/models/networks/wan/s2v_utils.py:28:    target_width = int((target_area * aspect_ratio) ** 0.5 // divisor * divisor)
+lightx2v/models/networks/wan/s2v_utils.py:29:    target_height = int((target_area / aspect_ratio) ** 0.5 // divisor * divisor)
+lightx2v/models/networks/wan/s2v_utils.py:30:    if target_width >= width or target_height >= height:
+lightx2v/models/networks/wan/s2v_utils.py:31:        target_width = int(width // divisor * divisor)
+lightx2v/models/networks/wan/s2v_utils.py:32:        target_height = int(height // divisor * divisor)
+lightx2v/models/networks/wan/s2v_utils.py:33:    return target_height, target_width
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:463:            target_shape = (b * seq_len, patch_count, embed_dim)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:464:            pos_target_shape = (b * seq_len, patch_count, 2) if pos is not None else None
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:466:            target_shape = (b, seq_len * patch_count, embed_dim)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:467:            pos_target_shape = (b, seq_len * patch_count, 2) if pos is not None else None
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:469:        if tokens.shape != target_shape:
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:470:            tokens = tokens.reshape(*target_shape)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:472:        if pos is not None and pos.shape != pos_target_shape:
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:473:            pos = pos.reshape(*pos_target_shape)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:487:            target_shape = (b * seq_len, patch_count, embed_dim)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:488:            pos_target_shape = (b * seq_len, patch_count * sp_size - padding_tokens, 2) if pos is not None else None
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:490:            target_shape = (b, seq_len * patch_count, embed_dim)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:491:            pos_target_shape = (b, seq_len * (patch_count * sp_size - padding_tokens), 2) if pos is not None else None
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:503:        if tokens.shape != target_shape:
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:504:            tokens = tokens.reshape(*target_shape)
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:506:        if pos is not None and pos.shape != pos_target_shape:
+lightx2v/models/networks/worldmirror/models/models/visual_transformer.py:507:            pos = pos.reshape(*pos_target_shape)
+lightx2v/models/runners/bagel/i2i_utils.py:13:def _validate_target_shape(size, latent_downsample):
+lightx2v/models/runners/bagel/i2i_utils.py:37:    resolved = _validate_target_shape(size, latent_downsample)
+lightx2v/models/runners/default_runner.py:376:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/default_runner.py:381:            (target_width, target_height),
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:151:        target_height, target_width = self.get_closest_resolution_given_original_size((int(width), int(height)), target_size)
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:155:            target_height // self.config["vae_stride"][1],
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:156:            target_width // self.config["vae_stride"][2],
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:175:        self.target_height = latent_shape[2] * self.config["vae_stride"][1]
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:176:        self.target_width = latent_shape[3] * self.config["vae_stride"][2]
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:243:        target_width, target_height = hr_bucket_map((lr_video_width, lr_video_height))
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:247:            target_height // self.config_sr["vae_stride"][1],
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:248:            target_width // self.config_sr["vae_stride"][2],
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:250:        self.target_sr_height = target_height
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:251:        self.target_sr_width = target_width
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:522:            target_width = self.target_sr_width
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:523:            target_height = self.target_sr_height
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:525:            target_width = self.target_width
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:526:            target_height = self.target_height
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:528:        input_image_np = self.resize_and_center_crop(first_frame, target_width=target_width, target_height=target_height)
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:534:    def resize_and_center_crop(self, image, target_width, target_height):
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:536:        if target_height == image.shape[0] and target_width == image.shape[1]:
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:541:        scale_factor = max(target_width / original_width, target_height / original_height)
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:545:        left = (resized_width - target_width) / 2
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:546:        top = (resized_height - target_height) / 2
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:547:        right = (resized_width + target_width) / 2
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:548:        bottom = (resized_height + target_height) / 2
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:563:            target_width = self.target_sr_width
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:564:            target_height = self.target_sr_height
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:566:            target_width = self.target_width
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:567:            target_height = self.target_height
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:569:        scale_factor = max(target_width / original_width, target_height / original_height)
+lightx2v/models/runners/hunyuan_video/hunyuan_video_15_runner.py:576:                transforms.CenterCrop((target_height, target_width)),
+lightx2v/models/runners/ltx2/ltx2_runner.py:381:            target_height = self.input_info.size[0]
+lightx2v/models/runners/ltx2/ltx2_runner.py:382:            target_width = self.input_info.size[1]
+lightx2v/models/runners/ltx2/ltx2_runner.py:385:                target_height = self.config["size"][0] // 2
+lightx2v/models/runners/ltx2/ltx2_runner.py:386:                target_width = self.config["size"][1] // 2
+lightx2v/models/runners/ltx2/ltx2_runner.py:388:                target_height = self.config["size"][0]
+lightx2v/models/runners/ltx2/ltx2_runner.py:389:                target_width = self.config["size"][1]
+lightx2v/models/runners/ltx2/ltx2_runner.py:390:            self.input_info.size = [target_height, target_width]
+lightx2v/models/runners/ltx2/ltx2_runner.py:396:            int(target_height) // self.config["vae_scale_factors"][1],
+lightx2v/models/runners/ltx2/ltx2_runner.py:397:            int(target_width) // self.config["vae_scale_factors"][2],
+lightx2v/models/runners/ltx2/ltx2_runner.py:747:        target_height = self.input_info.size[0]
+lightx2v/models/runners/ltx2/ltx2_runner.py:748:        target_width = self.input_info.size[1]
+lightx2v/models/runners/ltx2/ltx2_runner.py:798:                height=target_height,
+lightx2v/models/runners/ltx2/ltx2_runner.py:799:                width=target_width,
+lightx2v/models/runners/minimax_h3/minimax_h3_runner.py:450:                    target_width=self.request_width,
+lightx2v/models/runners/minimax_h3/minimax_h3_runner.py:451:                    target_height=self.request_height,
+lightx2v/models/runners/minimax_h3_causal/minimax_h3_causal_runner.py:241:                width, height, target_width=self.request_width, target_height=self.request_height, mode=self.config.get("reference_image_resize_mode", "match")
+lightx2v/models/runners/neopp/neopp_runner.py:57:        if "target_shape" in request_data:
+lightx2v/models/runners/neopp/neopp_runner.py:58:            # LightLLM's existing adapter still sends target_shape.
+lightx2v/models/runners/neopp/neopp_runner.py:60:            legacy_size = request_data.pop("target_shape")
+lightx2v/models/runners/neopp/neopp_runner.py:185:        target_height = self.input_info.size[0] if self.input_info.size and len(self.input_info.size) == 2 else self.config["size"][0]
+lightx2v/models/runners/neopp/neopp_runner.py:186:        target_width = self.input_info.size[1] if self.input_info.size and len(self.input_info.size) == 2 else self.config["size"][1]
+lightx2v/models/runners/neopp/neopp_runner.py:187:        latent_shape = [1, 3, target_height, target_width]
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:630:        target_height = p2_meta.get("auto_height")
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:631:        target_width = p2_meta.get("auto_width")
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:632:        if target_height is None or target_width is None:
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:636:            target_height = latent_h * scale_factor * 2
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:637:            target_width = latent_w * scale_factor * 2
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:638:        self.input_info.size = [int(target_height), int(target_width)]
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:640:        h_patches = int(target_height) // (scale_factor * 2)
+lightx2v/models/runners/qwen_image/qwen_image_runner.py:641:        w_patches = int(target_width) // (scale_factor * 2)
+lightx2v/models/runners/seedvr/seedvr_runner.py:247:        target_height, target_width = self.input_info.size or (720, 1280)
+lightx2v/models/runners/seedvr/seedvr_runner.py:250:            return int(target_height), int(target_width)
+lightx2v/models/runners/seedvr/seedvr_runner.py:251:        target_height = int(target_height or 720)
+lightx2v/models/runners/seedvr/seedvr_runner.py:252:        target_width = int(target_width or 1280)
+lightx2v/models/runners/seedvr/seedvr_runner.py:253:        if target_height <= 0 or target_width <= 0:
+lightx2v/models/runners/seedvr/seedvr_runner.py:254:            return target_height, target_width
+lightx2v/models/runners/seedvr/seedvr_runner.py:255:        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+lightx2v/models/runners/seedvr/seedvr_runner.py:273:        target_height, target_width = self._oriented_target()
+lightx2v/models/runners/seedvr/seedvr_runner.py:274:        resolution = min((self.ori_h * self.ori_w) ** 0.5 * self.input_info.sr_ratio, (target_height * target_width) ** 0.5)
+lightx2v/models/runners/seedvr/seedvr_runner.py:1167:        target_height, target_width = self._oriented_target()
+lightx2v/models/runners/seedvr/seedvr_runner.py:1168:        if target_height <= 0 or target_width <= 0:
+lightx2v/models/runners/seedvr/seedvr_runner.py:1172:        if (height, width) == (target_height, target_width):
+lightx2v/models/runners/seedvr/seedvr_runner.py:1175:        if height >= target_height and width >= target_width:
+lightx2v/models/runners/seedvr/seedvr_runner.py:1176:            top = (height - target_height) // 2
+lightx2v/models/runners/seedvr/seedvr_runner.py:1177:            left = (width - target_width) // 2
+lightx2v/models/runners/seedvr/seedvr_runner.py:1178:            logger.info(f"[SeedVRRunner] center crop SR output from {width}x{height} to {target_width}x{target_height}")
+lightx2v/models/runners/seedvr/seedvr_runner.py:1179:            return sample[..., top : top + target_height, left : left + target_width]
+lightx2v/models/runners/seedvr/seedvr_runner.py:1190:        scale = max(target_height / height, target_width / width)
+lightx2v/models/runners/seedvr/seedvr_runner.py:1193:        logger.info(f"[SeedVRRunner] rescale SR output from {width}x{height} to {new_width}x{new_height}, keeping source aspect (target {target_width}x{target_height} does not fit)")
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:181:        target_height, target_width = int(tier_height or 0), int(tier_width or 0)
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:182:        if target_height <= 0 or target_width <= 0:
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:184:        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:202:        max_height = int(self.config.get("max_target_height", 2160) or 0)
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:203:        max_width = int(self.config.get("max_target_width", 3840) or 0)
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:258:            target_height, target_width = self._oriented_target(source_height, source_width)
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:259:            if target_height and height * width > target_height * target_width:
+lightx2v/models/runners/swiftvr/swiftvr_runner.py:266:                height, width = target_height, target_width
+lightx2v/models/runners/vsr/vsr_wrapper_hy15.py:120:    def forward(self, z: Tensor, target_shape: Sequence[int] = None) -> Tensor:
+lightx2v/models/runners/vsr/vsr_wrapper_hy15.py:124:            target_shape: (H, W)
+lightx2v/models/runners/vsr/vsr_wrapper_hy15.py:127:        if target_shape is not None and z.shape[-2:] != target_shape:
+lightx2v/models/runners/vsr/vsr_wrapper_hy15.py:130:            z = F.interpolate(z, size=target_shape, mode="bilinear", align_corners=False)
+lightx2v/models/runners/wan/wan_animate2_runner.py:401:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/wan/wan_animate2_runner.py:402:        target_area = target_width * target_height
+lightx2v/models/runners/wan/wan_animate2_runner.py:624:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/wan/wan_animate2_runner.py:633:            "origin_area": [target_width, target_height],
+lightx2v/models/runners/wan/wan_animate_runner.py:127:    def use_auto_target_shape(self):
+lightx2v/models/runners/wan/wan_animate_runner.py:128:        return self.config.get("auto_target_shape", True)
+lightx2v/models/runners/wan/wan_animate_runner.py:130:    def align_target_shape(self, height, width):
+lightx2v/models/runners/wan/wan_animate_runner.py:137:    def get_comfy_target_shape(self):
+lightx2v/models/runners/wan/wan_animate_runner.py:138:        return self.align_target_shape(self.config["size"][0], self.config["size"][1])
+lightx2v/models/runners/wan/wan_animate_runner.py:176:        if self.use_auto_target_shape():
+lightx2v/models/runners/wan/wan_animate_runner.py:177:            target_height, target_width = self.align_target_shape(height, width)
+lightx2v/models/runners/wan/wan_animate_runner.py:178:            logger.info(f"WanAnimate uses auto target shape: height={target_height}, width={target_width}")
+lightx2v/models/runners/wan/wan_animate_runner.py:179:            cond_images = self.comfy_resize_frames(cond_images, target_height, target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:180:            refer_images = self.padding_resize(refer_images, height=target_height, width=target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:182:            target_height, target_width = self.get_comfy_target_shape()
+lightx2v/models/runners/wan/wan_animate_runner.py:183:            logger.info(f"WanAnimate uses config target shape: height={target_height}, width={target_width}")
+lightx2v/models/runners/wan/wan_animate_runner.py:184:            cond_images = self.comfy_resize_frames(cond_images, target_height, target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:185:            refer_images = self.comfy_resize(refer_images, target_height, target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:187:        self.animate_target_shape = (target_height, target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:201:        if self.use_auto_target_shape():
+lightx2v/models/runners/wan/wan_animate_runner.py:202:            target_height, target_width = getattr(self, "animate_target_shape", self.align_target_shape(*bg_images[0].shape[:2]))
+lightx2v/models/runners/wan/wan_animate_runner.py:204:            target_height, target_width = self.get_comfy_target_shape()
+lightx2v/models/runners/wan/wan_animate_runner.py:205:        bg_images = self.comfy_resize_frames(bg_images, target_height, target_width)
+lightx2v/models/runners/wan/wan_animate_runner.py:206:        mask_images = self.comfy_resize_frames(mask_images, target_height, target_width, interpolation=cv2.INTER_NEAREST)
+lightx2v/models/runners/wan/wan_lingbot_fast_runner.py:70:    def get_target_latent_size(self, target_height, target_width):
+lightx2v/models/runners/wan/wan_lingbot_fast_runner.py:73:        latent_h = target_height // stride_h // patch_h * patch_h
+lightx2v/models/runners/wan/wan_lingbot_fast_runner.py:74:        latent_w = target_width // stride_w // patch_w * patch_w
+lightx2v/models/runners/wan/wan_lingbot_fast_runner.py:79:    def get_warmup_latent_shape(self, target_height, target_width):
+lightx2v/models/runners/wan/wan_lingbot_fast_runner.py:80:        return self.get_latent_shape_with_lat_hw(*self.get_target_latent_size(target_height, target_width))
+lightx2v/models/runners/wan/wan_matrix_game4_runner.py:129:    def get_warmup_latent_shape(self, target_height, target_width):
+lightx2v/models/runners/wan/wan_matrix_game4_runner.py:131:        return [48, 1, target_height // stride_h, target_width // stride_w]
+lightx2v/models/runners/wan/wan_runner.py:205:    def get_warmup_latent_shape(self, target_height, target_width):
+lightx2v/models/runners/wan/wan_runner.py:208:        latent_h = max(1, target_height // stride_h // patch_h) * patch_h
+lightx2v/models/runners/wan/wan_runner.py:209:        latent_w = max(1, target_width // stride_w // patch_w) * patch_w
+lightx2v/models/runners/wan/wan_runner.py:885:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/wan/wan_runner.py:888:        ori_latent_h, ori_latent_w = image_latent_size((h, w), (target_height, target_width), self.config["vae_stride"], self.config["patch_size"])
+lightx2v/models/runners/wan/wan_runner.py:988:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/wan/wan_runner.py:993:            int(target_height) // self.config["vae_stride"][1],
+lightx2v/models/runners/wan/wan_runner.py:994:            int(target_width) // self.config["vae_stride"][2],
+lightx2v/models/runners/wan/wan_runner.py:1329:        target_height, target_width = self.get_target_size()
+lightx2v/models/runners/wan/wan_runner.py:1330:        max_area = target_height * target_width
+lightx2v/models/runners/z_image/z_image_runner.py:267:    def get_input_target_shape(self):
+lightx2v/models/runners/z_image/z_image_runner.py:313:        width, height = self.get_input_target_shape()
+lightx2v/models/schedulers/qwen_image/scheduler.py:556:    def _resize_i2i_image_latents(self, image_latents, target_height, target_width, num_channels_latents):
+lightx2v/models/schedulers/qwen_image/scheduler.py:564:        elif image_latents.shape[1] == (target_height // 2) * (target_width // 2):
+lightx2v/models/schedulers/qwen_image/scheduler.py:565:            source_height, source_width = target_height, target_width
+lightx2v/models/schedulers/qwen_image/scheduler.py:570:        if image_latents.shape[-2:] != (target_height, target_width):
+lightx2v/models/schedulers/qwen_image/scheduler.py:571:            image_latents = F.interpolate(image_latents, size=(target_height, target_width), mode="bilinear", align_corners=False)
+lightx2v/models/schedulers/qwen_image/scheduler.py:572:        return self._pack_latents(image_latents, image_latents.shape[0], num_channels_latents, target_height, target_width)
+lightx2v/models/schedulers/qwen_image/scheduler.py:583:        target_height, target_width = shape[-2], shape[-1]
+lightx2v/models/schedulers/qwen_image/scheduler.py:585:        image_latents = self._resize_i2i_image_latents(image_latents, target_height, target_width, num_channels_latents)
+lightx2v/models/schedulers/z_image/scheduler.py:353:    def _resize_i2i_image_latents(self, image_latents, target_height, target_width, target_channels):
+lightx2v/models/schedulers/z_image/scheduler.py:358:        if image_latents.shape[-2:] != (target_height, target_width):
+lightx2v/models/schedulers/z_image/scheduler.py:359:            image_latents = F.interpolate(image_latents, size=(target_height, target_width), mode="bilinear", align_corners=False)
+lightx2v/models/schedulers/z_image/scheduler.py:367:        _, target_channels, target_height, target_width = self.latents.shape
+lightx2v/models/schedulers/z_image/scheduler.py:368:        image_latents = self._resize_i2i_image_latents(image_latents, target_height, target_width, target_channels)
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:467:        sample, target_shape = self._denormalize_latents(sample)
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:474:        return self._adjust_output_shape(h, target_shape)
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:492:        target_shape = AudioLatentShape(
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:499:        return sample, target_shape
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:504:        target_shape: AudioLatentShape,
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:512:            target_shape: AudioLatentShape describing (batch, channels, time, mel bins)
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:514:            Tensor adjusted to match target_shape exactly
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:518:        target_channels = target_shape.channels
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:519:        target_time = target_shape.frames
+lightx2v/models/video_encoders/hf/ltx2/audio_vae/audio_vae.py:520:        target_freq = target_shape.mel_bins
+lightx2v/server/schema.py:95:        description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset",
+lightx2v/server/schema.py:136:        description="Super-resolution target short edge in pixels; output keeps the SOURCE aspect ratio. Takes precedence over sr_ratio, yields to target_shape. 0 = unset",
+lightx2v/utils/ltx2_media_io.py:49:    target_height = int(height * scale)
+lightx2v/utils/ltx2_media_io.py:50:    target_width = int(width * scale)
+lightx2v/utils/ltx2_media_io.py:51:    resized = resize_and_center_crop(image, target_height, target_width)
+lightx2v/utils/utils.py:719:def fixed_shape_resize(img, target_height, target_width):
+lightx2v/utils/utils.py:722:    target_ratio = target_height / target_width
+lightx2v/utils/utils.py:734:    resized_img = TF.resize(cropped_img, [target_height, target_width], antialias=True)
