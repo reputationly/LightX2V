@@ -19,6 +19,7 @@ from loguru import logger
 from safetensors import safe_open
 
 from lightx2v.models.networks.swiftvr import (
+    AntiphaseBlender,
     RestorationAutoencoder,
     SwiftVRModel,
     SwiftVRRestorer,
@@ -26,6 +27,7 @@ from lightx2v.models.networks.swiftvr import (
     normalize_swiftvr_config,
     padded_frame_count,
 )
+from lightx2v.models.networks.swiftvr.antiphase import exchange_antiphase_carry
 from lightx2v.models.runners.default_runner import DefaultRunner
 from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.server.metrics import monitor_cli
@@ -40,7 +42,7 @@ class SwiftVRRunner(DefaultRunner):
     """Native LightX2V runner for SwiftVR image and video restoration."""
 
     supported_request_fields_by_task = {
-        "sr": COMMON_REQUEST_FIELDS | {"image_path", "sr_ratio", "size", "video_path"},
+        "sr": COMMON_REQUEST_FIELDS | {"image_path", "sr_ratio", "size", "target_short_edge", "video_path"},
     }
 
     # Two spatial shapes trigger dynamic compilation before serving requests.
@@ -64,6 +66,26 @@ class SwiftVRRunner(DefaultRunner):
         self.is_main_process = is_main_process()
         self.copy_stream = torch.cuda.Stream(device=self.init_device) if self.init_device.type == "cuda" else None
 
+        # 两个数,两件事,别混：
+        #
+        # restoration_strength 是**用户旋钮**。1.0 = 上游原行为;调低用于抑制「把源本身的
+        # 缺陷(水波纹/噪点/压缩块)当成细节一起放大」——SwiftVR 在重退化数据上训过,喂它
+        # 轻退化素材(AIGC 直出、干净拍摄)会过度生成。
+        #
+        # antiphase_strength_gain 是**引擎补偿**。反相平均是逐像素取两条流的均值,这个平均
+        # 本身要削掉约三成高频(实测锐度 lap 2905 -> 1969),所以双跑路径得把残差按比例放大
+        # 才能回到基线画质(1.40 实测补平:2876~2921)。它不代表「用户想要更强的恢复」。
+        self.restoration_strength = float(self.config.get("restoration_strength", 1.0))
+        self.antiphase = bool(self.config.get("antiphase_dual_pass"))
+        gain = float(self.config.get("antiphase_strength_gain", 1.4)) if self.antiphase else 1.0
+        # 视频路径吃补偿,图像路径**不能**吃:单张图没有时间轴,反相平均无从谈起,补偿加
+        # 上去就是纯过锐(实测 s1.40 不做反相 lap 4349,是基线 2905 的 1.5 倍)。而
+        # run_pipeline 是按输入类型**运行时**分流的,同一个部署会同时收到图和视频,靠约定
+        # 隔离必然静默出错 —— 所以图像走 self.restoration_strength,视频走这个。
+        self.video_strength = self.restoration_strength * gain
+        # rank 0 暂存「上一 batch 从最后一个 rank 收到的块尾」(见 exchange_antiphase_carry)。
+        self._antiphase_carry = None
+
     def init_modules(self):
         logger.info(f"Loading native SwiftVR weights from {self.config['model_path']}")
         self.model = SwiftVRModel(self.config["model_path"], self.config, self.init_device)
@@ -79,14 +101,33 @@ class SwiftVRRunner(DefaultRunner):
         ) as weights:
             prompt_embedding = weights.get_tensor("prompt_emb").to(self.init_device, GET_DTYPE())
 
-        self.restorer = SwiftVRRestorer(
-            autoencoder,
-            self.model,
-            prompt_embedding,
-            overlap=self.config.get("dit_overlap", 0),
-            reae_frame_batch_size=self.config.get("reae_frame_batch_size", 1),
-        )
+        def build_restorer():
+            return SwiftVRRestorer(
+                autoencoder,
+                self.model,
+                prompt_embedding,
+                overlap=self.config.get("dit_overlap", 0),
+                reae_frame_batch_size=self.config.get("reae_frame_batch_size", 1),
+            )
+
+        self.restorer = build_restorer()
+        # 反相双跑的第二条流。SwiftVRRestorer 只持有流式状态(encoder_state/decoder_state/
+        # previous_latents),权重在 autoencoder 与 self.model 里 —— 所以再建一个实例是
+        # **共享权重、独立状态**,不吃第二份显存。
+        self.restorer_shifted = build_restorer() if self.antiphase else None
         self.config.lock()
+
+    def _set_chunk_p_group(self, group):
+        """两套流各有自己的 ReAE 因果状态,ring 组必须一起挂、一起摘。"""
+        self.restorer.autoencoder.chunk_p_group = group
+        if self.restorer_shifted is not None:
+            self.restorer_shifted.autoencoder.chunk_p_group = group
+
+    def _reset_restorers(self):
+        for restorer in (self.restorer, self.restorer_shifted):
+            if restorer is not None:
+                restorer.reset()
+        self._antiphase_carry = None
 
     @ProfilingContext4DebugL1("Warmup")
     @torch.inference_mode()
@@ -103,7 +144,7 @@ class SwiftVRRunner(DefaultRunner):
             overlap = self.restorer.transformer.overlap
             try:
                 self.restorer.transformer.overlap = 0
-                self.restorer.autoencoder.chunk_p_group = self.chunk_p_group
+                self._set_chunk_p_group(self.chunk_p_group)
                 for chunk in chunks:
                     video = torch.zeros(
                         1,
@@ -114,37 +155,136 @@ class SwiftVRRunner(DefaultRunner):
                         dtype=GET_DTYPE(),
                         device=self.init_device,
                     )
-                    restored = self.restorer.restore_chunk(video, chunk, clip_latents)
+                    # 用视频路径的 strength:正式请求的残差乘的就是这个系数。
+                    restored = self.restorer.restore_chunk(video, chunk, clip_latents, self.video_strength)
                     del video, restored
             finally:
                 self.restorer.transformer.overlap = overlap
-                self.restorer.autoencoder.chunk_p_group = None
-                self.restorer.reset()
+                self._set_chunk_p_group(None)
+                # 移位流走同一批权重、同一组形状,编译缓存与它共用,不必单独预热一遍;
+                # 但它的因果状态必须干净地进正式请求。
+                self._reset_restorers()
 
         logger.info("[Warmup] Warmup completed")
         self._maybe_freeze_gc()
 
-    @staticmethod
+    def _oriented_target(self, source_height: int, source_width: int) -> tuple[int, int]:
+        """配置里的标称输出档位,按源的朝向配对长短边。
+
+        与 SeedVR2 的 `_oriented_target`(seedvr_runner.py:220)同语义:config 写的
+        sr_tier_size [1080, 1920] 表示的是「1080P 这一档」,不是死的高×宽 —— 竖版源要出
+        1080×1920、横版出 1920×1080、方形塌到短边(横竖都救不了方的)。
+
+        返回 (0, 0) 表示没配档位,调用方退回纯 sr_ratio 放大。
+        """
+        tier_height, tier_width = self.config.get("sr_tier_size") or (1080, 1920)
+        target_height, target_width = int(tier_height or 0), int(tier_width or 0)
+        if target_height <= 0 or target_width <= 0:
+            return 0, 0
+        long_side, short_side = max(target_height, target_width), min(target_height, target_width)
+        if source_height > source_width:
+            return long_side, short_side
+        if source_width > source_height:
+            return short_side, long_side
+        return short_side, short_side
+
+    def _clamp_to_ceiling(self, height: int, width: int) -> tuple[int, int]:
+        """按面积把输出压到显存安全上限内,保持请求的宽高比。
+
+        这条是兜底护栏,拦的是**显式 size**:标称档位那条路已经被 `_oriented_target`
+        封住了,但请求可以直接点名尺寸,而 SwiftVR 的显存随像素数线性涨(实测单卡 1080p
+        15.8G / 2K 19.8G / 4K 32.5G,40G 卡上 4K 已是上限)。没有这道闸,一个 8K 的 size
+        就能把整台机器的卡打爆。
+
+        按**面积**而不是逐边压:显存跟像素数走,而且等比缩放不会改变请求的画幅比例。
+        配 0 或负数 = 关闭上限(自建/离线跑大图时用)。
+        """
+        max_height = int(self.config.get("max_target_height", 2160) or 0)
+        max_width = int(self.config.get("max_target_width", 3840) or 0)
+        if max_height <= 0 or max_width <= 0:
+            return height, width
+        budget = max_height * max_width
+        if height * width <= budget:
+            return height, width
+        scale = (budget / (height * width)) ** 0.5
+        clamped_height, clamped_width = max(1, round(height * scale)), max(1, round(width * scale))
+        logger.warning(f"SwiftVR: requested {width}x{height} exceeds the {max_width}x{max_height} ceiling, clamped to {clamped_width}x{clamped_height}")
+        return clamped_height, clamped_width
+
     def resolve_output_size(
+        self,
         input_info,
         source_height: int,
         source_width: int,
         *,
         require_even: bool = False,
     ) -> tuple[int, int]:
+        """定输出尺寸。三条路各有各的封顶,别把它们混起来看。
+
+        ⚠️ sr_ratio 这条路**必须**封顶,这是现网 SR 的既有契约,不是防呆:网关前端
+        固定下发 sr_ratio=4.0(new-api `VIDEO_SR_RATIO_UNCAPPED`),注释原话是"一个够不着
+        的上限",指望引擎拿 config 档位去 min 掉它 —— SeedVR2 靠 seedvr_runner.py:241
+        那个 min 兜住。SwiftVR 早先没有这层,1344×768 的源乘 4 会去出 5376×3072(≈5.3K),
+        远超 4K/33G 的实测上限,必 OOM,而且不报参数错、跑起来才炸。
+
+        size 这条路是 SwiftVR 精确点名尺寸的能力(SeedVR2 的 size 还要再过
+        match_target_size 的裁切/缩放),一份配置串行吃 1080p/2K/4K 靠的就是它,所以
+        **不能**用档位去封 —— 那会把 2K/4K 一起封死。它只过 `_clamp_to_ceiling` 的显存护栏。
+
+        target_short_edge 是给网关用的第三条路:只给一个目标短边,输出按**源的真实画幅**
+        等比放大。它存在的理由是「只有引擎知道源有多大」—— 网关手里只有用户选的比例
+        标签,而标签和实际画幅并不相等(H3 的 768P/16:9 实际出 1344x768 = 1.75,不是
+        1.778;wan 的 720P 是 1280x720 = 1.778),照标签算 size 会带约 1.6% 的横向拉伸,
+        且档位越高越明显。按短边对齐则画幅零形变、短边精确命中目标档,1080P/2K/4K 共用
+        同一个机制,网关只需下发一个数字。
+
+        三条路的优先级:size(精确尺寸,调用方完全指定) > target_short_edge
+        (指定档位、画幅随源) > sr_ratio(倍率,按部署档位封顶)。
+        """
         if input_info.size:
             if len(input_info.size) != 2:
                 raise ValueError(f"SwiftVR size must be [height, width], got {input_info.size}")
             height, width = input_info.size
+        elif input_info.target_short_edge > 0:
+            edge = int(input_info.target_short_edge)
+            source_edge = min(source_height, source_width)
+            if source_edge <= 0:
+                raise ValueError(f"SwiftVR source size must be positive, got {source_width}x{source_height}")
+            scale = edge / source_edge
+            height, width = round(source_height * scale), round(source_width * scale)
         else:
             ratio = input_info.sr_ratio
             height, width = round(source_height * ratio), round(source_width * ratio)
+            target_height, target_width = self._oriented_target(source_height, source_width)
+            if target_height and height * width > target_height * target_width:
+                # 落到档位上就出**精确**档位尺寸,不是等比缩到档位面积:界面标着 1080P
+                # 就得真是 1920×1080。SeedVR2 是靠 fixed_shape 中心裁到精确档位达成的
+                # (new-api videoPlayground.constants.js:512 记了这个决定),SwiftVR 这边
+                # preprocess_frames 直接 interpolate 到目标尺寸,等价结果、少一次裁剪。
+                # 代价是源与档位画幅比不一致时会有轻微拉伸(1344×768 的 1.75 → 1.778,
+                # 1.6%),而 SeedVR2 那边是上下各裁 12 像素 —— 两种取舍,量级都可忽略。
+                height, width = target_height, target_width
         if height <= 0 or width <= 0:
             raise ValueError(f"SwiftVR output size must be positive, got {height}x{width}")
+        height, width = self._clamp_to_ceiling(height, width)
         if require_even:
-            height = max(2, round(height / 2) * 2)
-            width = max(2, round(width / 2) * 2)
+            height = max(2, int(round(height / 2)) * 2)
+            width = max(2, int(round(width / 2)) * 2)
         return height, width
+
+    @staticmethod
+    def _antiphase_frames(chunk, raw_frame_count: int, frames_to_trim: int) -> int:
+        """反相双跑下本块要写出的帧数。
+
+        配对是「本块 direct[i] 配 shifted[i+1],块末帧留给下一块」,而移位流那一帧来自
+        **前一个源帧**,所以整条输出比直相前移一帧:窗口两端各减一,起点夹到 0(首块
+        没有上一块可配,原地不动、末尾少写一帧),末块 flush 把最后一帧原样补回来。
+        合起来正好一帧不少 —— 成片帧数 == 源帧数。
+        """
+        output = chunk.output_range(raw_frame_count, frames_to_trim)
+        start = max(0, output.start - 1)
+        stop = min(raw_frame_count, output.stop - 1 + (1 if chunk.is_last else 0))
+        return stop - start
 
     @staticmethod
     def resolve_input_kind(input_info) -> str:
@@ -166,8 +306,14 @@ class SwiftVRRunner(DefaultRunner):
         return frames, source_height, source_width
 
     @staticmethod
-    def read_video_frames(reader, chunk, raw_frame_count: int, source_height: int, source_width: int, pin_memory: bool):
-        indices = [min(index, raw_frame_count - 1) for index in range(chunk.start, chunk.start + chunk.frame_count)]
+    def read_video_frames(reader, chunk, raw_frame_count: int, source_height: int, source_width: int, pin_memory: bool, lead: int = 0):
+        """读一块。``lead>0`` 时向前多读几帧,供反相双跑的移位流用。
+
+        反相双跑要的两条流是 [start, start+n) 与 [start-1, start+n-1),并集恰好是
+        [start-1, start+n) —— 多读一帧就够,不必读两遍。块首越界的负号夹到 0,
+        等价于「复制首帧插到最前面」,与离线配方一致。
+        """
+        indices = [min(max(index, 0), raw_frame_count - 1) for index in range(chunk.start - lead, chunk.start + chunk.frame_count)]
         frames = reader.get_batch(indices)
         if not torch.is_tensor(frames):
             frames = torch.from_dlpack(frames.to_dlpack())
@@ -331,11 +477,11 @@ class SwiftVRRunner(DefaultRunner):
             if self.resolve_input_kind(input_info) == "image":
                 self.check_stop()
                 return self.run_image_pipeline(input_info) if self.is_main_process else {}
-            self.restorer.autoencoder.chunk_p_group = self.chunk_p_group
+            self._set_chunk_p_group(self.chunk_p_group)
             return self.run_video_pipeline(input_info)
         finally:
-            self.restorer.autoencoder.chunk_p_group = None
-            self.restorer.reset()
+            self._set_chunk_p_group(None)
+            self._reset_restorers()
 
     def run_image_pipeline(self, input_info):
         if not input_info.return_result_tensor and not input_info.save_result_path:
@@ -352,7 +498,9 @@ class SwiftVRRunner(DefaultRunner):
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
         started_at = time.perf_counter()
         video = self.preprocess_frames(frames, output_height, output_width)
-        restored = self.restorer.restore_chunk(video, chunk, clip_latents)[..., :output_height, :output_width]
+        # 单张图没有时间轴,反相双跑无从谈起 —— 图像固定走正相这一条流,而且用**基准**
+        # strength(不吃 antiphase_strength_gain,否则就是纯过锐)。
+        restored = self.restorer.restore_chunk(video, chunk, clip_latents, self.restoration_strength)[..., :output_height, :output_width]
         del video
         images = restored[0].permute(0, 2, 3, 1).contiguous()
         if input_info.return_result_tensor:
@@ -401,6 +549,9 @@ class SwiftVRRunner(DefaultRunner):
         # Idle ranks in the final batch still participate in ReAE boundary exchanges.
         local_chunks = [chunks[min(start + rank, len(chunks) - 1)] for start in range(0, len(chunks), self.chunk_p_size)]
         output_path = os.path.abspath(input_info.save_result_path)
+        antiphase = self.restorer_shifted is not None
+        # 双跑的两条流是 [start, start+n) 与 [start-1, start+n-1),并集多一帧就够。
+        read_lead = 1 if antiphase else 0
 
         try:
             try:
@@ -413,12 +564,28 @@ class SwiftVRRunner(DefaultRunner):
                 reader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-reader")
                 writer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-writer")
                 max_pending = self.config.get("queue_size", 3)
-                output_batch_size = 4 if self.chunk_p_group is not None else clip_length + 4
+                # 双跑要融合整块,按 output_batch_size=0 整块解码(显存代价 1080p 约
+                # 2×300MB/块、4K 约 2×1.2GB)。
+                output_batch_size = 0 if antiphase else (4 if self.chunk_p_group is not None else clip_length + 4)
                 # Keep the write queue's frame budget proportional to the original chunk budget.
-                max_pending_writes = max_pending * ((clip_length + output_batch_size - 1) // output_batch_size)
+                # 整块解码时一块只有一次写出。
+                writes_per_chunk = 1 if output_batch_size == 0 else (clip_length + output_batch_size - 1) // output_batch_size
+                max_pending_writes = max_pending * writes_per_chunk
+
+                def chunk_frames(chunk):
+                    return self._antiphase_frames(chunk, raw_frame_count, frames_to_trim) if antiphase else len(chunk.output_range(raw_frame_count, frames_to_trim))
 
                 def submit_read(chunk):
-                    return reader_executor.submit(self.read_video_frames, reader, chunk, raw_frame_count, source_height, source_width, self.copy_stream is not None)
+                    return reader_executor.submit(
+                        self.read_video_frames,
+                        reader,
+                        chunk,
+                        raw_frame_count,
+                        source_height,
+                        source_width,
+                        self.copy_stream is not None,
+                        read_lead,
+                    )
 
                 for chunk in local_chunks[:max_pending]:
                     pending_reads.append(submit_read(chunk))
@@ -427,9 +594,10 @@ class SwiftVRRunner(DefaultRunner):
                     dist.broadcast_object_list(directories, src=0, group=self.chunk_p_group)
                     work_dir = directories[0]
                     if rank < len(chunks):
-                        frame_counts = [len(local_chunk.output_range(raw_frame_count, frames_to_trim)) for local_chunk in chunks[rank :: self.chunk_p_size]]
+                        frame_counts = [chunk_frames(chunk) for chunk in chunks[rank :: self.chunk_p_size]]
                         writer = self.open_video_writer(os.path.join(work_dir, f"{rank:03d}-%08d.mp4"), fps, output_height, output_width, frame_counts)
 
+                blender = AntiphaseBlender() if antiphase else None
                 for local_index, chunk in enumerate(local_chunks):
                     self.check_stop()
                     active = local_index * self.chunk_p_size + rank < len(chunks)
@@ -437,19 +605,61 @@ class SwiftVRRunner(DefaultRunner):
                     next_read = local_index + max_pending
                     if next_read < len(local_chunks):
                         pending_reads.append(submit_read(local_chunks[next_read]))
-                    video = self.preprocess_frames(frames, output_height, output_width)
-                    del frames
 
-                    model_input, offset = self.restorer.encode_chunk(video, chunk, clip_latents)
-                    del video
-                    latents = model_input - self.model.predict(model_input, self.restorer.transformer.condition, offset) if active else model_input
-                    restored_frames = self.restorer.decode_chunk(latents, chunk, output_batch_size)
-                    del model_input, latents
-                    if not active:
-                        del restored_frames
-                        continue
+                    if antiphase:
+                        # 直相用 frames[1:]、移位流用 frames[:-1]:同一段画面差一帧的两种
+                        # 切法,多读的那一帧就是位移量。
+                        video = self.preprocess_frames(frames[1:], output_height, output_width)
+                        video_shifted = self.preprocess_frames(frames[:-1], output_height, output_width)
+                        del frames
+                        # 六步固定顺序:直相 encode → 移位 encode → 直相 predict → 移位
+                        # predict → 直相 decode → 移位 decode。**所有 rank(含 inactive 的
+                        # 重复块)都按这个顺序执行**,两套 ring 上每一次 ReAE 边界交换才能
+                        # 一一配对 —— 顺序一换,rank A 的直相交换就配上 rank B 的移位交换。
+                        direct_input, direct_offset = self.restorer.encode_chunk(video, chunk, clip_latents)
+                        shifted_input, shifted_offset = self.restorer_shifted.encode_chunk(video_shifted, chunk, clip_latents)
+                        del video, video_shifted
+                        if active:
+                            direct_latents = direct_input - self.video_strength * self.model.predict(direct_input, self.restorer.transformer.condition, direct_offset)
+                            shifted_latents = shifted_input - self.video_strength * self.model.predict(shifted_input, self.restorer_shifted.transformer.condition, shifted_offset)
+                        else:
+                            direct_latents, shifted_latents = direct_input, shifted_input
+                        del direct_input, shifted_input
+                        direct_frames = next(self.restorer.decode_chunk(direct_latents, chunk, output_batch_size))
+                        shifted_frames = next(self.restorer_shifted.decode_chunk(shifted_latents, chunk, output_batch_size))
+                        del direct_latents, shifted_latents
+                        if self.chunk_p_group is not None:
+                            # inactive 的重复块也要发同形零张量:ring 的每一次交换在所有
+                            # rank 上必须一一配对,少发一次其余 rank 就卡在 P2P 上。
+                            carry = direct_frames[:, -1:] if active else direct_frames.new_zeros((direct_frames.shape[0], 1, *direct_frames.shape[2:]))
+                            chunk_carry, self._antiphase_carry = exchange_antiphase_carry(carry, self.chunk_p_group, self._antiphase_carry)
+                            blender.carry = chunk_carry
+                        if not active:
+                            del direct_frames, shifted_frames
+                            continue
+                        restored = blender.push(direct_frames, shifted_frames)
+                        del direct_frames, shifted_frames
+                        if chunk.index == len(chunks) - 1:
+                            # 全片最后一块:carry 是最后一帧,移位流已经没有对应帧能与它
+                            # 配对(移位流整体比正相流短一帧),原样接在尾巴上。
+                            tail = blender.flush()
+                            if tail is not None:
+                                restored = torch.cat([restored, tail], dim=1)
+                        restored_frames = (restored,)
+                    else:
+                        video = self.preprocess_frames(frames, output_height, output_width)
+                        del frames
 
-                    remaining_frames = len(chunk.output_range(raw_frame_count, frames_to_trim))
+                        model_input, offset = self.restorer.encode_chunk(video, chunk, clip_latents)
+                        del video
+                        latents = model_input - self.video_strength * self.model.predict(model_input, self.restorer.transformer.condition, offset) if active else model_input
+                        restored_frames = self.restorer.decode_chunk(latents, chunk, output_batch_size)
+                        del model_input, latents
+                        if not active:
+                            del restored_frames
+                            continue
+
+                    remaining_frames = chunk_frames(chunk)
                     for restored in restored_frames:
                         if len(pending_writes) >= max_pending_writes:
                             pending_writes.popleft().result()

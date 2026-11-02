@@ -141,7 +141,25 @@ class SwiftVRRestorer:
         return self.autoencoder.decode(latents, chunk.is_first, output_batch_size)
 
     @torch.inference_mode()
-    def restore_chunk(self, video: torch.Tensor, chunk: VideoChunk, clip_latents: int) -> torch.Tensor:
+    def restore_chunk(self, video: torch.Tensor, chunk: VideoChunk, clip_latents: int, strength: float = 1.0) -> torch.Tensor:
+        """跑一块(整块编码 → DiT → 整块解码),供图像路径与 warmup 用。
+
+        ``strength`` 给 DiT 预测的**残差**乘系数:输出 = 输入 - strength*残差。
+          1.0  = 上游原行为
+          <1.0 = 弱化恢复。用来压住「把源本身的缺陷(水波纹、压缩噪点、颗粒)当成要恢复的
+                 细节一起放大」—— SwiftVR 在**重退化**数据上训过,喂它轻退化素材(AIGC
+                 直出、干净拍摄)必然过度生成,是这类生成式修复的通病,SeedVR2 官方也警告过。
+                 实测:雨林微距锐度 821(源) -> 1848,远超"恢复"该有的量。
+          0.0  = 残差置零,但**仍然走 ReAE 编解码** —— 拿到的是一次自编码往返,**不是纯放大**。
+                 「两帧一顿」(2beat)长在 ReAE 解码器的 TemporalGrow 里,把 strength 关到 0
+                 也修不掉:只跑 ReAE 实测 2beat 0.5639,而双线性对照是 1.0000。GPU 也一分不省。
+                 要真·纯放大请走 ffmpeg,别指望这个旋钮。
+          >1.0 = 引擎补偿,见 runner 的 antiphase_strength_gain:反相平均会削掉约三成高频,
+                 双跑路径靠放大残差补回来。它不代表「用户想要更强的恢复」。
+
+        图像路径传**基准** strength(不乘反相补偿:单图没有时间轴,乘补偿 = 纯过锐);
+        视频路径不经过这里,runner 直接对残差乘。
+        """
         model_input, temporal_offset = self.encode_chunk(video, chunk, clip_latents)
         prediction = self.transformer.model.predict(model_input, self.transformer.condition, temporal_offset)
-        return next(self.decode_chunk(model_input - prediction, chunk))
+        return next(self.decode_chunk(model_input - strength * prediction, chunk))
