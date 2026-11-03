@@ -141,19 +141,14 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
         normalized = self.modulate_func(phase.norm2.apply(x), scale=c_scale_msa, shift=c_shift_msa).reshape(1, -1)
         return phase.ffn_2.apply(F.gelu(phase.ffn_0.apply(normalized), approximate="tanh"))
 
-    def infer_self_attn(self, phase, x, shift_msa, scale_msa, grid_sizes=None, *, q_rope, k_rope, cache, cache_slot):
-        _, height, width = grid_sizes
+    def project_qkv(self, phase, x, shift_msa, scale_msa, tokens):
         normalized = self.modulate_func(phase.norm1.apply(x), scale_msa, shift_msa)
-        tokens = q_rope[0].shape[0]
         query = self.parallel.to_heads(phase.self_attn_norm_q.apply(phase.self_attn_q.apply(normalized)).view(-1, self.num_heads, self.head_dim), tokens)
         key = self.parallel.to_heads(phase.self_attn_norm_k.apply(phase.self_attn_k.apply(normalized)).view(-1, self.num_heads, self.head_dim), tokens)
         value = self.parallel.to_heads(phase.self_attn_v.apply(normalized).view(-1, self.num_heads, self.head_dim), tokens)
-        start = cache_slot * tokens
-        cache[0][start : start + tokens].copy_(key)
-        cache[1][start : start + tokens].copy_(value)
-        # Derive both views inside the graph. Independent overlapping inputs
-        # can lose the write-before-read dependency during functionalization.
-        key, value = cache[0][: k_rope[0].shape[0]], cache[1][: k_rope[0].shape[0]]
+        return query, key, value
+
+    def attend(self, phase, query, key, value, q_rope, k_rope, height, width, tokens):
         query = apply_rope(query, q_rope)
         key = apply_rope(key, k_rope)
         visible = key.shape[0] // tokens
@@ -164,6 +159,91 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
         else:
             attended = phase.self_attn_1.apply(query, key, value).view(tokens, -1, self.head_dim)
         return phase.self_attn_o.apply(self.parallel.to_sequence(attended))
+
+    def infer_self_attn(self, phase, x, shift_msa, scale_msa, grid_sizes=None, *, q_rope, k_rope, cache=None, cache_slot=None, precomputed=None):
+        _, height, width = grid_sizes
+        tokens = q_rope[0].shape[0]
+        if precomputed is not None:
+            # Exact chunk path: the Q/K/V of the whole visible window are already staged,
+            # so the ring buffer is never touched (see exact_chunk.infer_layer_major).
+            query, key, value = precomputed
+        else:
+            query, key, value = self.project_qkv(phase, x, shift_msa, scale_msa, tokens)
+            start = cache_slot * tokens
+            cache[0][start : start + tokens].copy_(key)
+            cache[1][start : start + tokens].copy_(value)
+            # Derive both views inside the graph. Independent overlapping inputs
+            # can lose the write-before-read dependency during functionalization.
+            key, value = cache[0][: k_rope[0].shape[0]], cache[1][: k_rope[0].shape[0]]
+        return self.attend(phase, query, key, value, q_rope, k_rope, height, width, tokens)
+
+    def infer_layer_major(self, blocks, groups, exchange, context, before_layer=None):
+        """Run the whole reference set layer-major, exchanging each layer's prefix K/V.
+
+        ``groups`` holds one ``(rank, first_ref, pres)`` entry per local rank, ``pres`` being
+        that rank's ``WanPreInferModuleOutput`` list in reference order.  Reference ``j``'s
+        layer-ℓ K/V is a pure function of its own layer-ℓ input, so staging every reference
+        first and settling the attention afterwards reproduces the serial run exactly: the
+        cross-reference dependency is the K/V ring, not the activations.
+        """
+        active = next((pres for _, _, pres in groups if pres), None)
+        if active is not None:
+            _, height, width = active[0].grid_sizes.tuple
+            self._output_tokens = height * width
+        for block_idx, block in enumerate(blocks):
+            self.block_idx = block_idx
+            if before_layer is not None:
+                before_layer()
+            phase = block.compute_phases[0]
+            staged = []
+            for rank, first_ref, pres in groups:
+                own, queries = {}, []
+                for offset, pre in enumerate(pres):
+                    tokens = pre.adapter_args["q_rope"][0].shape[0]
+                    shift_msa, scale_msa = self.pre_process(phase.modulation, pre.embed0)[:2]
+                    if self.use_compile:
+                        mark_sequence_dynamic(pre.x)
+                        query, key, value = self.get_compiled_stage1(block_idx, block)(pre.x, shift_msa, scale_msa, tokens)
+                    else:
+                        query, key, value = self.project_qkv(phase, pre.x, shift_msa, scale_msa, tokens)
+                    own[first_ref + offset] = (key, value)
+                    queries.append(query)
+                exchange.post(block_idx, rank, own)
+                staged.append((rank, first_ref, pres, own, queries))
+            # References whose visible window is fully local run before the exchange is awaited,
+            # so the point-to-point traffic overlaps with real work.
+            for rank, first_ref, pres, own, queries in staged:
+                for offset in range(min(context - 1, len(pres)), len(pres)):
+                    self.stage_reference(block_idx, block, pres, own, None, queries[offset], offset, first_ref)
+            for rank, first_ref, pres, own, queries in staged:
+                received = exchange.collect(block_idx, rank)
+                for offset in range(min(context - 1, len(pres))):
+                    self.stage_reference(block_idx, block, pres, own, received, queries[offset], offset, first_ref)
+
+    def stage_reference(self, block_idx, block, pres, own, received, query, offset, first_ref):
+        """Finish one reference's layer: slot-ordered attention over the visible window, then the rest."""
+        ref = first_ref + offset
+        pre = pres[offset]
+        window = self.relay_config["temporal_context_frames"]
+        visible = min(ref + 1, window)
+        keys, values = [], []
+        for slot in range(visible):
+            # Slot ``s`` holds the newest reference congruent to it, exactly as the serial ring does.
+            source = ref - ((ref - slot) % window)
+            key, value = own[source] if source in own else received[source]
+            keys.append(key)
+            values.append(value)
+        self_attn_kwargs = {
+            "q_rope": pre.adapter_args["q_rope"],
+            "k_rope": pre.adapter_args["k_rope"],
+            "precomputed": (query, torch.cat(keys, 0), torch.cat(values, 0)),
+        }
+        if self.use_compile:
+            mark_sequence_dynamic(pre.x, self_attn_kwargs["precomputed"][1], self_attn_kwargs["precomputed"][2])
+            output = self.get_compiled_block(block_idx, block)(pre.x, replace(pre, context=self.cross_cache[block_idx]), self_attn_kwargs)
+        else:
+            output = self.infer_block(block, pre.x, replace(pre, context=self.cross_cache[block_idx]), self_attn_kwargs)
+        pres[offset] = replace(pre, x=output)
 
     def prepare_input(self, x, temb, modulation, context, rope, cache, frame, height, width):
         window = self.relay_config["temporal_context_frames"]

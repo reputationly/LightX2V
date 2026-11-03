@@ -76,6 +76,36 @@ class RelayVSRModel:
         hidden = self.wan_transformer.infer(self.wan_weights, pre)
         scheduler.noise_pred = self.wan_post.infer(hidden, pre)
 
+    def infer_references(self, batches, exchange, context, before_layer=None):
+        """Run every reference layer-major and return one latent per reference.
+
+        ``batches`` holds ``(rank, first_ref, noises, lrs)`` per local rank.  ``noises`` are
+        that rank's fp32 scheduler latents in reference order — drawn by calling
+        ``prepare_latents`` once per reference from ``0`` so the Philox offsets match the
+        serial run — and ``lrs`` the matching preprocessed keyframes.  This is the exact
+        replacement for the serial ``reference()`` chain: same inputs, same tensor shapes,
+        same per-reference order of operations, only the layer loop moved outside.
+        """
+        groups, scheduled = [], []
+        for rank, first_ref, noises, lrs in batches:
+            pres = []
+            for offset, (noise, lr) in enumerate(zip(noises, lrs)):
+                height, width = self.geometry.wan_grid(*lr.shape[-2:])
+                hidden = self.parallel.split(self.wan_pre.infer(self.wan_weights.pre, noise.to(GET_DTYPE()), lr))
+                pres.append(self.wan_transformer.prepare_input(hidden, self.temb, self.modulation, self.context, self.wan_rope, None, first_ref + offset, height, width))
+            groups.append((rank, first_ref, pres))
+            scheduled.append(noises)
+        self.wan_transformer.infer_layer_major(self.wan_weights.blocks, groups, exchange, context, before_layer=before_layer)
+        latents = []
+        for (rank, first_ref, pres), noises in zip(groups, scheduled):
+            latents.append(
+                [
+                    (noise - self.wan_post.infer(self.wan_transformer.infer_non_blocks(self.wan_weights, pre.x, pre.embed), pre).float())[:, :, 0].to(GET_DTYPE())
+                    for noise, pre in zip(noises, pres)
+                ]
+            )
+        return latents
+
     def flash_model_prepare_condition(self, latent):
         height, width = latent.shape[-2:]
         hidden = self.parallel.split(self.flash_model_pre.condition(self.flash_model_weights.pre, latent))

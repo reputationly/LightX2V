@@ -18,6 +18,7 @@ from loguru import logger
 
 from lightx2v.common.kvcache.manager import KVCacheManager
 from lightx2v.models.networks.relayvsr.attention import LOCAL_ATTENTION_BACKENDS
+from lightx2v.models.networks.relayvsr.exact_chunk import NcclKVExchange, build_plan, kv_transfer_plan, split_ranks
 from lightx2v.models.networks.relayvsr.geometry import RelayVSRGeometry
 from lightx2v.models.networks.relayvsr.model import RelayVSRModel
 from lightx2v.models.runners.default_runner import DefaultRunner
@@ -41,9 +42,13 @@ def validate_config(config):
     parallel = config.get("parallel") or {}
     chunk_p_size = int(parallel.get("chunk_p_size", 1))
     if chunk_p_size > 1:
-        # 块级数据并行:每卡算自己那段连续帧,模型复制,不走 mesh。与 seq_p 互斥。
+        # 精确块并行:每卡算自己那段连续窗口,模型复制,不走 mesh。
         if int(parallel.get("seq_p_size", 1)) != 1:
             raise ValueError("RelayVSR chunk_p_size is exclusive with seq_p_size")
+        if config.get("cpu_offload"):
+            raise ValueError("RelayVSR chunk_p_size is exclusive with cpu_offload")
+        if config.get("lazy_load"):
+            raise ValueError("RelayVSR chunk_p_size is exclusive with lazy_load")
     elif parallel.get("seq_p_size", 1) not in (1, 2):
         raise ValueError("RelayVSR sequence parallelism supports 1 or 2 GPUs")
     for key, default, minimum in (("clip_len", 16, 2), ("queue_size", 16, 1), ("encoder_threads", 16, 1)):
@@ -92,18 +97,24 @@ class RelayVSRRunner(DefaultRunner):
         self.config.lock()
         logger.info("{} native {}x model loaded in {:.2f}s", self.config["model_cls"], self.geometry.scale, time.perf_counter() - started)
 
+    def warmup_resolutions(self):
+        configured = self.config.get("warmup_resolutions")
+        return [tuple(pair) for pair in configured] if configured else list(self.WARMUP_RESOLUTIONS)
+
     @torch.no_grad()
     def run_warmup(self):
         if self.config["task"] != "sr":
             raise NotImplementedError("RelayVSR warmup supports the native SR runner only")
         if self.config.get("lazy_load", False):
             raise NotImplementedError("RelayVSR warmup does not support lazy loading")
+        if self.chunk_p_size > 1:
+            return self._warmup_exact()
         started = time.perf_counter()
         # Fill the causal Wan cache and overwrite every slot once. The Flash model's
         # condition, first-frame and history branches follow the normal stream.
         references = 2 * self.model.wan_config["temporal_context_frames"]
         frames = (references - 1) * (self.config.get("clip_len", 16) - 1) + 1
-        for height, width in self.WARMUP_RESOLUTIONS:
+        for height, width in self.warmup_resolutions():
             frame = prediction = pixels = None
             logger.info("RelayVSR warmup: {}x{}, {} reference frames", height, width, references)
             try:
@@ -118,6 +129,46 @@ class RelayVSRRunner(DefaultRunner):
                 self.input_info = None
         logger.info("RelayVSR warmup cost {:.2f}s", time.perf_counter() - started)
         self._maybe_freeze_gc()
+
+    @torch.no_grad()
+    def _warmup_exact(self):
+        """Warm both compiled halves and every ``visible`` variant on the real rank layout.
+
+        ``2 * context`` references give each rank enough references that the point-to-point
+        exchange is exercised and the ``visible = 1...context`` attention variants are built.
+        """
+        started = time.perf_counter()
+        fps = float(self.config.get("fps") or 24)
+        frames = 2 * int(self.model.wan_config["temporal_context_frames"]) * (self.config.get("clip_len", 16) - 1) + 1
+        for height, width in self.warmup_resolutions():
+            logger.info("RelayVSR warmup: {}x{}, {} frames exact chunk", height, width, frames)
+            directory = Path(tempfile.mkdtemp(prefix="relayvsr-warmup-"))
+            try:
+                source = directory / "in.mp4"
+                self._write_synthetic_video(source, height, width, frames, fps)
+                self._run_video_exact(source, directory / "out.mp4", fps, (height * self.geometry.scale, width * self.geometry.scale), 42)
+                torch.cuda.synchronize()
+            finally:
+                self.input_info = None
+                shutil.rmtree(directory, ignore_errors=True)
+        logger.info("RelayVSR warmup cost {:.2f}s", time.perf_counter() - started)
+        self._maybe_freeze_gc()
+
+    @staticmethod
+    def _write_synthetic_video(path, height, width, frames, fps):
+        rate = Fraction(fps).limit_denominator(1001)
+        pixels = np.zeros((height, width, 3), dtype=np.uint8)
+        with av.open(str(path), mode="w") as container:
+            stream = container.add_stream("libx264", rate=rate)
+            stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+            stream.options = {"crf": "0", "preset": "ultrafast"}
+            for index in range(frames):
+                frame = av.VideoFrame.from_numpy_buffer(pixels, format="rgb24")
+                frame.pts, frame.time_base = index, 1 / rate
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
 
     def output_size(self, input_info, height, width):
         return self.geometry.output_size(input_info, height, width)
@@ -135,7 +186,7 @@ class RelayVSRRunner(DefaultRunner):
             prediction = F.interpolate(prediction.float().clamp(-1, 1), size=target, mode="bicubic", align_corners=False, antialias=True)
         return prediction[0].add(1).mul_(127.5).clamp_(0, 255).to(torch.uint8).permute(1, 2, 0).contiguous()
 
-    def init_run(self, height, width, seed):
+    def init_run(self, height, width, seed, with_wan_cache=True):
         self.scheduler.prepare(seed, self.device)
         wan = self.model.wan_config
         self.wan_cache_manager = KVCacheManager(
@@ -146,11 +197,16 @@ class RelayVSRRunner(DefaultRunner):
             },
             device=self.device,
         )
-        self.wan_cache = self.wan_cache_manager.create_self_attn_kv_cache(
-            "wan",
-            (height // self.geometry.wan_stride) * (width // self.geometry.wan_stride) * wan["temporal_context_frames"],
-            kv_cache_scheme="frame_ring",
-            num_heads=wan["num_attention_heads"] // self.model.parallel.size,
+        # 精确块并行不走 frame ring:每层的 K/V 由本层 stage1 现场给出,不需要跨 reference 的环形缓冲。
+        self.wan_cache = (
+            self.wan_cache_manager.create_self_attn_kv_cache(
+                "wan",
+                (height // self.geometry.wan_stride) * (width // self.geometry.wan_stride) * wan["temporal_context_frames"],
+                kv_cache_scheme="frame_ring",
+                num_heads=wan["num_attention_heads"] // self.model.parallel.size,
+            )
+            if with_wan_cache
+            else None
         )
         self.flash_model_cache_manager = KVCacheManager({"num_layers": 10, "num_heads": 2, "dim": 128}, device=self.device)
         flash_model_heads = 2 if self.model.flash_model_transformer.query_parallel else 2 // self.model.parallel.size
@@ -175,14 +231,8 @@ class RelayVSRRunner(DefaultRunner):
         latent = self.scheduler.latents[:, :, 0].to(GET_DTYPE())
         return self.model.flash_model_prepare_condition(latent)
 
-    def restore_frames(self, source, seed, priming=None):
-        """Yield cropped native predictions; overlapping endpoints are emitted once.
-
-        ``priming=(上一窗口末帧, 本块窗口序号)`` 供块级并行:``reference()`` 的结果依赖
-        ``reference_count``(RoPE 位置与时间可见窗口都按帧序号算),把序号和预热帧一起对齐,
-        分块就能复现**串行**的 relay 状态(成片与单卡逐位相同,而不是近似)。
-        此时首窗口前面还有一块,只发 ``clip_len-1`` 帧。
-        """
+    def restore_frames(self, source, seed):
+        """Yield cropped native predictions; overlapping endpoints are emitted once."""
         iterator = iter(source)
         first = next(iterator, None)
         if first is None:
@@ -192,21 +242,8 @@ class RelayVSRRunner(DefaultRunner):
         try:
             padded_height, padded_width = self.geometry.padded_size(height, width)
             self.init_run(padded_height, padded_width, seed)
-            if priming is None:
-                start_condition = self.reference(first)
-                first_window = True
-                start = first
-            else:
-                prime_frame, prime_index = priming
-                # 每调一次 reference() 就从 scheduler 的 generator 抽一次噪声,串行时第 k 次
-                # reference 用的是第 k 个噪声。块从中途开始,必须先把噪声流快进到同一位置,
-                # 否则同一帧在两个块里拿到的噪声不同 —— 这是逐位一致的最后一道差。
-                for _ in range(prime_index):
-                    self.scheduler.prepare_latents(padded_height, padded_width, self.device)
-                self.reference_count = prime_index
-                start_condition = self.reference(prime_frame)
-                first_window = False
-                start = prime_frame
+            start, start_condition = first, self.reference(first)
+            first_window = True
             while True:
                 window = [start, *islice(iterator, self.config.get("clip_len", 16) - 1)]
                 if any(frame.shape != shape for frame in window):
@@ -230,7 +267,7 @@ class RelayVSRRunner(DefaultRunner):
         finally:
             self.end_run()
 
-    # ---- 块级数据并行(chunk_p_size>1):每卡算一段连续帧,段首用 1 个 window 预热 ----
+    # ---- 精确块并行(chunk_p_size>1):reference 逐层同步,窗口独立解码 ----
 
     def _video_frame_count(self, source):
         with av.open(str(source)) as container:
@@ -239,128 +276,163 @@ class RelayVSRRunner(DefaultRunner):
                 return int(stream.frames)
             return sum(1 for _ in container.decode(video=0))
 
-    def _chunk_windows(self, total, clip_len):
-        """按**串行窗口网格**分配窗口:块边界必须落在窗口边界上,否则帧序号对不齐。"""
-        step = max(1, clip_len - 1)
-        windows = max(1, -(-(total - clip_len) // step) + 1) if total > clip_len else 1
-        per = -(-windows // self.chunk_p_size)
-        return [(min(rank * per, windows), min(windows, (rank + 1) * per), step, windows) for rank in range(self.chunk_p_size)]
+    def _decode_reference_frames(self, source, plan, refs):
+        """One scan up to this rank's last keyframe; only the keyframes are converted."""
+        wanted = {plan.ref_frame(ref): ref for ref in refs}
+        if not wanted:
+            return {}
+        limit = max(wanted)
+        frames = {}
+        with av.open(str(source)) as container:
+            container.streams.video[0].thread_type = "AUTO"
+            for index, frame in enumerate(container.decode(video=0)):
+                ref = wanted.get(index)
+                if ref is not None:
+                    frames[ref] = torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1).contiguous()
+                if index >= limit:
+                    break
+        if len(frames) != len(wanted):
+            raise ValueError(f"RelayVSR decoded {len(frames)} of {len(wanted)} reference frames from {source}")
+        return frames
 
-    def _chunk_spans(self, total):
-        """把 total 帧切成 chunk_p_size 段连续的区间;最后一卡吃掉余数。"""
-        per = -(-total // self.chunk_p_size)
-        # 尾巴上的 rank 可能一段都分不到(帧数 < 卡数 * per):起点要夹到 total,
-        # 否则会出现 start > end 这种和别人重叠的非法区间。
-        return [(min(rank * per, total), min(total, (rank + 1) * per)) for rank in range(self.chunk_p_size)]
+    def _exchange_boundary_latent(self, spans, span, latents, rank):
+        """Hand this rank's first latent to the predecessor and take the successor's."""
+        successor = rank + 1
+        receives = successor < len(spans) and spans[successor].active
+        sends = rank > 0 and spans[rank - 1].active
+        if not receives and not sends:
+            return None
+        boundary = torch.empty_like(latents[0]) if receives else None
+        requests = []
+        if sends:
+            requests.append(dist.P2POp(dist.isend, latents[0], rank - 1, group=self.chunk_p_group))
+        if receives:
+            requests.append(dist.P2POp(dist.irecv, boundary, successor, group=self.chunk_p_group))
+        for handle in dist.batch_isend_irecv(requests):
+            handle.wait()
+        return boundary
 
-    def _run_video_chunks(self, input_info, source, destination, fps, target):
-        """块级数据并行跑一条视频,rank0 负责拼回一个文件。
-
-        与 SwiftVR 的 chunk_p 同一个思路:模型复制到每张卡,各卡只算自己那段连续帧。
-        RelayVSR 的窗口是按时间滑动的 relay(window k+1 的起点就是 window k 的末帧),
-        所以每个 rank 在自己起点**之前多发一个 window 的帧来预热**(输出丢弃),
-        让 relay 状态收敛到接近单卡;代价是每卡多算一个 window(~1s)。
-        """
-        rank = dist.get_rank(self.chunk_p_group) if self.chunk_p_group is not None else 0
-        # 块并行下各 rank 干的活不一样多,check_stop 的 MAX all-reduce 必须改成 rank 本地判定,
-        # 否则先跑完的 rank 会在下一次 all-reduce 上等满超时(实测 NCCL watchdog 600s abort)。
-        previous_local = getattr(self, "_rank_local_collectives", False)
-        self._rank_local_collectives = True
-        total = self._video_frame_count(source)
+    def _decode_windows(self, source, plan, span, conditions, work_dir, fps, target, height, width):
         clip_len = int(self.config.get("clip_len", 16))
-        spans = self._chunk_windows(total, clip_len)
-        w_start, w_end, step, windows = spans[rank]
-        # relay 的隐状态有两层:reference_count(RoPE/可见窗口的帧序号)和 wan 的 frame_ring KV 缓存
-        # (最近 temporal_context_frames 个 reference 帧)。要复现串行状态,就得把这两样都补齐 ——
-        # 所以本块前面先**重放 warmup_windows 个窗口**(输出丢弃),而不是只对齐一个序号。
-        context = int((self.model.wan_config or {}).get("temporal_context_frames", 1) or 1)
-        warmup_windows = min(context, w_start)
-        start = (w_start - warmup_windows) * step
-        end = total if w_end >= windows else (w_end - 1) * step + clip_len
-        first_window_index = w_start - warmup_windows
-        # 预热窗口也要丢:窗口 0 发 clip_len 帧,其余窗口发 clip_len-1(=step)帧
-        drop_frames = (clip_len if first_window_index == 0 and warmup_windows else 0) + max(0, warmup_windows - (1 if first_window_index == 0 else 0)) * step
-        logger.info(f"[RelayVSR] chunk_p rank {rank}/{self.chunk_p_size}: windows [{w_start}, {w_end}) of {windows}, "
-                    f"frames [{start}, {end}) of {total}, warmup {warmup_windows} window(s)/{drop_frames} frames")
-
-        directories = [None]
-        if rank == 0:
-            directories = [tempfile.mkdtemp(prefix="relayvsr-chunks-", dir=destination.parent)]
-        dist.broadcast_object_list(directories, src=0, group=self.chunk_p_group)
-        work_dir = Path(directories[0])
-
-        writer = None
+        writer = AsyncVideoWriter(str(work_dir / f"{span.rank:03d}.mp4"), fps, self.config)
         written = 0
         try:
-            part_path = work_dir / f"{rank:03d}.mp4"
-            if w_end > w_start:
-                writer = AsyncVideoWriter(str(part_path), fps, self.config)
             with av.open(str(source)) as container:
-                stream = container.streams.video[0]
-                stream.thread_type = "AUTO"
+                container.streams.video[0].thread_type = "AUTO"
                 with closing(prefetch_frames(container, clip_len)) as frames:
-                    priming = None
-                    if first_window_index > 0:
-                        # 块首落在窗口中间:先读上一个窗口的末帧当 priming,再从 start 开始
-                        frames = islice(frames, max(0, start - 1), None)
-                        prev_end = list(islice(frames, 1))
-                        if not prev_end:
-                            raise ValueError("RelayVSR chunk priming frame missing")
-                        priming = (prev_end[0], first_window_index)
-                    else:
-                        frames = islice(frames, start, None)
-                    if priming is None and first_window_index > 0:
-                        raise AssertionError("unreachable")
-                    window = islice(frames, 0, end - start)
-                    with closing(self.restore_frames(window, input_info.seed, priming=priming)) as predictions:
-                        for index, prediction in enumerate(predictions):
+                    stream = islice(frames, span.decode.start, None)
+                    window_frames = []
+                    for position, window in enumerate(span.windows):
+                        length = len(plan.window_frames(window))
+                        window_frames = window_frames[-1:] if position else []
+                        while len(window_frames) < length:
+                            frame = next(stream, None)
+                            if frame is None:
+                                raise ValueError(f"RelayVSR source {source} ended before frame {span.decode.stop}")
+                            window_frames.append(frame)
+                        self.check_stop()
+                        start_condition = conditions[window]
+                        end_condition = conditions[window + 1] if length > 1 else start_condition
+                        pair = [(torch.cat((a[0], b[0]), 0), torch.cat((a[1], b[1]), 0)) for a, b in zip(start_condition, end_condition)]
+                        self.flash_model_history.reset()
+                        for offset, frame in enumerate(window_frames):
                             self.check_stop()
-                            if index < drop_frames:
-                                continue  # 预热窗口的输出丢弃:它们属于前面的 rank
-                            if writer is not None:
-                                writer.submit(self.postprocess(prediction, target))
-                            written += 1
-                            if written % 30 == 0:
-                                logger.info(f"[RelayVSR] chunk_p rank {rank}: {written} frames queued")
-            if writer is not None:
-                writer.close()
-                writer = None
+                            output = self.model.flash_model_decode(self.preprocess(frame), pair, self.flash_model_history, offset)
+                            if window == 0 or offset > 0:
+                                writer.submit(self.postprocess(output[..., : height * self.geometry.scale, : width * self.geometry.scale], target))
+                                written += 1
+                    if span.decode.stop >= plan.total and next(stream, None) is not None:
+                        raise ValueError(f"RelayVSR source {source} has more frames than the counted {plan.total}")
+        finally:
+            writer.close()
+        return written
+
+    def _run_video_exact(self, source, destination, fps, target, seed):
+        """精确块并行跑一条视频:各 rank 一段连续窗口,reference 按层同步,rank0 拼回一个文件。
+
+        与旧的"段首预热"不同,这里不接受任何近似:reference 的每一层都在全体 rank 上前进,
+        段尾 ``context - 1`` 个 reference 的 K/V 点对点交给下一段,注意力读到的窗口与串行逐位相同。
+        """
+        rank = dist.get_rank(self.chunk_p_group)
+        world = dist.get_world_size(self.chunk_p_group)
+        totals = [self._video_frame_count(source) if rank == 0 else None]
+        dist.broadcast_object_list(totals, src=0, group=self.chunk_p_group)
+        plan = build_plan(int(totals[0]), int(self.config.get("clip_len", 16)))
+        spans = split_ranks(plan, world)
+        span = spans[rank]
+        context = int((self.model.wan_config or {}).get("temporal_context_frames", 1) or 1)
+        exchange = NcclKVExchange(kv_transfer_plan(spans, context), rank, self.chunk_p_group)
+        directories = [tempfile.mkdtemp(prefix="relayvsr-exact-", dir=destination.parent) if rank == 0 else None]
+        dist.broadcast_object_list(directories, src=0, group=self.chunk_p_group)
+        work_dir = Path(directories[0])
+        logger.info(f"[RelayVSR] exact rank {rank}/{world}: windows [{span.windows.start}, {span.windows.stop}) of {plan.windows}, refs [{span.refs.start}, {span.refs.stop}), frames [{span.decode.start}, {span.decode.stop}) of {plan.total}")
+
+        previous_local = getattr(self, "_rank_local_collectives", False)
+        written = 0
+        try:
+            batches = [(rank, 0, [], [])]
+            frame_shape = None
+            if span.active:
+                frames = self._decode_reference_frames(source, plan, span.refs)
+                frame_shape = frames[span.refs.start].shape[-2:]
+                padded = self.geometry.padded_size(*frame_shape)
+                self.init_run(*padded, seed, with_wan_cache=False)
+                # 串行语义:每个 reference 从同一个 generator 依次抽一次噪声,所以块内也要从 0 抽起。
+                self.scheduler.prepare(seed, self.device)
+                noises = []
+                for ref in range(span.refs.stop):
+                    self.scheduler.prepare_latents(*padded, self.device)
+                    if ref >= span.refs.start:
+                        noises.append(self.scheduler.latents.clone())
+                batches = [(rank, span.refs.start, noises, [self.preprocess(frames[ref]) for ref in span.refs])]
+                frames = noises = None
+            # Phase A 是全员逐层同步的(空闲 rank 也跑满层数),所以停止检查在阶段内可以是全局的。
+            self._rank_local_collectives = False
+            latents = self.model.infer_references(batches, exchange, context, before_layer=self.check_stop)[0]
+
+            if span.active:
+                conditions = {ref: self.model.flash_model_prepare_condition(latent) for ref, latent in zip(span.refs, latents)}
+                boundary = self._exchange_boundary_latent(spans, span, latents, rank)
+                if boundary is not None:
+                    conditions[span.refs.stop] = self.model.flash_model_prepare_condition(boundary)
+                self._rank_local_collectives = True
+                written = self._decode_windows(source, plan, span, conditions, work_dir, fps, target, *frame_shape)
         finally:
             self._rank_local_collectives = previous_local
-            if writer is not None:
-                try:
-                    writer.close()
-                except (RuntimeError, ValueError, OSError):
-                    logger.exception("RelayVSR chunk encoder cleanup failed")
-
+            if span.active:
+                self.end_run()
+        logger.info(f"[RelayVSR] exact rank {rank}: {written} frames written")
         self._chunk_barrier()
-        assemble_start = time.perf_counter()
         if rank == 0:
-            manifest = work_dir / "chunks.txt"
-            with open(manifest, "w") as handle:
-                handle.write("ffconcat version 1.0\n")
-                for index, (first_window, last_window, _step, _windows) in enumerate(spans):
-                    if last_window > first_window:
-                        handle.write(f"file '{index:03d}.mp4'\n")
-            result = mux_audio_from_video(
-                str(source),
-                str(manifest),
-                output_path=str(destination),
-                prefer_copy=self.config.get("audio_mux_prefer_copy", True),
-                trim_to_shortest=False,
-            )
-            if result is None:
-                raise RuntimeError("RelayVSR failed to assemble the chunked output video")
-            logger.info(f"[RelayVSR] chunk_p assembled {written} own frames (total {total}) in {time.perf_counter() - assemble_start:.1f}s -> {destination}")
-            shutil.rmtree(work_dir, ignore_errors=True)
+            self._assemble_chunks(work_dir, spans, destination, source, plan.total)
         self._chunk_barrier()
         return {"video": None}
+
+    def _assemble_chunks(self, work_dir, spans, destination, source, total):
+        manifest = work_dir / "chunks.txt"
+        with open(manifest, "w") as handle:
+            handle.write("ffconcat version 1.0\n")
+            for span in spans:
+                if span.active:
+                    handle.write(f"file '{span.rank:03d}.mp4'\n")
+        started = time.perf_counter()
+        result = mux_audio_from_video(
+            str(source),
+            str(manifest),
+            output_path=str(destination),
+            prefer_copy=self.config.get("audio_mux_prefer_copy", True),
+            trim_to_shortest=False,
+        )
+        if result is None:
+            raise RuntimeError("RelayVSR failed to assemble the chunked output video")
+        logger.info(f"[RelayVSR] exact assembled {total} frames in {time.perf_counter() - started:.1f}s -> {destination}")
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     def _chunk_barrier(self):
         if self.chunk_p_group is not None:
             dist.barrier(group=self.chunk_p_group)
 
-    @torch.no_grad()
+
     @ProfilingContext4DebugL1("🚀 RUN pipeline")
     def run_pipeline(self, input_info):
         if bool(input_info.image_path) == bool(input_info.video_path):
@@ -412,8 +484,8 @@ class RelayVSRRunner(DefaultRunner):
                     raise ValueError("YUV420 video output requires even height and width")
                 input_info.output_fps = float(fps)
                 if self.chunk_p_size > 1:
-                    # 块级数据并行:所有 rank 都参与,由 rank0 拼回一个文件。
-                    return self._run_video_chunks(input_info, source, destination, fps, target)
+                    # 精确块并行:所有 rank 都参与,由 rank0 拼回一个文件。
+                    return self._run_video_exact(source, destination, fps, target, input_info.seed)
                 if self.main_rank:
                     writer = AsyncVideoWriter(temporary, fps, self.config)
                 with closing(prefetch_frames(container, self.config.get("clip_len", 16))) as frames, closing(self.restore_frames(frames, input_info.seed)) as predictions:

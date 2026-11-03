@@ -13,6 +13,22 @@ class RelayCompileMixin:
             # graphs. Retain them after warmup instead of falling back to eager.
             torch._dynamo.config.recompile_limit = max(torch._dynamo.config.recompile_limit, 32)
         super().init_compile(config)
+        # Exact chunk parallelism compiles the K/V staging half apart from the full block.
+        self.compiled_stage1 = {}
+
+    def get_compiled_stage1(self, block_idx, block):
+        cached = self.compiled_stage1.get(block_idx)
+        if cached is not None and cached[0] is block:
+            return cached[1]
+
+        runner = partial(self.project_qkv, block.compute_phases[0])
+        if self.compile_backend == "default":
+            options = {"options": self.compile_options} if self.compile_options else {}
+            compiled = torch.compile(runner, dynamic=None, **options)
+        else:
+            compiled = torch.compile(runner, dynamic=None, backend=self._compile_backend_obj)
+        self.compiled_stage1[block_idx] = (block, compiled)
+        return compiled
 
     def get_compiled_block(self, block_idx, block):
         key = self.get_compile_block_key(block_idx, block)
