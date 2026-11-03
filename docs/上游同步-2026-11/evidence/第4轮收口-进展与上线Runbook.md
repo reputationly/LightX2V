@@ -39,3 +39,37 @@ PUT /v2/inference-backends/3  (版本改名 1103.1.0.1-custom,保留 1.0.0) → 
    只在 1、2 都不通时作为最后手段。
 
 **另需**:canary 的"真实网关链路"验证需要 new-api 的地址与 API key(本地没有),需要你提供或由你执行那一步。
+
+## 上线进展(2026-11-03 15:05):canary 已部署并验证 —— 用**模型级 image_name** 绕开 built-in backend 限制
+
+发现 `ModelCreate/ModelUpdate` 支持 `image_name` 字段,模型可以自己钉镜像,不必改 backend 版本表。
+这比之前提的三条路线都干净(不加 backend 实体、不动浮动 tag):
+
+```
+POST /v2/models
+{"name":"seedvr2-canary","backend":"LightX2V","backend_version":"1.0.0",
+ "image_name":".../lightx2v:arm64-a100-20261103-0647-e48faec8",
+ "replicas":1,"backend_parameters":["--model-cls seedvr2"],
+ "local_path":"/nfs-models/wuhanjisuan894/models/ByteDance-Seed/SeedVR2-3B",
+ "gpu_selector":{"gpu_ids":[4 张空闲卡],"gpus_per_replica":4},"cluster_id":1, ...}
+```
+
+| 验证项 | 结果 |
+|---|---|
+| 创建 | `seedvr2-canary` 1 副本,`ready_replicas=1/1`,`image_name` 已钉成不可变 tag |
+| 实跑镜像 | worker 上容器 `seedvr2-canary-n78b3-run-0` 镜像 **`d611187bd472`** = 新镜像 digest(`docker inspect` 核对) |
+| 生产形态请求 | 走 launcher 门面(`/v1/tasks/video/`,payload 带 `model/task_type/user_id/size:"1920x1080"/sr_ratio:4.0/target_short_edge/seed/negative_prompt/infer_steps`)→ **completed**,产物 **1904×1104 / 124 帧** |
+| 兼容层行为 | 日志 `dropping request fields it does not support: negative_prompt, target_short_edge`(WARNING,非 4xx) |
+
+**仍缺的一步**:new-api → GPUStack 门面这一跳(拿不到 new-api 地址/API key)。canary 目前仍在
+`dev-gpustack-a100-0004` 上跑着(4 卡),供那次真网关验证使用。
+
+**滚动上线的执行命令**(第 4 步剩余部分,待 new-api 验证通过后执行):
+
+```bash
+# 1) 把生产模型钉到同一个镜像(不影响正在跑的副本,只有被重建的副本才会用新镜像)
+PUT /v2/models/38  {...,"image_name":".../lightx2v:arm64-a100-20261103-0647-e48faec8"}
+# 2) 逐副本滚动:replicas 3→4(或按 GPUStack 的实例逐个删除,让它重建),每步核对
+docker inspect <seedvr2-*-run-0> --format '{{.Image}}'   # 期望 d611187bd472
+# 3) 回滚:PUT /v2/models/38 {...,"image_name":null}  ← 回到 built-in 的浮动 tag
+```
