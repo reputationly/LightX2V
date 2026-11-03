@@ -89,3 +89,28 @@ docker inspect <seedvr2-*-run-0> --format '{{.Image}}'   # 期望 d611187bd472
   (GPUStack 只在副本重建时换镜像)。所以回滚的实际操作是:把 `image_name` 置 null → 逐个副本重建
   (缩容/扩容或删掉实例让它重建)→ 用 `docker inspect` 核对应回到 `cdd5271f`(现网旧镜像)。
 - 注意:`PUT /v2/models/{id}` 必须带完整 body(含 `source`/`cluster_id`/`gpu_selector`),否则 422。
+
+## 切换的两个方向都在 canary 上跑通了(2026-11-03 15:36)
+
+| 动作 | 观察 |
+|---|---|
+| `image_name` = 新 tag + 副本重建 | 容器镜像 **`d611187bd472`**(新) |
+| `image_name` = null + 副本重建 | 容器镜像 **`cdd5271fe686`**(浮动 tag 的现网旧 digest)→ **回滚方向成立** |
+| 再钉回新 tag + 副本重建 | 容器镜像又回到 **`d611187bd472`**,`/ready` 200、model `1/1` |
+
+要点:
+- GPUStack **只在副本重建时换镜像**(PUT 改 `image_name` 不会自动重建),所以滚动上线要配合缩容/扩容或删实例。
+- 副本重建后 launcher 端口会变(本次 40038 → 40033),核对就绪要用新实例的端口。
+- `PUT /v2/models/{id}` 必须带完整 body(`source`/`cluster_id`/`gpu_selector` 等),否则 422。
+- canary 当前状态:模型 63,`image_name` 钉在新 tag,`1/1` ready,launcher 端口 40033,占 dev-0004 四卡。
+
+## 生产滚动(唯一未执行项,等放行)
+
+```bash
+T=<gpustack token>; NEW=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-20261103-0647-e48faec8
+# 1) 取模型 38 完整 body,把 image_name 换成 $NEW,PUT 回去(此时不影响在跑的副本)
+# 2) 缩容 3 → 扩容 4(或删一个实例让它重建),每次起来后核对:
+docker inspect <seedvr2-*-run-0> --format '{{.Image}}'   # 期望 d611187bd472
+# 3) 四个副本都换成新镜像后,跑一条真实网关请求确认
+# 4) 回滚:body 里 image_name=null + 同样重建步骤,核对回到 cdd5271f
+```
