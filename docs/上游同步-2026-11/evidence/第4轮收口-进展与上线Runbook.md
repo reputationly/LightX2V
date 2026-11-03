@@ -73,3 +73,19 @@ PUT /v2/models/38  {...,"image_name":".../lightx2v:arm64-a100-20261103-0647-e48f
 docker inspect <seedvr2-*-run-0> --format '{{.Image}}'   # 期望 d611187bd472
 # 3) 回滚:PUT /v2/models/38 {...,"image_name":null}  ← 回到 built-in 的浮动 tag
 ```
+
+## canary 复核(2026-11-03 15:20):两种现网形态 payload 都通过
+
+| payload 形态 | 结果 | 兼容层日志 |
+|---|---|---|
+| 现代形态(`size:"1920x1080"` + `target_short_edge` + `negative_prompt` + `infer_steps` + `model`/`task_type`/`user_id`) | completed,**1904×1104 / 124 帧** | `dropping request fields it does not support: negative_prompt, target_short_edge`;`dropping request fields unknown to this service: model, task_type, user_id` |
+| 旧形态(`target_shape:"1920x1080"` 字符串 + `target_video_length` + `num_frames`) | completed,**1904×1104 / 124 帧** | 同上(字符串 size 被忽略、旧键被重命名/丢弃,均 WARNING 非 4xx) |
+
+## 切换机制的两个方向(在 canary 上验证)
+
+- **钉住**(生产要用的方向):`PUT /v2/models/63 {"image_name":"<不可变 tag>", ...}` →
+  模型 `image_name` 生效,重建出来的容器镜像 ID = `d611187bd472`(新镜像)✓
+- **回滚**(`image_name: null` → 回到 built-in 的浮动 tag):PUT 会把字段改成 null ✓,但**正在跑的容器不会自己重建**
+  (GPUStack 只在副本重建时换镜像)。所以回滚的实际操作是:把 `image_name` 置 null → 逐个副本重建
+  (缩容/扩容或删掉实例让它重建)→ 用 `docker inspect` 核对应回到 `cdd5271f`(现网旧镜像)。
+- 注意:`PUT /v2/models/{id}` 必须带完整 body(含 `source`/`cluster_id`/`gpu_selector`),否则 422。
