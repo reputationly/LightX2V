@@ -889,6 +889,44 @@ class SeedVRRunner(DefaultRunner):
                 logger.warning(f"[SeedVRRunner] could not send the abort marker for segment {idx}: {e}")
                 return
 
+    def _sr_drain_inbound_edges(self, my_indices, edge_recv, seg_world):
+        """把「别人还要发给本 rank」的边界帧收掉并丢弃。
+
+        协议必须**对称**:提前离开段循环的 rank 只发自己欠的 abort 是不够的 —— 上游段
+        (以及级联过来的 abort)仍然会往它这里发。一个 rank 拥有 ≥2 段时(4 卡下段数 ≥5)
+        就会留下没人收的 isend:要么发送方在 ``_sr_drain_tail_sends()`` 里等满 15 分钟,
+        要么这条消息躺进通道被**下一个请求**的同一对 src/dst 收走,把下一个请求误判成
+        abort 或写坏成片。
+
+        顺序与发送侧对称:调用方先发完所有出边 abort,再进这里按 idx 递增逐条收;
+        内容是 abort 还是真实 tail 都无所谓,一律丢弃。
+        """
+        if seg_world <= 1:
+            return
+        if not getattr(self, "_sr_tail_dir", None) and getattr(self, "_sr_tail_pg", None) is None:
+            return
+        for idx in my_indices:
+            if idx == 0 or idx in edge_recv:
+                continue
+            try:
+                dropped = self._sr_recv_tail(self._sr_segment_owner(idx - 1, seg_world), idx - 1)
+                edge_recv.add(idx)
+                if dropped is _SR_ABORT:
+                    kind = "abort"
+                elif dropped is None:
+                    kind = "empty tail"
+                else:
+                    kind = f"{getattr(dropped, 'shape', ('?', '?', '?', '?', '?'))[2]} boundary frame(s)"
+                logger.info(f"[SeedVRRunner] unwinding: discarded the {kind} for inbound edge {idx - 1}->{idx}")
+            except Exception as e:  # 传输层塌了也不能盖住真正的异常
+                logger.warning(f"[SeedVRRunner] could not drain the inbound edge {idx - 1}->{idx}: {e}")
+                return
+
+    def _sr_unwind_segment_loop(self, my_indices, edge_sent, edge_recv, seg_world, num_segments):
+        """提前离开段循环的唯一出口:先发欠的出边 abort,再收欠的入边,最后才汇合。"""
+        self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, num_segments)
+        self._sr_drain_inbound_edges(my_indices, edge_recv, seg_world)
+
     def _sr_run_on_rank0(self, fn):
         """Run ``fn`` on rank 0 only, with everyone meeting afterwards.
 
@@ -1544,6 +1582,7 @@ class SeedVRRunner(DefaultRunner):
         # 定义在 try 之前:异常可能发生在临时目录那次 rendezvous 之前,而处理器要用到它们。
         my_indices = [i for i in range(len(segments)) if seg_world <= 1 or self._sr_segment_owner(i, seg_world) == seg_rank]
         edge_sent = set()
+        edge_recv = set()
         # 上游的流式落盘(直接喂 ffmpeg)与段并行互斥:各 rank 的段是乱序完成的,
         # 没法按播放顺序往管道里灌。段并行不在时才启用,行为与上游一致。
         stream_file_output = stream_file_output and seg_world == 1
@@ -1633,10 +1672,11 @@ class SeedVRRunner(DefaultRunner):
                         # meet: the previous segment's owner was computing in
                         # lockstep and hands off the moment it finishes.
                         pending_tail = self._sr_recv_tail(self._sr_segment_owner(idx - 1, seg_world), idx - 1)
+                        edge_recv.add(idx)
                         if pending_tail is _SR_ABORT:
                             aborted = True
                             logger.warning(f"[SeedVRRunner] rank {seg_rank}: segment {idx} got an abort marker from segment {idx - 1}; propagating to the edges this rank still owes")
-                            self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
+                            self._sr_unwind_segment_loop(my_indices, edge_sent, edge_recv, seg_world, len(segments))
                             break
                     if raw is not None:
                         if pending_tail is not None:
@@ -1749,16 +1789,16 @@ class SeedVRRunner(DefaultRunner):
             # Cancelled, not broken: the peers must learn of it, but this rank
             # did not leave a hole behind.
             if seg_world > 1:
-                # 先把还欠着的边界帧标成 abort:否则对端会一直等这条 tail(15 分钟),
-                # 段并行的上游段也跟着等,一个取消就变成整机挂住。
-                self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
+                # 先发完欠下游的 abort,再把自己欠的入边收干净 —— 少了后半步,拥有 ≥2 段的
+                # rank 会留下没人收的 isend(等满超时,或被下一个请求收走)。
+                self._sr_unwind_segment_loop(my_indices, edge_sent, edge_recv, seg_world, len(segments))
             if seg_world > 1 and not agreed:
                 agreed = True
                 self._sr_seg_rendezvous(failed=False)
             raise
         except Exception:
             if seg_world > 1:
-                self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, len(segments))
+                self._sr_unwind_segment_loop(my_indices, edge_sent, edge_recv, seg_world, len(segments))
             if seg_world > 1 and not agreed:
                 # The peers are waiting on a rendezvous only this rank can
                 # complete. Report the failure rather than let them sit out the
