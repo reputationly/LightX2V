@@ -138,7 +138,7 @@ class RelayVSRRunner(DefaultRunner):
         exchange is exercised and the ``visible = 1...context`` attention variants are built.
         """
         started = time.perf_counter()
-        fps = float(self.config.get("fps") or 24)
+        fps = Fraction(float(self.config.get("fps") or 24)).limit_denominator(1001)
         frames = 2 * int(self.model.wan_config["temporal_context_frames"]) * (self.config.get("clip_len", 16) - 1) + 1
         for height, width in self.warmup_resolutions():
             logger.info("RelayVSR warmup: {}x{}, {} frames exact chunk", height, width, frames)
@@ -155,8 +155,7 @@ class RelayVSRRunner(DefaultRunner):
         self._maybe_freeze_gc()
 
     @staticmethod
-    def _write_synthetic_video(path, height, width, frames, fps):
-        rate = Fraction(fps).limit_denominator(1001)
+    def _write_synthetic_video(path, height, width, frames, rate):
         pixels = np.zeros((height, width, 3), dtype=np.uint8)
         with av.open(str(path), mode="w") as container:
             stream = container.add_stream("libx264", rate=rate)

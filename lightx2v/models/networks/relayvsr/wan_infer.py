@@ -245,7 +245,9 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
             "precomputed": (query, torch.cat(keys, 0), torch.cat(values, 0)),
         }
         if self.use_compile:
-            mark_sequence_dynamic(pre.x, self_attn_kwargs["precomputed"][1], self_attn_kwargs["precomputed"][2])
+            # Same set of dynamic sequence axes as the serial ring path: the staged K/V plays
+            # the role of the ring cache, so tokens, visible*tokens and the RoPE tables move together.
+            mark_sequence_dynamic(pre.x, self_attn_kwargs["precomputed"][1], self_attn_kwargs["precomputed"][2], *self_attn_kwargs["q_rope"], *self_attn_kwargs["k_rope"])
             output = self.get_compiled_block(block_idx, block)(pre.x, replace(pre, context=self.cross_cache[block_idx]), self_attn_kwargs)
         else:
             output = self.infer_block(block, pre.x, replace(pre, context=self.cross_cache[block_idx]), self_attn_kwargs)
