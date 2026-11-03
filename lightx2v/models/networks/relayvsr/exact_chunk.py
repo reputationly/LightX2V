@@ -158,17 +158,23 @@ class LocalKVExchange:
     """Single-process stand-in for the NCCL exchange (parity tests, one rank per process absent)."""
 
     def __init__(self, transfers: list[KVTransfer]):
-        self.store: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+        self.store: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self.layer: int | None = None
         self.requests: dict[int, list[int]] = {}
         for transfer in transfers:
             self.requests.setdefault(transfer.dst, []).extend(transfer.refs)
 
     def post(self, layer, rank, own):
+        # Every post for one layer happens before any collect, so the previous layer's
+        # staged K/V can go as soon as the next layer starts (they are tens of MB each).
+        if self.layer != layer:
+            self.store.clear()
+            self.layer = layer
         for ref, kv in own.items():
-            self.store[(layer, ref)] = kv
+            self.store[ref] = kv
 
     def collect(self, layer, rank):
-        return {ref: self.store[(layer, ref)] for ref in self.requests.get(rank, ())}
+        return {ref: self.store[ref] for ref in self.requests.get(rank, ())}
 
 
 class NcclKVExchange:

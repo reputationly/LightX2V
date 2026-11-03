@@ -11,6 +11,7 @@ compilation on the two paths fuse differently and the comparison is informationa
 """
 
 import argparse
+import hashlib
 import sys
 
 import av
@@ -22,6 +23,14 @@ from lightx2v.models.runners.runner_factory import build_runner
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.set_config import build_cli_inputs, init_parallel
 from lightx2v.utils.utils import validate_config_paths
+
+
+def digest(tensor):
+    """Stable per-frame fingerprint; keeps long comparisons off the GPU and out of host RAM."""
+    tensor = tensor.detach().cpu().contiguous()
+    if tensor.dtype == torch.bfloat16:
+        tensor = tensor.view(torch.int16)
+    return hashlib.sha256(tensor.numpy().tobytes()).hexdigest()
 
 
 def read_frames(path, limit):
@@ -47,9 +56,10 @@ def serial_chain(runner, frames, seed):
 
     runner.reference = reference
     try:
-        outputs = list(runner.restore_frames(iter(frames), seed))
+        outputs = [digest(output) for output in runner.restore_frames(iter(frames), seed)]
     finally:
         runner.reference = original
+    torch.cuda.empty_cache()
     return recorded, outputs
 
 
@@ -59,6 +69,7 @@ def exact_chain(runner, frames, seed, plan, world, context):
     padded = runner.geometry.padded_size(*frames[0].shape[-2:])
     height, width = frames[0].shape[-2:]
 
+    print(f"[parity]   exact world={world}: allocated before phase A {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
     runner.init_run(*padded, seed, with_wan_cache=False)
     batches = []
     for span in spans:
@@ -74,6 +85,7 @@ def exact_chain(runner, frames, seed, plan, world, context):
     for (rank, first_ref, _, _), produced in zip(batches, runner.model.infer_references(batches, exchange, context)):
         for offset, latent in enumerate(produced):
             latents[first_ref + offset] = latent
+    print(f"[parity]   exact world={world}: allocated after phase A {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
     runner.end_run()
 
     runner.init_run(*padded, seed, with_wan_cache=False)
@@ -88,8 +100,9 @@ def exact_chain(runner, frames, seed, plan, world, context):
             for offset, frame in enumerate(window_frames):
                 output = runner.model.flash_model_decode(runner.preprocess(frame), pair, runner.flash_model_history, offset)
                 if window == 0 or offset > 0:
-                    outputs.append(output[..., : height * runner.geometry.scale, : width * runner.geometry.scale])
+                    outputs.append(digest(output[..., : height * runner.geometry.scale, : width * runner.geometry.scale]))
     runner.end_run()
+    torch.cuda.empty_cache()
     return latents, outputs
 
 
@@ -114,6 +127,7 @@ def main():
     print(f"[parity] frames={plan.total} clip_len={plan.clip_len} windows={plan.windows} refs={plan.refs} context={context} seed={seed}", flush=True)
 
     reference_latents, serial_outputs = serial_chain(runner, frames, seed)
+    print(f"[parity] serial allocated {torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
     print(f"[parity] serial: {len(reference_latents)} refs, {len(serial_outputs)} frames", flush=True)
 
     failures = 0
@@ -121,7 +135,7 @@ def main():
         latents, outputs = exact_chain(runner, frames, seed, plan, world, context)
         latent_mismatch = [ref for ref in range(plan.refs) if not torch.equal(latents[ref], reference_latents[ref])]
         count = min(len(outputs), len(serial_outputs))
-        frame_mismatch = [index for index in range(count) if not torch.equal(outputs[index], serial_outputs[index])]
+        frame_mismatch = [index for index in range(count) if outputs[index] != serial_outputs[index]]
         same_frames = len(outputs) == len(serial_outputs)
         status = "PASS" if not latent_mismatch and not frame_mismatch and same_frames else "FAIL"
         print(
