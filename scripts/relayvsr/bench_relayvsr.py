@@ -28,6 +28,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--stop-after", type=float, default=None, help="raise stop_signal on rank 0 only, N seconds into the first request (production holds the stop flag on rank 0)")
+    parser.add_argument("--fail-assemble", action="store_true", help="make rank 0 fail while assembling the chunks, to check the four ranks still converge")
     parser.add_argument("--fail-at-layer", type=int, default=None, help="inject an exception on rank 2 at this transformer layer, then hold the process so the other ranks hit the NCCL timeout")
     parser.add_argument("--hold", type=float, default=900.0, help="how long the injected-failure rank stays alive so the peers' NCCL timeout can fire")
     mine, rest = parser.parse_known_args()
@@ -53,6 +54,18 @@ def main():
         runner.model.wan_transformer.stage_reference = injecting_stage_reference
     input_info = runner.prepare_request(request_data)
     runner.warmup()
+    if mine.fail_assemble:
+        assemble_chunks = runner._assemble_chunks
+
+        failed_once = {"done": False}
+
+        def failing_assemble_chunks(*args, **kwargs):
+            if rank == 0 and not failed_once["done"]:
+                failed_once["done"] = True
+                raise RuntimeError("injected assembly failure")
+            return assemble_chunks(*args, **kwargs)
+
+        runner._assemble_chunks = failing_assemble_chunks
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
@@ -68,8 +81,8 @@ def main():
             runner.run_request(input_info)
         except Exception as error:  # noqa: BLE001 - the cancellation test wants the type name
             # 每个 rank 都打印:取消时四个 rank 都必须抛 TaskStopped(worker 会把 RuntimeError 记成推理失败)。
-            print(f"[bench] rank {rank} run {attempt + 1}: raised after {time.perf_counter() - started:.2f}s: {type(error).__name__}", flush=True)
-            if mine.stop_after is None:
+            print(f"[bench] rank {rank} run {attempt + 1}: raised after {time.perf_counter() - started:.2f}s: {type(error).__name__}: {error}", flush=True)
+            if mine.stop_after is None and not mine.fail_assemble:
                 raise
             runner.stop_signal = False
             timings.append(float("nan"))
