@@ -416,7 +416,9 @@ class RelayVSRRunner(DefaultRunner):
             self._run_exact_body(source, destination, plan, spans, span, rank, world, seed, exchange, context, work_dir, fps, target, timer)
         except BaseException:
             # Phase A 里的 TaskStopped 由 check_stop 直接抛出,会穿过内层 finally,这里统一清临时目录。
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # 只在 rank0 清:四个 rank 同时 rmtree 会互相踩,ignore_errors 下会留下残余。
+            if rank == 0:
+                shutil.rmtree(work_dir, ignore_errors=True)
             raise
         finally:
             self._rank_local_collectives = previous_local
@@ -438,7 +440,6 @@ class RelayVSRRunner(DefaultRunner):
             # 谁都不许带着坏状态进入逐层 P2P:准备失败在这里全员一起抛。
             failure = self._converge(failure)
             if failure is not None:
-                shutil.rmtree(work_dir, ignore_errors=True)
                 raise failure
 
             # Phase A 是全员逐层同步的(空闲 rank 也跑满层数),所以停止检查在阶段内可以是全局的。
@@ -482,13 +483,22 @@ class RelayVSRRunner(DefaultRunner):
         if failure is not None:
             shutil.rmtree(work_dir, ignore_errors=True)
             raise failure
-        if timer is not None:
-            timer["assemble"] = -time.perf_counter()
         if rank == 0:
-            self._assemble_chunks(work_dir, spans, destination, source, plan.total)
+            # 拼接只有 rank0 做,失败时必须和出错的 rank 一起收敛,否则 rank1-3 会卡在下面这道
+            # barrier 上等满 NCCL 超时(和 B2 是同一类问题,只是发生在拼接这一步)。
+            if timer is not None:
+                timer["assemble"] = -time.perf_counter()
+            try:
+                self._assemble_chunks(work_dir, spans, destination, source, plan.total)
+            except BaseException as error:  # noqa: BLE001 - ffmpeg 出错、磁盘满、目录权限都要全员一起退
+                failure = error
+            if timer is not None:
+                timer["assemble"] = time.perf_counter() + timer["assemble"]
         self._chunk_barrier(timer)
+        failure = self._converge(failure)
+        if failure is not None:
+            raise failure
         if timer is not None:
-            timer["assemble"] = time.perf_counter() + timer["assemble"]
             timer.pop("_last", None)
             report = " ".join(f"{key}={value:.2f}" for key, value in sorted(timer.items()))
             logger.info(f"[RelayVSR][timing] rank={rank} world={world} frames={plan.total} refs={len(span.refs)} windows={len(span.windows)} {report}")
