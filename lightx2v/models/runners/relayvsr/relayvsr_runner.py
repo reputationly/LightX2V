@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import time
 from contextlib import closing
@@ -38,7 +39,12 @@ def validate_config(config):
     if config.get("cpu_offload") and config.get("offload_granularity", "block") != "block":
         raise ValueError("RelayVSR supports block weight offload only")
     parallel = config.get("parallel") or {}
-    if parallel.get("seq_p_size", 1) not in (1, 2):
+    chunk_p_size = int(parallel.get("chunk_p_size", 1))
+    if chunk_p_size > 1:
+        # 块级数据并行:每卡算自己那段连续帧,模型复制,不走 mesh。与 seq_p 互斥。
+        if int(parallel.get("seq_p_size", 1)) != 1:
+            raise ValueError("RelayVSR chunk_p_size is exclusive with seq_p_size")
+    elif parallel.get("seq_p_size", 1) not in (1, 2):
         raise ValueError("RelayVSR sequence parallelism supports 1 or 2 GPUs")
     for key, default, minimum in (("clip_len", 16, 2), ("queue_size", 16, 1), ("encoder_threads", 16, 1)):
         if config.get(key, default) < minimum:
@@ -64,10 +70,15 @@ class RelayVSRRunner(DefaultRunner):
             raise ValueError("RelayVSR local attention requires a CUDA-compatible accelerator with BF16 or FP16")
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.main_rank = not dist.is_initialized() or dist.get_rank() == 0
+        parallel = config.get("parallel") or {}
+        self.chunk_p_size = int(parallel.get("chunk_p_size", 1))
+        # 块级数据并行:模型是复制的,各 rank 直接和 WORLD 通信(与 SwiftVR 的 chunk_p 同款)。
+        self.chunk_p_group = dist.group.WORLD if self.chunk_p_size > 1 else None
         self.seq_p_group = config["device_mesh"].get_group(mesh_dim="seq_p") if config.get("seq_parallel") else None
         world_size = dist.get_world_size() if dist.is_initialized() else 1
-        if world_size != (config.get("parallel") or {}).get("seq_p_size", 1):
-            raise ValueError("RelayVSR world size must equal parallel.seq_p_size")
+        expected = self.chunk_p_size if self.chunk_p_size > 1 else (config.get("parallel") or {}).get("seq_p_size", 1)
+        if world_size != expected:
+            raise ValueError(f"RelayVSR world size must equal parallel.chunk_p_size/seq_p_size (expected {expected}, got {world_size})")
 
     def init_scheduler(self):
         self.scheduler = RelayVSRScheduler(self.config, self.geometry)
@@ -201,6 +212,107 @@ class RelayVSRRunner(DefaultRunner):
         finally:
             self.end_run()
 
+    # ---- 块级数据并行(chunk_p_size>1):每卡算一段连续帧,段首用 1 个 window 预热 ----
+
+    def _video_frame_count(self, source):
+        with av.open(str(source)) as container:
+            stream = container.streams.video[0]
+            if stream.frames:
+                return int(stream.frames)
+            return sum(1 for _ in container.decode(video=0))
+
+    def _chunk_spans(self, total):
+        """把 total 帧切成 chunk_p_size 段连续的区间;最后一卡吃掉余数。"""
+        per = -(-total // self.chunk_p_size)
+        # 尾巴上的 rank 可能一段都分不到(帧数 < 卡数 * per):起点要夹到 total,
+        # 否则会出现 start > end 这种和别人重叠的非法区间。
+        return [(min(rank * per, total), min(total, (rank + 1) * per)) for rank in range(self.chunk_p_size)]
+
+    def _run_video_chunks(self, input_info, source, destination, fps, target):
+        """块级数据并行跑一条视频,rank0 负责拼回一个文件。
+
+        与 SwiftVR 的 chunk_p 同一个思路:模型复制到每张卡,各卡只算自己那段连续帧。
+        RelayVSR 的窗口是按时间滑动的 relay(window k+1 的起点就是 window k 的末帧),
+        所以每个 rank 在自己起点**之前多发一个 window 的帧来预热**(输出丢弃),
+        让 relay 状态收敛到接近单卡;代价是每卡多算一个 window(~1s)。
+        """
+        rank = dist.get_rank(self.chunk_p_group) if self.chunk_p_group is not None else 0
+        # 块并行下各 rank 干的活不一样多,check_stop 的 MAX all-reduce 必须改成 rank 本地判定,
+        # 否则先跑完的 rank 会在下一次 all-reduce 上等满超时(实测 NCCL watchdog 600s abort)。
+        previous_local = getattr(self, "_rank_local_collectives", False)
+        self._rank_local_collectives = True
+        total = self._video_frame_count(source)
+        spans = self._chunk_spans(total)
+        start, end = spans[rank]
+        clip_len = int(self.config.get("clip_len", 16))
+        warmup = min(clip_len, start)
+        logger.info(f"[RelayVSR] chunk_p rank {rank}/{self.chunk_p_size}: frames [{start}, {end}) of {total}, warmup {warmup}")
+
+        directories = [None]
+        if rank == 0:
+            directories = [tempfile.mkdtemp(prefix="relayvsr-chunks-", dir=destination.parent)]
+        dist.broadcast_object_list(directories, src=0, group=self.chunk_p_group)
+        work_dir = Path(directories[0])
+
+        writer = None
+        written = 0
+        try:
+            part_path = work_dir / f"{rank:03d}.mp4"
+            if end > start:
+                writer = AsyncVideoWriter(str(part_path), fps, self.config)
+            with av.open(str(source)) as container:
+                stream = container.streams.video[0]
+                stream.thread_type = "AUTO"
+                with closing(prefetch_frames(container, clip_len)) as frames:
+                    window = islice(frames, start - warmup, end)
+                    with closing(self.restore_frames(window, input_info.seed)) as predictions:
+                        for index, prediction in enumerate(predictions):
+                            if index < warmup:
+                                continue  # 预热段的输出丢弃:它属于上一个 rank
+                            self.check_stop()
+                            if writer is not None:
+                                writer.submit(self.postprocess(prediction, target))
+                            written += 1
+                            if written % 30 == 0:
+                                logger.info(f"[RelayVSR] chunk_p rank {rank}: {written} frames queued")
+            if writer is not None:
+                writer.close()
+                writer = None
+        finally:
+            self._rank_local_collectives = previous_local
+            if writer is not None:
+                try:
+                    writer.close()
+                except (RuntimeError, ValueError, OSError):
+                    logger.exception("RelayVSR chunk encoder cleanup failed")
+
+        self._chunk_barrier()
+        assemble_start = time.perf_counter()
+        if rank == 0:
+            manifest = work_dir / "chunks.txt"
+            with open(manifest, "w") as handle:
+                handle.write("ffconcat version 1.0\n")
+                for index, (span_start, span_end) in enumerate(spans):
+                    if span_end > span_start:
+                        handle.write(f"file '{index:03d}.mp4'\n")
+            result = mux_audio_from_video(
+                str(source),
+                str(manifest),
+                output_path=str(destination),
+                prefer_copy=self.config.get("audio_mux_prefer_copy", True),
+                trim_to_shortest=False,
+            )
+            if result is None:
+                raise RuntimeError("RelayVSR failed to assemble the chunked output video")
+            logger.info(f"[RelayVSR] chunk_p assembled {written} own frames (total {total}) in {time.perf_counter() - assemble_start:.1f}s -> {destination}")
+            shutil.rmtree(work_dir, ignore_errors=True)
+        self._chunk_barrier()
+        return {"video": None}
+
+    def _chunk_barrier(self):
+        if self.chunk_p_group is not None:
+            dist.barrier(group=self.chunk_p_group)
+
     @torch.no_grad()
     @ProfilingContext4DebugL1("🚀 RUN pipeline")
     def run_pipeline(self, input_info):
@@ -252,6 +364,9 @@ class RelayVSRRunner(DefaultRunner):
                 if target[0] % 2 or target[1] % 2:
                     raise ValueError("YUV420 video output requires even height and width")
                 input_info.output_fps = float(fps)
+                if self.chunk_p_size > 1:
+                    # 块级数据并行:所有 rank 都参与,由 rank0 拼回一个文件。
+                    return self._run_video_chunks(input_info, source, destination, fps, target)
                 if self.main_rank:
                     writer = AsyncVideoWriter(temporary, fps, self.config)
                 with closing(prefetch_frames(container, self.config.get("clip_len", 16))) as frames, closing(self.restore_frames(frames, input_info.seed)) as predictions:

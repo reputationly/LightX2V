@@ -464,16 +464,18 @@ def init_parallel(config):
         # SwiftVR owns its chunk group and validates its parallel settings in the runner.
         return
 
-    seg_p_size = int(parallel.get("seg_p_size", 1))
-    if seg_p_size > 1:
+    # 段/块级数据并行(SeedVR 的 seg_p_size、SwiftVR/RelayVSR 的 chunk_p_size):模型复制、
+    # 每卡算自己那一份,不经过任何 mesh-aware 的层 —— runner 直接和进程组打交道。
+    seg_p_size = max(int(parallel.get("seg_p_size", 1)), int(parallel.get("chunk_p_size", 1)))
+    if seg_p_size > 1 and config.get("model_cls") != "swiftvr":
         # 段并行(SeedVR SR):并行轴是「整段」,模型是复制的,不经过任何 mesh-aware 的层
         # —— runner 直接和进程组打交道。与 tensor/cfg/seq/pp mesh 互斥,而且是断言而非
         # 假定:这个分支根本不读那些尺寸,若从混合 profile 拷来的配置仍写着 2D mesh,
         # 它会照样启动成纯段并行 —— 实际拓扑和签入的配置悄悄不一致。
         if any(int(parallel.get(k, 1)) != 1 for k in ("tensor_p_size", "cfg_p_size", "seq_p_size", "pp_size")):
-            raise ValueError(f"seg_p_size ({seg_p_size}) is exclusive with tensor/cfg/seq/pp parallelism: {parallel}")
+            raise ValueError(f"seg_p_size/chunk_p_size ({seg_p_size}) is exclusive with tensor/cfg/seq/pp parallelism: {parallel}")
         if seg_p_size != dist.get_world_size():
-            raise ValueError(f"seg_p_size ({seg_p_size}) must equal world_size ({dist.get_world_size()})")
+            raise ValueError(f"seg_p_size/chunk_p_size ({seg_p_size}) must equal world_size ({dist.get_world_size()})")
         config["tensor_parallel"] = config["seq_parallel"] = config["cfg_parallel"] = config["pipefusion_parallel"] = False
         config["seg_parallel"] = True
     else:
