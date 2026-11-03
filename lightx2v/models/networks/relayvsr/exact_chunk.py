@@ -194,7 +194,7 @@ class NcclKVExchange:
         self.handles, self.keepalive, self.received = [], [], []
         if not self.outgoing and not self.incoming:
             return
-        sample = own[self.incoming[0][1].start if self.incoming else self.outgoing[0][1].start][0]
+        sample = next(iter(own.values()))[0]
         self.tokens, dtype, device = sample.shape[0], sample.dtype, sample.device
         requests = []
         for dst, refs in self.outgoing:

@@ -190,6 +190,12 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
         if active is not None:
             _, height, width = active[0].grid_sizes.tuple
             self._output_tokens = height * width
+            # Every reference has the same token count and the same fixed prompt, so the
+            # per-call state the serial infer() sets up once per reference is set up once here.
+            self.cos_sin = getattr(active[0], "cos_sin", None)
+            self.rope_positions = getattr(active[0], "rope_positions", None)
+            self.reset_infer_states(active[0].x, active[0].context)
+            self.reset_attention_states(blocks)
         for block_idx, block in enumerate(blocks):
             self.block_idx = block_idx
             if before_layer is not None:
