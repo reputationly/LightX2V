@@ -58,7 +58,13 @@ def judder(frames):
 
 
 def psnr(a, b):
-    """逐帧 PSNR(RGB,逐帧独立),返回 mean/min 与帧数。"""
+    """逐帧 PSNR(RGB)。**必须分开报"逐位相同帧数"与"有限帧的均值"**。
+
+    踩过的坑:直接把逐帧值丢给 ``np.mean`` —— 只要有一帧是 ``inf``(该帧逐位相同),
+    均值就是 ``inf``,于是"9 帧相同 + 115 帧 48dB"会被误读成"整段逐位一致"。
+    所以这里返回 ``identical``(inf 帧数)、``finite_mean``/``finite_min``(只统计有限帧)
+    以及最差的若干帧。
+    """
     out = subprocess.run(
         ["ffmpeg", "-v", "error", "-i", a, "-i", b, "-lavfi", "[0:v][1:v]psnr=stats_file=-", "-f", "null", "-"],
         capture_output=True,
@@ -68,20 +74,21 @@ def psnr(a, b):
     for line in out.splitlines():
         for token in line.split():
             if token.startswith("psnr_avg:"):
-                values.append(float(token.split(":", 1)[1]))
+                raw = token.split(":", 1)[1]
+                values.append(float("inf") if raw == "inf" else float(raw))
     if not values:
-        # ffmpeg 把 psnr 打到 stderr;重试一次只取汇总行
-        text = subprocess.run(
-            ["ffmpeg", "-v", "info", "-i", a, "-i", b, "-lavfi", "[0:v][1:v]psnr", "-f", "null", "-"],
-            capture_output=True,
-            text=True,
-        ).stderr
-        for line in text.splitlines():
-            if "PSNR" in line and "average:" in line:
-                mean = float(line.split("average:")[1].split()[0])
-                return {"frames": None, "psnr_mean": mean, "psnr_min": None}
         raise RuntimeError("psnr filter produced no stats (size mismatch?)")
-    return {"frames": len(values), "psnr_mean": round(float(np.mean(values)), 3), "psnr_min": round(float(np.min(values)), 3)}
+
+    finite = [(index + 1, value) for index, value in enumerate(values) if value != float("inf")]
+    worst = sorted(finite, key=lambda pair: pair[1])[:5]
+    return {
+        "frames": len(values),
+        "identical": len(values) - len(finite),
+        "finite_mean": round(sum(v for _, v in finite) / len(finite), 3) if finite else None,
+        "finite_min": round(worst[0][1], 3) if worst else None,
+        "worst_frames": [(index, round(value, 2)) for index, value in worst],
+        "all_identical": not finite,
+    }
 
 
 def main():
