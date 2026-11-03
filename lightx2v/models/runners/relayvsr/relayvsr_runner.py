@@ -21,6 +21,7 @@ from lightx2v.models.networks.relayvsr.attention import LOCAL_ATTENTION_BACKENDS
 from lightx2v.models.networks.relayvsr.exact_chunk import NcclKVExchange, build_plan, kv_transfer_plan, split_ranks
 from lightx2v.models.networks.relayvsr.geometry import RelayVSRGeometry
 from lightx2v.models.networks.relayvsr.model import RelayVSRModel
+from lightx2v.models.runners.base_runner import TaskStopped
 from lightx2v.models.runners.default_runner import DefaultRunner
 from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.schedulers.relayvsr.scheduler import RelayVSRScheduler
@@ -132,30 +133,38 @@ class RelayVSRRunner(DefaultRunner):
 
     @torch.no_grad()
     def _warmup_exact(self):
-        """Warm both compiled halves and every ``visible`` variant on the real rank layout.
+        """Warm every rank layout a real request can land on, at every warm-up resolution.
 
-        ``2 * context`` references give each rank enough references that the point-to-point
-        exchange is exercised and the ``visible = 1...context`` attention variants are built.
+        Two things have to be covered or the first real request pays for them:
+
+        * each rank must own at least ``context + 1`` references, otherwise the neighbour-independent
+          half of a layer never runs (long layout);
+        * short clips split into ``W = k * world`` windows, so a rank's first reference is ``k * r``
+          and it sees ``visible = min(k * r + 1, context)...`` plus a layer where *every* reference
+          waits on the predecessor. Those layouts warm the per-layer rendezvous cost as well
+          (measured: without them the first 4-5 s request spends 5x longer in the layer sync).
         """
         started = time.perf_counter()
         fps = Fraction(float(self.config.get("fps") or 24)).limit_denominator(1001)
+        clip_len = int(self.config.get("clip_len", 16))
         context = int(self.model.wan_config["temporal_context_frames"])
         world = dist.get_world_size(self.chunk_p_group) if self.chunk_p_group is not None else 1
-        # Every rank must own at least ``context + 1`` references, otherwise the warm-up only ever
-        # runs the neighbour-dependent half of each layer and the first real request re-traces the rest.
-        references = max(2 * context, world * (context + 1))
-        frames = int(self.config.get("warmup_frames") or (references - 1) * (self.config.get("clip_len", 16) - 1) + 1)
+        long_layout = max(2 * context, world * (context + 1))
+        windows = [(long_layout, int(self.config.get("warmup_frames") or 0))] + [(k * world, 0) for k in range(1, context) if world > 1]
         for height, width in self.warmup_resolutions():
-            logger.info("RelayVSR warmup: {}x{}, {} frames exact chunk", height, width, frames)
-            directory = Path(tempfile.mkdtemp(prefix="relayvsr-warmup-"))
-            try:
-                source = directory / "in.mp4"
-                self._write_synthetic_video(source, height, width, frames, fps)
-                self._run_video_exact(source, directory / "out.mp4", fps, (height * self.geometry.scale, width * self.geometry.scale), 42)
-                torch.cuda.synchronize()
-            finally:
-                self.input_info = None
-                shutil.rmtree(directory, ignore_errors=True)
+            for count, override in windows:
+                # warmup_frames 只覆盖长布局;短布局的帧数由 W = k * world 决定,覆盖它会丢掉 R2 的覆盖。
+                frames = override or (count - 1) * (clip_len - 1) + 1
+                logger.info("RelayVSR warmup: {}x{}, {} windows / {} frames exact chunk", height, width, count, frames)
+                directory = Path(tempfile.mkdtemp(prefix="relayvsr-warmup-"))
+                try:
+                    source = directory / "in.mp4"
+                    self._write_synthetic_video(source, height, width, frames, fps)
+                    self._run_video_exact(source, directory / "out.mp4", fps, (height * self.geometry.scale, width * self.geometry.scale), 42)
+                    torch.cuda.synchronize()
+                finally:
+                    self.input_info = None
+                    shutil.rmtree(directory, ignore_errors=True)
         logger.info("RelayVSR warmup cost {:.2f}s", time.perf_counter() - started)
         self._maybe_freeze_gc()
 
@@ -381,6 +390,9 @@ class RelayVSRRunner(DefaultRunner):
         """
         rank = dist.get_rank(self.chunk_p_group)
         world = dist.get_world_size(self.chunk_p_group)
+        timer = {} if self.config.get("relay_timing_log") else None
+        if timer is not None:
+            timer["prologue"] = -time.perf_counter()
         totals = [self._video_frame_count(source) if rank == 0 else None]
         dist.broadcast_object_list(totals, src=0, group=self.chunk_p_group)
         plan = build_plan(int(totals[0]), int(self.config.get("clip_len", 16)))
@@ -397,8 +409,20 @@ class RelayVSRRunner(DefaultRunner):
             f"[RelayVSR] exact rank {rank}/{world}: windows [{span.windows.start}, {span.windows.stop}) of {plan.windows}, refs [{span.refs.start}, {span.refs.stop}), frames [{span.decode.start}, {span.decode.stop}) of {plan.total}"
         )
 
-        timer = {} if self.config.get("relay_timing_log") else None
+        if timer is not None:
+            timer["prologue"] += time.perf_counter()
         previous_local = getattr(self, "_rank_local_collectives", False)
+        try:
+            self._run_exact_body(source, destination, plan, spans, span, rank, world, seed, exchange, context, work_dir, fps, target, timer)
+        except BaseException:
+            # Phase A 里的 TaskStopped 由 check_stop 直接抛出,会穿过内层 finally,这里统一清临时目录。
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise
+        finally:
+            self._rank_local_collectives = previous_local
+        return {"video": None}
+
+    def _run_exact_body(self, source, destination, plan, spans, span, rank, world, seed, exchange, context, work_dir, fps, target, timer):
         written = 0
         failure = None
         try:
@@ -428,10 +452,14 @@ class RelayVSRRunner(DefaultRunner):
                 timer["reference"] += time.perf_counter()
 
             if span.active:
+                if timer is not None:
+                    timer["handoff"] = -time.perf_counter()
                 conditions = {ref: self.model.flash_model_prepare_condition(latent) for ref, latent in zip(span.refs, latents)}
                 boundary = self._exchange_boundary_latent(spans, span, latents, rank)
                 if boundary is not None:
                     conditions[span.refs.stop] = self.model.flash_model_prepare_condition(boundary)
+                if timer is not None:
+                    timer["handoff"] += time.perf_counter()
                 # 生产上只有 rank0 持有 stop_event,而 Phase B 按 rank 判断停止,所以持有者会立刻抛、
                 # 其余 rank 会把自己那段跑完才到下面的 rendezvous —— 取消延迟 ≈ 其它 rank 的剩余工作量
                 # (实测见自测报告 §6,30 秒素材约 8~10s)。要缩短它就得每窗口做一次全员轮询,
@@ -446,7 +474,6 @@ class RelayVSRRunner(DefaultRunner):
                 if timer is not None:
                     timer["flash"] = time.perf_counter() + timer["flash"]
         finally:
-            self._rank_local_collectives = previous_local
             if span.active:
                 self.end_run()
         logger.info(f"[RelayVSR] exact rank {rank}: {written} frames written")
@@ -490,19 +517,27 @@ class RelayVSRRunner(DefaultRunner):
     def _converge(self, failure):
         """Agree on cancel/failure across ranks once, so nobody waits for the NCCL watchdog.
 
-        Phase A advances in lockstep, so a failure there already reaches every rank.  Phase B
-        is rank-local — each rank owns different windows — so a cancelled or failed request
-        only surfaces on one rank; without this rendezvous the others would sit in the closing
-        barrier until the watchdog fires.
+        Phase A advances in lockstep, so a failure there already reaches every rank.  Phase B is
+        rank-local — each rank owns different windows — so a cancelled or failed request only
+        surfaces on one rank; without this rendezvous the others would sit in the closing barrier
+        until the watchdog fires.  Cancellation is reported separately from failure: a cancelled
+        request must raise ``TaskStopped`` on **every** rank, otherwise the workers would record
+        one cancellation as three inference failures.
         """
         if self.chunk_p_group is None:
             return failure
-        signal = torch.tensor([0 if failure is None else dist.get_rank(self.chunk_p_group) + 1], dtype=torch.int32, device=self.device)
+        rank = dist.get_rank(self.chunk_p_group)
+        cancelled = 0 if failure is None else int(isinstance(failure, TaskStopped))
+        failed = 0 if failure is None or isinstance(failure, TaskStopped) else rank + 1
+        signal = torch.tensor([cancelled, failed], dtype=torch.int32, device=self.device)
         dist.all_reduce(signal, op=dist.ReduceOp.MAX, group=self.chunk_p_group)
-        source = int(signal.item()) - 1
-        if source < 0 or failure is not None:
-            return failure
-        return RuntimeError(f"RelayVSR exact chunk aborted because rank {source} failed")
+        cancelled, failed = int(signal[0].item()), int(signal[1].item()) - 1
+        if failed >= 0:
+            # 异常优先于取消:真正出错的那张卡抛原始异常,其余卡抛带 rank 号的 RuntimeError。
+            return failure if failed == rank else RuntimeError(f"RelayVSR exact chunk aborted because rank {failed} failed")
+        if cancelled:
+            return failure if isinstance(failure, TaskStopped) else TaskStopped("RelayVSR exact chunk cancelled")
+        return None
 
     def _chunk_barrier(self, timer=None):
         if self.chunk_p_group is None:

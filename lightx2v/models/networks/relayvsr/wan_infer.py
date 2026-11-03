@@ -202,7 +202,12 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
         for block_idx, block in enumerate(blocks):
             self.block_idx = block_idx
             if before_layer is not None:
-                before_layer()
+                if self.timing is None:
+                    before_layer()
+                else:
+                    synced = time.perf_counter()
+                    before_layer()
+                    self.timing["layer_sync"] = self.timing.get("layer_sync", 0.0) + time.perf_counter() - synced
             phase = block.compute_phases[0]
             staged = []
             self._mark("stage1", block_idx)
