@@ -67,8 +67,8 @@ def main():
         try:
             runner.run_request(input_info)
         except Exception as error:  # noqa: BLE001 - the cancellation test wants the type name
-            if rank == 0:
-                print(f"[bench] run {attempt + 1}: cancelled after {time.perf_counter() - started:.2f}s with {type(error).__name__}", flush=True)
+            # 每个 rank 都打印:取消时四个 rank 都必须抛 TaskStopped(worker 会把 RuntimeError 记成推理失败)。
+            print(f"[bench] rank {rank} run {attempt + 1}: raised after {time.perf_counter() - started:.2f}s: {type(error).__name__}", flush=True)
             if mine.stop_after is None:
                 raise
             runner.stop_signal = False
