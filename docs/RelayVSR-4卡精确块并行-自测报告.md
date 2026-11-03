@@ -624,3 +624,44 @@ run2–run5 稳定在 3.64 / 3.53 / 3.51 / 3.56(3.64 到 3.51 还在往下走,�
 
 Phase A 中途某张卡出错时,整套 4 卡服务会卡在 NCCL 上约 **600 s**(实测 600012 ms),之后 job abort,
 需要重启;重启后同一个请求正常完成(实测 29.51 s)。这是方案 §3.5 明确接受的行为,已在报告里写明。
+
+---
+
+# 第 3 轮验收意见处理(R3)
+
+> 对象:[验收意见(第 3 轮)](RelayVSR-4卡精确块并行-验收意见-第3轮.md)。R1/R2 已通过,R3 是新发现的同类卡死漏洞。
+
+## R3 拼接失败时四卡一起退出
+
+拼接只有 rank0 做。之前 `_assemble_chunks` 抛异常时 rank0 直接穿出 `_run_exact_body`,**跳过了拼接之后
+那道全员同步**,rank1–3 会卡在 barrier 上等满 NCCL 超时 —— 和 B2 是同一类问题,只是发生在拼接这一步。
+
+修法:rank0 的拼接包在 `try/except`,失败先记进 `failure`,把拼接后的那道同步换成 `_converge`,
+四张卡一起退出(rank0 抛原始异常,rank1–3 抛 `RuntimeError(... rank 0 failed)`)。
+同时把失败路径的清理收窄成**只在 rank0 删临时目录**:四个 rank 同时 `rmtree` 会互相踩,
+`ignore_errors=True` 下会留下残余。
+
+## 验证(人为让 rank0 拼接失败)
+
+用 `bench_relayvsr.py --fail-assemble` 在**预热之后**给 rank0 的 `_assemble_chunks` 注入一次
+`RuntimeError`,4 卡、768P 30 秒、`chunk_work_dir` 指到宿主挂载目录(残留才能看到):
+
+```
+[bench] rank 1 run 1: raised after 16.39s: RuntimeError: RelayVSR exact chunk aborted because rank 0 failed
+[bench] rank 3 run 1: raised after 16.39s: RuntimeError: RelayVSR exact chunk aborted because rank 0 failed
+[bench] rank 2 run 1: raised after 16.39s: RuntimeError: RelayVSR exact chunk aborted because rank 0 failed
+[bench] rank 0 run 1: raised after 16.42s: RuntimeError: injected assembly failure
+[bench] run 2: 17.06s
+--- watchdog lines: 0
+--- staging entries after the run: 0
+```
+
+| 要求 | 结果 |
+|---|---|
+| 四张卡几秒内全部退出 | 16.4 s 全部退出(**没有** NCCL watchdog 行),即该请求正常的结束时刻 |
+| 下一个请求正常完成 | 同一进程的下一个请求 17.06 s ✅ |
+| 临时目录无残留 | 0 ✅ |
+
+## 本轮工程项
+
+`ruff check` / `ruff format --check` 通过,`pytest test_cases/test_relayvsr_exact_chunk.py` 933 passed。
