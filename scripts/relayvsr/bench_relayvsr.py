@@ -27,7 +27,9 @@ from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--stop-after", type=float, default=None, help="raise stop_signal after N seconds of the first request")
+    parser.add_argument("--stop-after", type=float, default=None, help="raise stop_signal on rank 0 only, N seconds into the first request (production holds the stop flag on rank 0)")
+    parser.add_argument("--fail-at-layer", type=int, default=None, help="inject an exception on rank 2 at this transformer layer, then hold the process so the other ranks hit the NCCL timeout")
+    parser.add_argument("--hold", type=float, default=900.0, help="how long the injected-failure rank stays alive so the peers' NCCL timeout can fire")
     mine, rest = parser.parse_known_args()
     sys.argv = [sys.argv[0], *rest]
     args = build_parser().parse_args()
@@ -39,6 +41,16 @@ def main():
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     runner = build_runner(startup_config)
+    if mine.fail_at_layer is not None:
+        stage_reference = runner.model.wan_transformer.stage_reference
+
+        def injecting_stage_reference(block_idx, *args, **kwargs):
+            if block_idx == mine.fail_at_layer and rank == 2:
+                print(f"[bench] rank 2 injecting failure at layer {block_idx}, holding for {mine.hold}s", flush=True)
+                time.sleep(mine.hold)
+            return stage_reference(block_idx, *args, **kwargs)
+
+        runner.model.wan_transformer.stage_reference = injecting_stage_reference
     input_info = runner.prepare_request(request_data)
     runner.warmup()
     torch.cuda.synchronize()
@@ -46,7 +58,9 @@ def main():
 
     timings = []
     for attempt in range(mine.repeat):
-        if mine.stop_after is not None and attempt == 0:
+        # 生产上只有 rank0 的进程持有 stop_event(server/services/inference/worker.py),
+        # 所以这里也只在 rank0 置位,否则测出来的取消延迟不代表线上。
+        if mine.stop_after is not None and attempt == 0 and rank == 0:
             threading.Timer(mine.stop_after, setattr, (runner, "stop_signal", True)).start()
         torch.cuda.synchronize()
         started = time.perf_counter()
