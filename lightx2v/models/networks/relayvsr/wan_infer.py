@@ -1,4 +1,5 @@
 import math
+import time
 from dataclasses import replace
 
 import torch
@@ -78,6 +79,8 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
         self.sensitive_layer_dtype = self.infer_dtype
         self.modulate_func = self.modulate_and_cast
         self.cross_cache = []
+        # Optional per-stage accumulation, enabled by the runner's relay_timing_log.
+        self.timing = None
         if weights.offload:
             self.offload_manager.init_cuda_buffer(blocks_cuda_buffer=weights.offload_block_cuda_buffers)
 
@@ -202,6 +205,7 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
                 before_layer()
             phase = block.compute_phases[0]
             staged = []
+            self._mark("stage1", block_idx)
             for rank, first_ref, pres in groups:
                 own, queries = {}, []
                 for offset, pre in enumerate(pres):
@@ -216,15 +220,33 @@ class RelayWanTransformerInfer(RelayCompileMixin, WanOffloadTransformerInfer):
                     queries.append(query)
                 exchange.post(block_idx, rank, own)
                 staged.append((rank, first_ref, pres, own, queries))
+            self._mark("stage1_end", block_idx)
             # References whose visible window is fully local run before the exchange is awaited,
             # so the point-to-point traffic overlaps with real work.
+            self._mark("stage2_free", block_idx)
             for rank, first_ref, pres, own, queries in staged:
                 for offset in range(min(context - 1, len(pres)), len(pres)):
                     self.stage_reference(block_idx, block, pres, own, None, queries[offset], offset, first_ref)
+            self._mark("stage2_free_end", block_idx)
             for rank, first_ref, pres, own, queries in staged:
                 received = exchange.collect(block_idx, rank)
+                self._mark("exchange_end", block_idx)
                 for offset in range(min(context - 1, len(pres))):
                     self.stage_reference(block_idx, block, pres, own, received, queries[offset], offset, first_ref)
+            self._mark("stage2_bound_end", block_idx)
+
+    def _mark(self, name, block_idx):
+        """Accumulate stage boundaries when the runner asked for timing detail."""
+        if self.timing is None:
+            return
+        torch.cuda.synchronize()
+        clock = time.perf_counter()
+        previous = self.timing.get("_last")
+        if previous is not None:
+            self.timing[name] = self.timing.get(name, 0.0) + clock - previous
+        self.timing["_last"] = clock
+        if name == "stage2_bound_end":
+            self.timing["layers"] = block_idx + 1
 
     def stage_reference(self, block_idx, block, pres, own, received, query, offset, first_ref):
         """Finish one reference's layer: slot-ordered attention over the visible window, then the rest."""

@@ -21,6 +21,7 @@ from lightx2v.models.networks.relayvsr.attention import LOCAL_ATTENTION_BACKENDS
 from lightx2v.models.networks.relayvsr.exact_chunk import NcclKVExchange, build_plan, kv_transfer_plan, split_ranks
 from lightx2v.models.networks.relayvsr.geometry import RelayVSRGeometry
 from lightx2v.models.networks.relayvsr.model import RelayVSRModel
+from lightx2v.models.runners.base_runner import TaskStopped
 from lightx2v.models.runners.default_runner import DefaultRunner
 from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.schedulers.relayvsr.scheduler import RelayVSRScheduler
@@ -318,8 +319,8 @@ class RelayVSRRunner(DefaultRunner):
         try:
             with av.open(str(source)) as container:
                 container.streams.video[0].thread_type = "AUTO"
-                with closing(prefetch_frames(container, clip_len)) as frames:
-                    stream = islice(frames, span.decode.start, None)
+                with closing(prefetch_frames(container, clip_len, skip=span.decode.start)) as frames:
+                    stream = iter(frames)
                     window_frames = []
                     for position, window in enumerate(span.windows):
                         length = len(plan.window_frames(window))
@@ -364,10 +365,14 @@ class RelayVSRRunner(DefaultRunner):
         directories = [tempfile.mkdtemp(prefix="relayvsr-exact-", dir=destination.parent) if rank == 0 else None]
         dist.broadcast_object_list(directories, src=0, group=self.chunk_p_group)
         work_dir = Path(directories[0])
-        logger.info(f"[RelayVSR] exact rank {rank}/{world}: windows [{span.windows.start}, {span.windows.stop}) of {plan.windows}, refs [{span.refs.start}, {span.refs.stop}), frames [{span.decode.start}, {span.decode.stop}) of {plan.total}")
+        logger.info(
+            f"[RelayVSR] exact rank {rank}/{world}: windows [{span.windows.start}, {span.windows.stop}) of {plan.windows}, refs [{span.refs.start}, {span.refs.stop}), frames [{span.decode.start}, {span.decode.stop}) of {plan.total}"
+        )
 
+        timer = {} if self.config.get("relay_timing_log") else None
         previous_local = getattr(self, "_rank_local_collectives", False)
         written = 0
+        stopped = None
         try:
             batches = [(rank, 0, [], [])]
             frame_shape = None
@@ -387,24 +392,49 @@ class RelayVSRRunner(DefaultRunner):
                 frames = noises = None
             # Phase A 是全员逐层同步的(空闲 rank 也跑满层数),所以停止检查在阶段内可以是全局的。
             self._rank_local_collectives = False
+            if timer is not None:
+                self.model.wan_transformer.timing = timer
+                timer["reference"] = -time.perf_counter()
             latents = self.model.infer_references(batches, exchange, context, before_layer=self.check_stop)[0]
+            if timer is not None:
+                self.model.wan_transformer.timing = None
+                timer["reference"] += time.perf_counter()
 
             if span.active:
+                if timer is not None:
+                    timer["flash"] = -time.perf_counter()
                 conditions = {ref: self.model.flash_model_prepare_condition(latent) for ref, latent in zip(span.refs, latents)}
                 boundary = self._exchange_boundary_latent(spans, span, latents, rank)
                 if boundary is not None:
                     conditions[span.refs.stop] = self.model.flash_model_prepare_condition(boundary)
                 self._rank_local_collectives = True
                 written = self._decode_windows(source, plan, span, conditions, work_dir, fps, target, *frame_shape)
+                if timer is not None:
+                    timer["flash"] = time.perf_counter() + timer["flash"]
+        except TaskStopped as error:
+            # Phase B 用 rank 本地判定(各 rank 干的活不同),所以只有持有停止信号的 rank 会抛;
+            # 其余 rank 必须照常走到下面这道 barrier,否则它们会一直等到 NCCL 超时。
+            stopped = error
         finally:
             self._rank_local_collectives = previous_local
             if span.active:
                 self.end_run()
         logger.info(f"[RelayVSR] exact rank {rank}: {written} frames written")
         self._chunk_barrier()
+        stopped = self._settle_cancel(stopped)
+        if stopped is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise stopped
+        if timer is not None:
+            timer["assemble"] = -time.perf_counter()
         if rank == 0:
             self._assemble_chunks(work_dir, spans, destination, source, plan.total)
         self._chunk_barrier()
+        if timer is not None:
+            timer["assemble"] += time.perf_counter()
+            timer.pop("_last", None)
+            report = " ".join(f"{key}={value:.2f}" for key, value in sorted(timer.items()))
+            logger.info(f"[RelayVSR][timing] rank={rank} world={world} frames={plan.total} refs={len(span.refs)} windows={len(span.windows)} {report}")
         return {"video": None}
 
     def _assemble_chunks(self, work_dir, spans, destination, source, total):
@@ -427,10 +457,17 @@ class RelayVSRRunner(DefaultRunner):
         logger.info(f"[RelayVSR] exact assembled {total} frames in {time.perf_counter() - started:.1f}s -> {destination}")
         shutil.rmtree(work_dir, ignore_errors=True)
 
+    def _settle_cancel(self, stopped):
+        """Agree on cancellation across ranks after the rendezvous, so everyone stops together."""
+        if self.chunk_p_group is None:
+            return stopped
+        flag = torch.tensor([0 if stopped is None else 1], dtype=torch.int32, device=self.device)
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=self.chunk_p_group)
+        return TaskStopped(f"RelayVSR exact chunk cancelled on {int(flag.item())} rank(s)") if int(flag.item()) else stopped
+
     def _chunk_barrier(self):
         if self.chunk_p_group is not None:
             dist.barrier(group=self.chunk_p_group)
-
 
     @ProfilingContext4DebugL1("🚀 RUN pipeline")
     def run_pipeline(self, input_info):

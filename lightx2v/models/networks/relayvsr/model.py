@@ -99,10 +99,7 @@ class RelayVSRModel:
         latents = []
         for (rank, first_ref, pres), noises in zip(groups, scheduled):
             latents.append(
-                [
-                    (noise - self.wan_post.infer(self.wan_transformer.infer_non_blocks(self.wan_weights, pre.x, pre.embed), pre).float())[:, :, 0].to(GET_DTYPE())
-                    for noise, pre in zip(noises, pres)
-                ]
+                [(noise - self.wan_post.infer(self.wan_transformer.infer_non_blocks(self.wan_weights, pre.x, pre.embed), pre).float())[:, :, 0].to(GET_DTYPE()) for noise, pre in zip(noises, pres)]
             )
         return latents
 

@@ -1,6 +1,6 @@
 """Compare two videos frame by frame: PSNR, identical frames, and per-boundary detail.
 
-    python scripts/relayvsr/compare_outputs.py a.mp4 b.mp4 --boundaries 187 374 561
+python scripts/relayvsr/compare_outputs.py a.mp4 b.mp4 --boundaries 187 374 561
 """
 
 import argparse
