@@ -564,9 +564,11 @@ class SwiftVRRunner(DefaultRunner):
                 reader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-reader")
                 writer_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="swiftvr-writer")
                 max_pending = self.config.get("queue_size", 3)
-                # 双跑要融合整块,按 output_batch_size=0 整块解码(显存代价 1080p 约
-                # 2×300MB/块、4K 约 2×1.2GB)。
-                output_batch_size = 0 if antiphase else (4 if self.chunk_p_group is not None else clip_length + 4)
+                # 与上游同款分批:块并行 4 帧一批、单卡 clip_len+4。双跑以前用 0(整块)
+                # 是为了拿到块尾做 ring carry,代价是 output_layers 一次性吃下整块,
+                # 4C/4K 实测多占 5.3GiB(peak_allocated 反而更低,差额全是 allocator 缓存
+                # 的大块 transient)。融合算法本身是流式的,分批一样能算对。
+                output_batch_size = 4 if self.chunk_p_group is not None else clip_length + 4
                 # Keep the write queue's frame budget proportional to the original chunk budget.
                 # 整块解码时一块只有一次写出。
                 writes_per_chunk = 1 if output_batch_size == 0 else (clip_length + output_batch_size - 1) // output_batch_size
@@ -625,27 +627,39 @@ class SwiftVRRunner(DefaultRunner):
                         else:
                             direct_latents, shifted_latents = direct_input, shifted_input
                         del direct_input, shifted_input
-                        direct_frames = next(self.restorer.decode_chunk(direct_latents, chunk, output_batch_size))
-                        shifted_frames = next(self.restorer_shifted.decode_chunk(shifted_latents, chunk, output_batch_size))
-                        del direct_latents, shifted_latents
+                        # 直相整块分批解完(每批过后 output_layers 的临时张量就释放),拿到
+                        # 块尾后立刻做 ring carry 交换;移位流随后逐批解、逐批融合写出。
+                        # 这样同一时刻只驻留一条流的整块,而不是两条。
+                        direct_frames = list(self.restorer.decode_chunk(direct_latents, chunk, output_batch_size))
+                        del direct_latents
                         if self.chunk_p_group is not None:
                             # inactive 的重复块也要发同形零张量:ring 的每一次交换在所有
                             # rank 上必须一一配对,少发一次其余 rank 就卡在 P2P 上。
-                            carry = direct_frames[:, -1:] if active else direct_frames.new_zeros((direct_frames.shape[0], 1, *direct_frames.shape[2:]))
+                            last_batch = direct_frames[-1]
+                            carry = last_batch[:, -1:] if active else last_batch.new_zeros((last_batch.shape[0], 1, *last_batch.shape[2:]))
                             chunk_carry, self._antiphase_carry = exchange_antiphase_carry(carry, self.chunk_p_group, self._antiphase_carry)
                             blender.carry = chunk_carry
                         if not active:
-                            del direct_frames, shifted_frames
+                            # 两条流都要跑完整块:causal 层的 ring 交换一一配对。
+                            for _ in self.restorer_shifted.decode_chunk(shifted_latents, chunk, output_batch_size):
+                                pass
+                            del direct_frames, shifted_latents
                             continue
-                        restored = blender.push(direct_frames, shifted_frames)
-                        del direct_frames, shifted_frames
-                        if chunk.index == len(chunks) - 1:
-                            # 全片最后一块:carry 是最后一帧,移位流已经没有对应帧能与它
-                            # 配对(移位流整体比正相流短一帧),原样接在尾巴上。
-                            tail = blender.flush()
-                            if tail is not None:
-                                restored = torch.cat([restored, tail], dim=1)
-                        restored_frames = (restored,)
+
+                        def fused_batches(direct_batches, shifted_latents, chunk, blender, batch_size):
+                            """按批融合:blender 的 carry 语义在批之间同样成立(流式)。"""
+                            for index, shifted_batch in enumerate(self.restorer_shifted.decode_chunk(shifted_latents, chunk, batch_size)):
+                                yield blender.push(direct_batches[index], shifted_batch)
+                                direct_batches[index] = None  # 这一批已经融合完,立刻放手
+                            if chunk.index == len(chunks) - 1:
+                                # 全片最后一块:carry 是最后一帧,移位流没有对应帧可配
+                                # (移位流整体比正相流短一帧),原样接在尾巴上。
+                                tail = blender.flush()
+                                if tail is not None:
+                                    yield tail
+
+                        restored_frames = fused_batches(direct_frames, shifted_latents, chunk, blender, output_batch_size)
+                        del shifted_latents
                     else:
                         video = self.preprocess_frames(frames, output_height, output_width)
                         del frames
