@@ -23,6 +23,14 @@ ABORT = "ABORT"
 REAL = "REAL"
 
 
+class _FakeWork:
+    def __init__(self):
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
 class _Edge:
     """一条 (idx-1 -> idx) 边,只有一个发送方和一个接收方。"""
 
@@ -41,6 +49,7 @@ class _Rig:
         self.edges = [_Edge() for _ in range(num_segments)]
         self.threads = []
         self.errors = []
+        self.runners = {}
 
     def owner(self, idx):
         return idx % self.world
@@ -57,6 +66,9 @@ class _Rig:
             edge = self.edges[idx]
             edge.sent += 1
             edge.queue.put(ABORT if abort else REAL)
+            # 真实实现把 isend 挂进 _sr_tail_sends,由 drain 收尾;这里照样挂一个假 work,
+            # 好让「退出路径有没有 drain 发送」可被断言。
+            runner._sr_tail_sends.append((_FakeWork(), None))
 
         def recv_tail(src, idx):
             edge = self.edges[idx]
@@ -72,6 +84,7 @@ class _Rig:
 
         def body(rank):
             runner = self.make_rank(rank)
+            self.runners[rank] = runner
             my_indices = [idx for idx in range(self.num_segments) if self.owner(idx) == rank]
             edge_sent, edge_recv = set(), set()
             try:
@@ -94,6 +107,9 @@ class _Rig:
                     if idx + 1 < self.num_segments:
                         runner._sr_send_tail("tail", self.owner(idx + 1), idx)
                         edge_sent.add(idx)
+                # 正常跑完也要 drain(真实实现在段循环后、rendezvous 前做同一件事)
+                if self.world > 1:
+                    runner._sr_drain_tail_sends()
             except Exception as error:  # noqa: BLE001 - 线程里记下来交给主线程断言
                 if rank == raise_rank:
                     runner._sr_unwind_segment_loop(my_indices, edge_sent, edge_recv, self.world, self.num_segments)
@@ -107,6 +123,11 @@ class _Rig:
             thread.join(timeout=15)
         stuck = [index for index, thread in enumerate(self.threads) if thread.is_alive()]
         return stuck
+
+    def assert_no_pending_sends(self):
+        """退出路径必须 drain 发送,否则最后一个 abort isend 会被下一个请求回收。"""
+        for rank, runner in self.runners.items():
+            assert runner._sr_tail_sends == [], f"rank {rank} left {len(runner._sr_tail_sends)} tail hand-off(s) pending"
 
     def assert_balanced(self):
         for idx, edge in enumerate(self.edges):
@@ -136,6 +157,7 @@ def test_cancel_by_any_rank_at_any_segment_is_balanced(world, num_segments):
                 stuck = rig.run(cancel_rank=cancel_rank, cancel_phase=(phase, idx))
                 assert stuck == [], f"deadlock: w={world} n={num_segments} rank={cancel_rank} {phase} {idx} stuck={stuck}"
                 rig.assert_balanced()
+                rig.assert_no_pending_sends()
                 assert rig.errors == [], f"w={world} n={num_segments} rank={cancel_rank} {phase} {idx}: {rig.errors}"
 
 
@@ -148,6 +170,7 @@ def test_exception_path_is_balanced(world, num_segments):
         stuck = rig.run(raise_rank=raise_rank, cancel_phase=("before", idx))
         assert stuck == []
         rig.assert_balanced()
+        rig.assert_no_pending_sends()
 
 
 @pytest.mark.parametrize("world", [2, 4])

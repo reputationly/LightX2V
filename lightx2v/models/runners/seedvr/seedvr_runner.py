@@ -923,9 +923,21 @@ class SeedVRRunner(DefaultRunner):
                 return
 
     def _sr_unwind_segment_loop(self, my_indices, edge_sent, edge_recv, seg_world, num_segments):
-        """提前离开段循环的唯一出口:先发欠的出边 abort,再收欠的入边,最后才汇合。"""
+        """提前离开段循环的唯一出口:发欠的出边 → 收欠的入边 → drain 发送 → 汇合。
+
+        第三步不能省:``_sr_abort_owed_edges`` 里的 abort 也是 ``_sr_send_tail`` 发出去的
+        isend,挂在 ``_sr_tail_sends`` 里;不 drain 的话本次请求结束时它还没落地,会被**下一个
+        请求**在 ``_run_sr_segments`` 开头当作「上一个失败请求遗留的 hand-off」释放掉,
+        日志里就是 ``releasing N tail hand-off(s) abandoned by a failed request`` ——
+        第 3 轮验收明确禁止这个字符串。
+        """
         self._sr_abort_owed_edges(my_indices, edge_sent, seg_world, num_segments)
         self._sr_drain_inbound_edges(my_indices, edge_recv, seg_world)
+        if seg_world > 1:
+            try:
+                self._sr_drain_tail_sends()
+            except Exception as e:  # 传输层坏了不能盖住真正的异常
+                logger.warning(f"[SeedVRRunner] could not drain the abort hand-offs: {e}")
 
     def _sr_run_on_rank0(self, fn):
         """Run ``fn`` on rank 0 only, with everyone meeting afterwards.
