@@ -175,8 +175,14 @@ class RelayVSRRunner(DefaultRunner):
         latent = self.scheduler.latents[:, :, 0].to(GET_DTYPE())
         return self.model.flash_model_prepare_condition(latent)
 
-    def restore_frames(self, source, seed):
-        """Yield cropped native predictions; overlapping endpoints are emitted once."""
+    def restore_frames(self, source, seed, priming=None):
+        """Yield cropped native predictions; overlapping endpoints are emitted once.
+
+        ``priming=(上一窗口末帧, 本块窗口序号)`` 供块级并行:``reference()`` 的结果依赖
+        ``reference_count``(RoPE 位置与时间可见窗口都按帧序号算),把序号和预热帧一起对齐,
+        分块就能复现**串行**的 relay 状态(成片与单卡逐位相同,而不是近似)。
+        此时首窗口前面还有一块,只发 ``clip_len-1`` 帧。
+        """
         iterator = iter(source)
         first = next(iterator, None)
         if first is None:
@@ -186,9 +192,21 @@ class RelayVSRRunner(DefaultRunner):
         try:
             padded_height, padded_width = self.geometry.padded_size(height, width)
             self.init_run(padded_height, padded_width, seed)
-            start_condition = self.reference(first)
-            first_window = True
-            start = first
+            if priming is None:
+                start_condition = self.reference(first)
+                first_window = True
+                start = first
+            else:
+                prime_frame, prime_index = priming
+                # 每调一次 reference() 就从 scheduler 的 generator 抽一次噪声,串行时第 k 次
+                # reference 用的是第 k 个噪声。块从中途开始,必须先把噪声流快进到同一位置,
+                # 否则同一帧在两个块里拿到的噪声不同 —— 这是逐位一致的最后一道差。
+                for _ in range(prime_index):
+                    self.scheduler.prepare_latents(padded_height, padded_width, self.device)
+                self.reference_count = prime_index
+                start_condition = self.reference(prime_frame)
+                first_window = False
+                start = prime_frame
             while True:
                 window = [start, *islice(iterator, self.config.get("clip_len", 16) - 1)]
                 if any(frame.shape != shape for frame in window):
@@ -221,6 +239,13 @@ class RelayVSRRunner(DefaultRunner):
                 return int(stream.frames)
             return sum(1 for _ in container.decode(video=0))
 
+    def _chunk_windows(self, total, clip_len):
+        """按**串行窗口网格**分配窗口:块边界必须落在窗口边界上,否则帧序号对不齐。"""
+        step = max(1, clip_len - 1)
+        windows = max(1, -(-(total - clip_len) // step) + 1) if total > clip_len else 1
+        per = -(-windows // self.chunk_p_size)
+        return [(min(rank * per, windows), min(windows, (rank + 1) * per), step, windows) for rank in range(self.chunk_p_size)]
+
     def _chunk_spans(self, total):
         """把 total 帧切成 chunk_p_size 段连续的区间;最后一卡吃掉余数。"""
         per = -(-total // self.chunk_p_size)
@@ -242,11 +267,21 @@ class RelayVSRRunner(DefaultRunner):
         previous_local = getattr(self, "_rank_local_collectives", False)
         self._rank_local_collectives = True
         total = self._video_frame_count(source)
-        spans = self._chunk_spans(total)
-        start, end = spans[rank]
         clip_len = int(self.config.get("clip_len", 16))
-        warmup = min(clip_len, start)
-        logger.info(f"[RelayVSR] chunk_p rank {rank}/{self.chunk_p_size}: frames [{start}, {end}) of {total}, warmup {warmup}")
+        spans = self._chunk_windows(total, clip_len)
+        w_start, w_end, step, windows = spans[rank]
+        # relay 的隐状态有两层:reference_count(RoPE/可见窗口的帧序号)和 wan 的 frame_ring KV 缓存
+        # (最近 temporal_context_frames 个 reference 帧)。要复现串行状态,就得把这两样都补齐 ——
+        # 所以本块前面先**重放 warmup_windows 个窗口**(输出丢弃),而不是只对齐一个序号。
+        context = int((self.model.wan_config or {}).get("temporal_context_frames", 1) or 1)
+        warmup_windows = min(context, w_start)
+        start = (w_start - warmup_windows) * step
+        end = total if w_end >= windows else (w_end - 1) * step + clip_len
+        first_window_index = w_start - warmup_windows
+        # 预热窗口也要丢:窗口 0 发 clip_len 帧,其余窗口发 clip_len-1(=step)帧
+        drop_frames = (clip_len if first_window_index == 0 and warmup_windows else 0) + max(0, warmup_windows - (1 if first_window_index == 0 else 0)) * step
+        logger.info(f"[RelayVSR] chunk_p rank {rank}/{self.chunk_p_size}: windows [{w_start}, {w_end}) of {windows}, "
+                    f"frames [{start}, {end}) of {total}, warmup {warmup_windows} window(s)/{drop_frames} frames")
 
         directories = [None]
         if rank == 0:
@@ -258,18 +293,30 @@ class RelayVSRRunner(DefaultRunner):
         written = 0
         try:
             part_path = work_dir / f"{rank:03d}.mp4"
-            if end > start:
+            if w_end > w_start:
                 writer = AsyncVideoWriter(str(part_path), fps, self.config)
             with av.open(str(source)) as container:
                 stream = container.streams.video[0]
                 stream.thread_type = "AUTO"
                 with closing(prefetch_frames(container, clip_len)) as frames:
-                    window = islice(frames, start - warmup, end)
-                    with closing(self.restore_frames(window, input_info.seed)) as predictions:
+                    priming = None
+                    if first_window_index > 0:
+                        # 块首落在窗口中间:先读上一个窗口的末帧当 priming,再从 start 开始
+                        frames = islice(frames, max(0, start - 1), None)
+                        prev_end = list(islice(frames, 1))
+                        if not prev_end:
+                            raise ValueError("RelayVSR chunk priming frame missing")
+                        priming = (prev_end[0], first_window_index)
+                    else:
+                        frames = islice(frames, start, None)
+                    if priming is None and first_window_index > 0:
+                        raise AssertionError("unreachable")
+                    window = islice(frames, 0, end - start)
+                    with closing(self.restore_frames(window, input_info.seed, priming=priming)) as predictions:
                         for index, prediction in enumerate(predictions):
-                            if index < warmup:
-                                continue  # 预热段的输出丢弃:它属于上一个 rank
                             self.check_stop()
+                            if index < drop_frames:
+                                continue  # 预热窗口的输出丢弃:它们属于前面的 rank
                             if writer is not None:
                                 writer.submit(self.postprocess(prediction, target))
                             written += 1
@@ -292,8 +339,8 @@ class RelayVSRRunner(DefaultRunner):
             manifest = work_dir / "chunks.txt"
             with open(manifest, "w") as handle:
                 handle.write("ffconcat version 1.0\n")
-                for index, (span_start, span_end) in enumerate(spans):
-                    if span_end > span_start:
+                for index, (first_window, last_window, _step, _windows) in enumerate(spans):
+                    if last_window > first_window:
                         handle.write(f"file '{index:03d}.mp4'\n")
             result = mux_audio_from_video(
                 str(source),
