@@ -199,8 +199,9 @@ class SwiftVRRunner(DefaultRunner):
         按**面积**而不是逐边压:显存跟像素数走,而且等比缩放不会改变请求的画幅比例。
         配 0 或负数 = 关闭上限(自建/离线跑大图时用)。
         """
-        max_height = int(self.config.get("max_target_height", 2160) or 0)
-        max_width = int(self.config.get("max_target_width", 3840) or 0)
+        # 缺省也按产品口径封 2K:配置漏写这个键时不该悄悄放行 4K(4C 双跑 4K 实测 39G/96%)。
+        max_height = int(self.config.get("max_target_height", 1440) or 0)
+        max_width = int(self.config.get("max_target_width", 2560) or 0)
         if max_height <= 0 or max_width <= 0:
             return height, width
         budget = max_height * max_width
@@ -602,11 +603,6 @@ class SwiftVRRunner(DefaultRunner):
                 blender = AntiphaseBlender() if antiphase else None
                 for local_index, chunk in enumerate(local_chunks):
                     self.check_stop()
-                    # 一块一块来:进下一块之前把上一块的 transient 还给驱动。不还的话
-                    # allocator 会把它们留着复用,4C/4K 上 rank0 的 reserved 会一路涨到
-                    # 36~38GiB(而真正的活张量只有 24.7GiB)。代价是每块一次 empty_cache。
-                    if local_index and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
                     active = local_index * self.chunk_p_size + rank < len(chunks)
                     frames = pending_reads.popleft().result()
                     next_read = local_index + max_pending
@@ -696,11 +692,6 @@ class SwiftVRRunner(DefaultRunner):
                     del restored_frames
                 while pending_writes:
                     pending_writes.popleft().result()
-                # 解码/写出的 transient 已经用完:把 allocator 缓存的那部分还给驱动。
-                # 不还的话它一直挂到请求结束(nvidia-smi 上 4C/4K 的峰值就出现在这一段,
-                # 而 decode 本身只要 28.2G)。收尾的 join/mux 是纯 CPU/ffmpeg,不需要显存。
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
             finally:
                 if reader_executor is not None:
                     reader_executor.shutdown(wait=True, cancel_futures=True)

@@ -6,8 +6,8 @@
         1080,
         1920
     ],
-    "max_target_height": 2160,
-    "max_target_width": 3840,
+    "max_target_height": 1440,
+    "max_target_width": 2560,
     "clip_len": 24,
     "dit_overlap": 0,
     "reae_frame_batch_size": 1,
