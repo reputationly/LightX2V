@@ -1,3 +1,4 @@
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from itertools import islice
@@ -45,6 +46,8 @@ class AsyncVideoWriter:
         self.frames = 0
         self.queue_size = config.get("queue_size", 16)
         self.closed = False
+        # Time the producer spent blocked because the encoder queue was full.
+        self.encode_wait = 0.0
 
     def _write(self, pixels, event):
         event.synchronize()
@@ -75,7 +78,9 @@ class AsyncVideoWriter:
 
     def submit(self, pixels):
         if len(self.pending) >= self.queue_size:
+            blocked = time.perf_counter()
             self.pending.popleft().result()
+            self.encode_wait += time.perf_counter() - blocked
         host = torch.empty(pixels.shape, device="cpu", dtype=torch.uint8, pin_memory=True)
         self.copy_stream.wait_stream(torch.cuda.current_stream(pixels.device))
         with torch.cuda.stream(self.copy_stream):
