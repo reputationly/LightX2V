@@ -11,7 +11,7 @@
   "queue_size": 16,
   "use_compile": true,
   "warmup": true,
-  "warmup_resolutions": [[768, 1024], [768, 1344], [768, 1376]],
+  "warmup_resolutions": [[768, 1024], [768, 1344], [768, 1376], [1344, 768], [1024, 768], [768, 768]],
   "parallel": {
     "chunk_p_size": 4
   }

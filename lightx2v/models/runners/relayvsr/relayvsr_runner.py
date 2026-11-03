@@ -481,7 +481,7 @@ class RelayVSRRunner(DefaultRunner):
         self._chunk_barrier(timer)
         failure = self._converge(failure)
         if failure is not None:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # 清理统一由外层(只在 rank0)处理,这里只负责把异常抛出去。
             raise failure
         if rank == 0:
             # 拼接只有 rank0 做,失败时必须和出错的 rank 一起收敛,否则 rank1-3 会卡在下面这道
