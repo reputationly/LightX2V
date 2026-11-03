@@ -15,7 +15,7 @@ GPUS=${3:?gpu count}
 PORT=${4:?port}
 CT=${5:-lx2v_$MODE}
 IMG=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-a100-latest
-SYNC=/data/lx2v-sync
+SYNC=${SYNC:-/data/lx2v-sync}
 LOGD=/data/verify-logs
 mkdir -p "$LOGD"
 

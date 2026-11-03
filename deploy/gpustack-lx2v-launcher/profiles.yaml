@@ -35,9 +35,12 @@ seedvr2:
       config_json: /opt/LightX2V/configs/seedvr/a100/seedvr2_3b_seg121.json
     # 4-card segment data parallelism: the same segmentation as the 1-card
     # variant, with the segments dealt round-robin across ranks and only the
-    # 8-frame cross-fade boundary sent rank-to-rank. Output is BIT-IDENTICAL to
-    # 1-card (PSNR inf, measured) because each segment's noise is keyed on
-    # (seed, global segment index) rather than drawn from the global RNG.
+    # 8-frame cross-fade boundary sent rank-to-rank. Each segment's noise is
+    # keyed on (seed, global segment index) rather than drawn from the global RNG.
+    # ⚠️ 4 卡与 1 卡的成片**不是逐位相同**:实测 finite_mean ≈ 48.2 dB、124 帧中仅前 9 帧
+    #    逐位相同,其余差异全片均匀(最差帧落在 cross-fade 重叠区与尾部)。已确认与
+    #    VAE 分块上限无关(vae_memory_limit_gb 0 与 0.5 同值),根因未定位 —— 已另开单。
+    #    同一个例子在现网镜像上也是这个量级,所以不是本次上游同步引入的。
     # Speedup is segments/ceil(segments/4), so it is a function of INPUT LENGTH:
     # ≤121 frames = 1 segment = no gain (the request is pinned to rank 0);
     # 122-234 = 2; 235-347 = 3; 348-460 = 4.

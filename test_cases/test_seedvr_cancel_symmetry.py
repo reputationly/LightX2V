@@ -14,7 +14,6 @@
 
 import queue
 import threading
-from types import SimpleNamespace
 
 import pytest
 
