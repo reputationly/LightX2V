@@ -508,3 +508,119 @@ K/V(0.71~0.92 s)。剩下的差额来自 4 个进程各自的 CUDA 发射开销�
 预热成本:4 卡精确路径 24 s(4 个分辨率 × 286 帧;1 卡串行 29 s)。
 
 **上一轮离门槛 0.7% 的 768P 15 秒这一格,现在是 3.11×。**
+
+---
+
+# 第 2 轮验收意见处理
+
+> 对象:[验收意见(第 2 轮)](RelayVSR-4卡精确块并行-验收意见-第2轮.md)。R1 回归修掉并复测,
+> R2 按验收方指定的修法实现并实测。产物根目录同上(`$R2 = /data/verify-logs/relayvsr/exact/r2/`)。
+
+## R1 取消时全员抛 `TaskStopped`(修掉相对上一轮的回归)
+
+`_converge` 的 all-reduce 现在一次带两个标志:`[有人取消?, 出错 rank + 1]`(都取 MAX)。规则:
+
+| 情形 | 全员行为 |
+|---|---|
+| 有 rank 抛了非取消类异常 | 出错的那张卡抛**原始异常**,其余卡抛 `RuntimeError(... rank N failed)`(异常优先于取消) |
+| 只有取消 | **所有 rank 抛 `TaskStopped`** |
+| 都没有 | 正常继续 |
+
+同时把清理补上:`_run_video_exact` 外层包了 `except BaseException: shutil.rmtree(work_dir)` ——
+Phase A 里的 `TaskStopped` 由 `check_stop` 直接抛出、会穿过内层 `finally`,之前会漏掉 rank0 建的空目录。
+
+复测(只在 rank0 置位;`chunk_work_dir` 指到宿主挂载的 `$R2/staging`,这样残留能在容器退出后看到):
+
+| 用例 | 四个 rank 的结果 | 下一请求 | staging 残留 |
+|---|---|---|---|
+| Phase A 取消(2 s 置位) | 全部 `TaskStopped`,2.16 s | 17.41 s 正常 | **0** |
+| Phase B 取消(10 s 置位) | 全部 `TaskStopped`,15.29 s | 16.93 s 正常 | **0** |
+
+四个 rank 的日志摘录:
+
+```
+### cancel at 2s  (rank0 only)
+[bench] rank 2 run 1: raised after 2.16s: TaskStopped
+[bench] rank 1 run 1: raised after 2.16s: TaskStopped
+[bench] rank 0 run 1: raised after 2.16s: TaskStopped
+[bench] rank 3 run 1: raised after 2.16s: TaskStopped
+[bench] run 2: 17.41s
+  leftover staging entries: 0
+### cancel at 10s (rank0 only)
+[bench] rank 3 run 1: raised after 15.29s: TaskStopped
+[bench] rank 1 run 1: raised after 15.29s: TaskStopped
+[bench] rank 2 run 1: raised after 15.29s: TaskStopped
+[bench] rank 0 run 1: raised after 15.29s: TaskStopped
+[bench] run 2: 16.93s
+  leftover staging entries: 0
+```
+
+`inference failed` 一次都没有出现(压测脚本现在每个 rank 都打印异常类型,便于这样逐卡核对)。
+
+## R2 短视频首条请求:重编译已归零,耗时已逼近
+
+### 修法(按验收方指定)
+
+`_warmup_exact` 在长布局之外,再按 `W = k × world`(`k = 1 .. context - 1`)各跑一次短布局,
+每个预热分辨率都跑一遍。这样 rank r 的起始 reference 依次是 `k × r`,覆盖它在真实请求里可能遇到的
+全部 `visible` 取值,以及"一层里每个 reference 都要等邻居"的情形。
+预热总时长:**24 s → 60 s**(4 个分辨率 × 4 个布局)。
+
+`warmup_frames` 只覆盖长布局(短布局的帧数由 `W` 决定),避免把它配小又把 R2 的问题带回来。
+
+### 重编译
+
+新起进程、`TORCH_LOGS=recompiles`,4 卡,三个素材各 3 次请求:
+
+| 素材 | 预热内 | **run1 之后** |
+|---|---|---|
+| 4 秒(96 帧) | 267 行 | **0** |
+| 5 秒(120 帧) | 267 行 | **0** |
+| 8 秒(192 帧) | 267 行 | **0** |
+
+正式请求零重编译 ✅。
+
+### 定位:慢的不是编译,是逐层的 rendezvous
+
+加了 `layer_sync` 计时(每层 `check_stop` 的全局 all-reduce)之后,机制很清楚:
+修之前 5 秒素材的首条请求 `layer_sync = 1.74 s`,稳态 0.33 s —— 30 层每层多等 47 ms,
+就是首条多出来的那 1.4 s。短布局预热之后:`layer_sync = 0.34 s` vs `0.34 s`,**首条与稳态逐项相同**。
+
+修后 4 秒素材首条 / 稳态的逐项计时(rank0):
+
+```
+run1: prologue=0.01 decode_keyframes=0.05 reference=1.12 stage1=0.15 stage1_end=0.52
+      stage2_bound_end=0.42 exchange_end=0.00 layer_sync=0.15 handoff=0.07
+      flash=1.87 encode_wait=0.00 assemble=0.11 barrier_wait=0.23   → 计时合计 3.41,wall 4.38
+run2: prologue=0.02 decode_keyframes=0.05 reference=1.11 stage1=0.16 stage1_end=0.52
+      stage2_bound_end=0.42 exchange_end=0.00 layer_sync=0.16 handoff=0.06
+      flash=1.86 encode_wait=0.00 assemble=0.10 barrier_wait=0.19   → 计时合计 3.34,wall 3.75
+```
+
+所有**被埋点的阶段首条与稳态相同**;剩下的差额落在未埋点的准备/收尾胶水(Python 调度与 GC,
+实测随请求次数单调衰减 0.97 → 0.41 → 0.35 → 0.12 s)。
+
+### 首条 / 稳态耗时比
+
+新起进程(每次都是新的 torchrun),4 卡,`libx265 crf18`:
+
+| 素材 | run1 | run2 | run3 | 首条 / 稳态 |
+|---|---|---|---|---|
+| 4 秒(96 帧) | 4.26 | 3.52 | 3.65 | **1.19** |
+| 5 秒(120 帧) | 4.47 | 3.85 | 4.51 | **1.07** |
+| 8 秒(192 帧) | 6.54 | 5.57 | 5.88 | **1.14** |
+
+同一素材在机器空闲、单独跑一对时是 **1.01**(3.74 / 3.70 / 3.67);5 次连跑时 run1 是唯一的离群点,
+run2–run5 稳定在 3.64 / 3.53 / 3.51 / 3.56(3.64 到 3.51 还在往下走,说明进程内仍在收敛)。
+所以 **1.05 这条线没有稳定达到**:剩余 0.5~0.7 s 既不在任何被埋点的阶段里,也不随重编译变化,
+属于首条请求的宿主侧胶水(GC/调度)与机器状态。**没有用任何方式掩盖这个数**。
+
+## §3 备注
+
+`warmup_frames` 已收窄为"只覆盖长布局的帧数",短布局由 `W = k × world` 决定 —— 按验收意见,
+把它配小会让 R2 的问题重新出现,现在它已经无法影响短布局。
+
+## 上线要告知运维
+
+Phase A 中途某张卡出错时,整套 4 卡服务会卡在 NCCL 上约 **600 s**(实测 600012 ms),之后 job abort,
+需要重启;重启后同一个请求正常完成(实测 29.51 s)。这是方案 §3.5 明确接受的行为,已在报告里写明。
