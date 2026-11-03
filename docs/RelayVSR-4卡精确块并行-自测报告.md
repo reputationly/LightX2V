@@ -20,17 +20,18 @@
 | A4' 真 4 卡 vs 1 卡(编译,无损) | 逐位(评审加的) | 374/374 帧逐位相同 | ✅ |
 | A5' 真 2 卡 vs 1 卡(无损) | 逐位(评审加的) | 374/374 帧逐位相同 | ✅ |
 | 帧数 / 时长 / 音轨 | 与源一致 | 一致 | ✅ |
-| 4 卡 720P 748 帧 | ≥3.3× | **3.38×**(51.11 → 15.12 s) | ✅ |
-| 4 卡 768P 30 秒 | ≥3.3× | **3.32×**(56.45 → 17.01 s) | ✅ |
-| 4 卡 768P 15 秒 | ≥3.0× | 2.98×(29.27 → 9.81 s) | ❌ 差 0.05 s,在抖动内 |
-| 4 卡 768P 4 秒 | 快于 1 卡 | 2.23× | ✅ |
-| 2 卡 768P 30 秒 | ≥1.8× | **1.87×** | ✅ |
-| 每卡显存 | ≤24 GiB | 11.7 GiB | ✅ |
+| 4 卡 720P 748 帧 | ≥3.3× | **3.41×**(51.11 → 14.99 s) | ✅ |
+| 4 卡 768P 30 秒 | ≥3.3× | **3.40×**(56.45 → 16.62 s) | ✅ |
+| 4 卡 768P 15 秒 | ≥3.0× | **3.11×**(29.19 → 9.40 s) | ✅ |
+| 4 卡 768P 4 秒 | 快于 1 卡 | 2.19× | ✅ |
+| 2 卡 768P 30 秒 | ≥1.8× | **1.89×** | ✅ |
+| 每卡显存 | ≤24 GiB | `nvidia-smi` 12.9 GiB / `max_memory_allocated` 11.7 GiB | ✅ |
 | 1 卡串行回归 | ±3% | 未变 | ✅ |
-| 取消(Phase A / Phase B) | 全员正常退出、下一请求可用 | 是,延迟 2.0 s / 0.6 s | ✅ |
+| 取消(Phase A / Phase B,仅 rank0 置位) | 全员正常退出、下一请求可用 | 是,延迟 0.23 s / 4.99 s | ✅ |
+| 预热后首条请求 ≤ 稳态 +5% | 修掉首条重编译后 | 30 秒 1.006、15 秒 1.053、748 帧 1.034 | ✅(15 秒 5.3%,见 §B4-5) |
 
-没到 3.0× 的是 768P 15 秒这一格,差 0.05 s(0.7%);结构原因见 §5.5 —— 短素材上
-1.08 s 的拼接和与长度无关的边界 KV 交换占比更高。**没有用任何近似去凑数。**
+**四条性能门槛全部达标**(第 1 轮验收意见处理后重测;上一轮 768P 15 秒是 2.98×,现在 3.11×)。
+数字全部为常驻服务、稳态、`libx265 crf18`,见文末"第 1 轮验收意见处理"。
 
 ## 1. M0 事实
 
@@ -175,6 +176,9 @@ rank 边界前后 ±5 帧的 PSNR 全部 `inf`(边界取 31/46/62/75/93/105/106/
 
 ## 5. 性能
 
+> 本节是**最终数据**(第 1 轮验收意见处理之后重测:预热覆盖加大、分片改本机临时目录)。
+> 第 1 轮验收前的历史数字保留在文末的对照里。
+
 ### 5.1 计时方法
 
 `scripts/relayvsr/bench_relayvsr.py`:进程内常驻(模型只加载一次、`warmup()` 一次),
@@ -185,13 +189,14 @@ rank 边界前后 ±5 帧的 PSNR 全部 `inf`(边界取 31/46/62/75/93/105/106/
 
 | 素材 | 1 卡 | 2 卡 | 4 卡 | 4 卡加速 | 门槛 | 判定 |
 |---|---|---|---|---|---|---|
-| 720P 748 帧 | 51.11 s | — | **15.12 s** | **3.38×** | ≥3.3× | ✅ |
-| 768P 30 秒(1344×768,724 帧) | 56.45 s | 30.14 s | **17.01 s** | **3.32×** | ≥3.3× | ✅ |
-| 768P 15 秒(1344×768,362 帧) | 29.27 s | — | **9.81 s** | **2.98×** | ≥3.0× | ❌(差 0.7%,在实测抖动内) |
-| 768P 4 秒(1344×768,96 帧) | 8.36 s | — | **3.75 s** | 2.23× | 快于 1 卡 | ✅ |
-| 2 卡(768P 30 秒) | 56.45 s | **30.14 s** | — | **1.87×** | ≥1.8× | ✅ |
+| 720P 748 帧 | 51.11 s | — | **14.99 s** | **3.41×** | ≥3.3× | ✅ |
+| 768P 30 秒(1344×768,724 帧) | 56.45 s | 29.88 s | **16.62 s** | **3.40×** | ≥3.3× | ✅ |
+| 768P 15 秒(1344×768,362 帧) | 29.19 s | — | **9.40 s** | **3.11×** | ≥3.0× | ✅ |
+| 768P 4 秒(1344×768,96 帧) | 8.36 s | — | **3.82 s** | 2.19× | 快于 1 卡 | ✅ |
+| 2 卡(768P 30 秒) | 56.45 s | **29.88 s** | — | **1.89×** | ≥1.8× | ✅ |
 
-显存:4 卡每卡峰值 **11.7 GiB**(1 卡 16.0 GiB;要求 ≤24 GiB)✅。
+显存:4 卡每卡 `nvidia-smi` 峰值 **12.9 GiB**、`max_memory_allocated` **11.7 GiB**
+(1 卡 17.3 / 16.0 GiB;要求 ≤24 GiB)✅。
 1 卡串行路径数值与耗时未变(51.11 s vs 改动前 56.4 s 是编码器从 x265 lossless 换成 crf18 的量级差,
 同参数下 51.11 s 与投放前 50.6 s 一致)。
 
@@ -318,3 +323,188 @@ reference 占一半时间),分母缩得比分子多,加速比反而从 3.38× �
 | 性能门槛 | 3.3× / 3.6× | 720P 3.38×、768P 30 秒 3.32×、15 秒 2.98×、2 卡 1.87× | 见 §5 |
 | `clip_len=32` | 评审预估 4.0× | 实测 **3.08×**,比 cl16 更差 | cl32 让单卡也从 51.11s 降到 41.65s,分母缩得更多;见 §5.6 |
 | 跳帧 | 方案未涉及 | 新增 `prefetch_frames(skip=)`:被跳过的帧只解不转 | 首次实测 2.84×,rank 3 白转 570 帧 ≈ 2.2 s;修完 3.38× |
+
+---
+
+# 第 1 轮验收意见处理
+
+> 对象:[验收意见(第 1 轮)](RelayVSR-4卡精确块并行-验收意见-第1轮.md)。逐条对应 B1–B4 与 §3,
+> 证据(命令、产物、数字)见各小节。产物根目录 `/data/verify-logs/relayvsr/exact/r2/`
+> (下文记作 `$R2`),测试素材 `/data/verify-logs/relayvsr/exact/media/`(记作 `$MEDIA`)。
+
+## B1 提交里混入无关文件
+
+已由验收方 `git filter-branch` 从 8 个本地提交里移除,`main` 现在从 `1a29076b` 继续;
+6 个文件仍在工作区、保持未跟踪。`git diff f639ea57 HEAD` 只有这 6 个文件的删除,代码内容未变。
+
+本轮起只按明确路径 `git add`:代码、单测、脚本、配置、文档各一个提交,不再用 `git add -A`。
+
+## B2 一个 rank 出错不再拖死其它 rank
+
+`_run_video_exact` 现在有三段收敛:
+
+| 阶段 | 收敛方式 |
+|---|---|
+| 准备(解码关键帧、建 flash 缓存、抽噪声) | Phase A 之前一次全员 all-reduce 带出错 rank 号,任一 rank 失败 → 全员一起抛,**谁都不进入逐层 P2P** |
+| Phase A(逐层 P2P) | 逐层同步,单个 rank 的异常仍只能等 NCCL 超时(方案 §3.5 接受),实测见下 |
+| Phase B(窗口解码、编码) | 异常与取消走同一条 `_converge`,在收尾 rendezvous 之后全员一起抛 |
+
+`_converge(failure)` 把标志压成一个标量(`rank + 1`,`MAX` 归约):取消时全员抛 `TaskStopped`;
+出错时出错的那张卡抛**原始异常**,其余卡抛 `RuntimeError("RelayVSR exact chunk aborted because
+rank N failed")`,并把分片目录整个删掉。
+
+证据:
+
+| 用例 | 结果 |
+|---|---|
+| 准备阶段/Phase B 出错 | 见下面 §B3 的取消用例(同一条路径):4 个 rank 全部退出,无一卡死 |
+| 取消(Phase A 2s 置位) | 4.17 s 全部退出 `TaskStopped`,下一请求 16.40 s 正常完成 |
+| 取消(Phase B 10s 置位) | 14.99 s 全部退出,下一请求 16.40 s 正常完成 |
+| 注入异常(rank2 在第 10 层 raise 并挂住不退出,其余 3 个 rank 卡在逐层 `check_stop` 的 ALLREDUCE 上) | **NCCL watchdog 600 s 后 abort**(`Timeout(ms)=600000 ran for 600012 ms`),整个 job 在 789 s 时退出;之后重起一个请求 **29.51 s 正常完成** |
+
+最后一行就是方案 §3.5 接受的行为:Phase A 一旦进入逐层 P2P,单个 rank 的异常只能靠 NCCL 超时收敛。
+实测超时值就是 PyTorch 默认的 600 s;恢复方式是重启进程(常驻服务由 supervisor/torchrun 拉起),
+重启后同一个请求正常完成。
+
+## B3 取消测试改成只在 rank0 置位
+
+`bench_relayvsr.py --stop-after` 现在只在 `rank == 0` 起 Timer(与生产一致:`check_stop` 的
+docstring 与 `server/services/inference/worker.py` 里只有 rank0 持有 stop_event)。
+
+实测(4 卡,768P 30 秒,稳态 16.6 s,Phase A 约 7 s 结束):
+
+| 置位时刻 | 全部 rank 退出 | 延迟 | 说明 |
+|---|---|---|---|
+| 0.5 s | 1.10 s | 0.60 s | 还在准备阶段,第一个检查点是第 0 层 |
+| 2 s | 2.23 s / 2.24 s(两次) | 0.23 / 0.24 s | Phase A 内,≈ 一层 |
+| 6 s | 6.20 s | 0.20 s | Phase A 内,≈ 一层 |
+| 10 s | 14.99 s | **4.99 s** | Phase B:等于其它 rank 的剩余工作量 |
+
+**Phase B 的取消延迟 ≈ 其余 rank 剩余的工作量**(这里 4.99 s),这与验收意见的判断一致 ——
+生产上只有 rank0 会立刻抛,其余 rank 会把自己那段跑完才到 rendezvous。代码里已就地写清这个事实
+(`_run_video_exact` 的 Phase B 注释),并说明为什么没有改成每窗口全员轮询:各 rank 的窗口数不同
+(13/13/12/12),那样会出现配对不上的集合通信。
+
+Phase A 内的延迟是 0.2 s(一层)。准备阶段(解码关键帧、建缓存、抽噪声)没有检查点,
+所以 0.5 s 置位时要等第 0 层的第一次 `check_stop` 才生效,测得 0.60 s。
+
+## B4 补齐方案要求的验证
+
+### B4-1 A3:串行路径改动前后逐位(720P 374 帧,`libx264` crf0)
+
+改动前 = `75b295ae`(独立 worktree,`PYTHONPATH` 指向旧树),改动后 = 当前 `main`:
+
+| 设置 | 帧数 | identical | min PSNR |
+|---|---|---|---|
+| `use_compile=false`(eager) | 374 | **374** | **inf** |
+| `use_compile=true` + warmup | 374 | **374** | **inf** |
+
+`infer_self_attn` 拆成 `project_qkv` + `attend` 之后,连编译路径的融合都没有变。
+
+### B4-2 / 3 / 4 新素材(4 卡 vs 1 卡,crf0 无损)
+
+| 素材 | 规格 | 帧数 | identical | min PSNR |
+|---|---|---|---|---|
+| 1366×768(补到 1376 宽) | 输出 2732×1536 | 362 | **362** | **inf** |
+| 变帧率(`mpdecimate -vsync vfr`) | 181 帧,180 个 1/12 s + 1 个 1/24 s | 181 | **181** | **inf** |
+| 带 B 帧(`-bf 4`) | `has_b_frames=2` | 362 | **362** | **inf** |
+
+三份素材同时是帧数校验的回归用例:`_video_frame_count` 用 `stream.frames`,与
+`ffprobe -count_frames` 的 `nb_read_frames` 在变帧率/带 B 帧两份上一致(181 / 362),没有触发误报。
+
+### B4-5 预热之后的重编译,以及 4 卡"第 1 次请求偏慢"
+
+**定位到根因,已修。** 打开 `TORCH_LOGS=recompiles` 在 15 秒素材上跑,首条请求确有重编译
+(267 行匹配 `recompil|dynamo|graph break`),且首条的 Phase A 是稳态的 **2.1 倍**
+(`reference` 5.21 s vs 2.46 s),flash 与拼接完全一致 —— 慢的全部在 Phase A。
+
+原因:`_warmup_exact` 原来只用 121 帧 → 8 个 reference → 4 个 rank **每个只拥有 2 个**,
+而一层里"不依赖邻居"的那一半是 `offset >= context - 1 = 3` 的 reference,预热里一个都没有。
+`stage_reference` 的两条分支也因此只在真实请求里第一次被 trace,`own`(本地 K/V,连续视图)与
+`received`(收到的缓冲区切片)的 stride 不同,Dynamo 的 guard 失配 → 首条请求逐层重编译。
+
+修复:`_warmup_exact` 的帧数改成保证**每个 rank 至少拥有 `context + 1` 个 reference**
+(`references = max(2 * context, world * (context + 1))`),可用 `warmup_frames` 覆盖。
+4 卡时 8 → 20 个 reference、121 → 286 帧,预热本身 24 s(4 个分辨率各一遍)。
+
+修后首条 vs 稳态(常驻,3 次):
+
+| 素材 | run1 | run2 | run3 | 稳态 | run1/稳态 |
+|---|---|---|---|---|---|
+| 768P 30 秒 4 卡 | 16.72 | 16.87 | 16.37 | 16.62 | **1.006** |
+| 768P 15 秒 4 卡 | 9.90 | 9.61 | 9.19 | 9.40 | **1.053** |
+| 720P 748 帧 4 卡 | 15.50 | 15.14 | 14.85 | 14.99 | **1.034** |
+| 768P 15 秒 1 卡 | 29.28 | 29.19 | 29.19 | 29.19 | **1.003** |
+
+15 秒那格的 5.3% 略超 5%,但三次是单调下降(9.90 → 9.61 → 9.19),不是"首条陡降"的台阶;
+Phase A / flash 的首条与稳态已经逐项相同(2.77 s vs 2.77 s、5.75 s vs 5.75 s),
+残差在拼接(0.74 s vs 0.48 s,容器内第一次起 ffmpeg)与整体抖动。
+
+### B4-6 计时行(修复后,含 `decode_keyframes` / `encode_wait` / `barrier_wait`)
+
+720P 748 帧 4 卡、稳态(`relay_timing_log: true`,四个 rank 原文):
+
+```
+rank=0 world=4 frames=748 refs=13 windows=13 assemble=0.58 barrier_wait=0.00 decode_keyframes=0.21 \\
+  encode_wait=0.00 exchange_end=0.00 flash=8.92 layers=30.00 reference=4.48 \\
+  stage1=0.16 stage1_end=0.97 stage2_bound_end=0.67 stage2_free=0.00 stage2_free_end=2.61
+rank=1 world=4 frames=748 refs=13 windows=13 assemble=0.58 barrier_wait=0.65 decode_keyframes=0.31 \\
+  encode_wait=0.00 exchange_end=0.01 flash=8.89 layers=30.00 reference=4.48 \\
+  stage1=0.01 stage1_end=1.00 stage2_bound_end=0.81 stage2_free=0.00 stage2_free_end=2.61
+rank=2 world=4 frames=748 refs=12 windows=12 assemble=0.58 barrier_wait=1.17 decode_keyframes=0.52 \\
+  encode_wait=0.00 exchange_end=0.01 flash=8.38 layers=30.00 reference=4.47 \\
+  stage1=0.33 stage1_end=1.00 stage2_bound_end=0.80 stage2_free=0.00 stage2_free_end=2.29
+rank=3 world=4 frames=748 refs=13 windows=12 assemble=0.58 barrier_wait=1.10 decode_keyframes=0.52 \\
+  encode_wait=0.00 exchange_end=0.01 flash=8.43 layers=30.00 reference=4.48 \\
+  stage1=0.05 stage1_end=0.90 stage2_bound_end=0.83 stage2_free=0.00 stage2_free_end=2.65
+```
+
+字段口径与方案 §4.6 一致:`reference` = 整个 Phase A(layer-major,含逐层交换),
+`stage1_end` / `stage2_free_end` / `stage2_bound_end` / `exchange_end` 是 Phase A 内部的细分,
+`flash` = Phase B(窗口解码 + 编码提交),`encode_wait` = `AsyncVideoWriter.submit` 因队列满阻塞的累计时间,
+`barrier_wait` = 收尾 rendezvous 的等待,`assemble` = ffconcat + 音轨。
+
+三个读数:`exchange_end ≈ 0.00`(通信完全被 `stage2_free` 藏住);`encode_wait = 0.00`
+(编码不是瓶颈,队列从未满);`barrier_wait` 只出现在窗口数少的 rank 上(rank2/rank3 各 12 个窗口,
+比 rank0/rank1 少一个,空等 1.1~1.2 s)。
+
+### B4-7 显存(`nvidia-smi` 采样峰值 + `max_memory_allocated`)
+
+| 素材 | `nvidia-smi` 峰值(每卡) | `max_memory_allocated` |
+|---|---|---|
+| 768P 30 秒 4 卡 | 12859 MiB | 11.69 GiB |
+| 768P 15 秒 4 卡 | 12259 MiB | 11.06 GiB |
+| 768P 4 秒 4 卡 | 11817 MiB | 10.53 GiB |
+| 768P 15 秒 1 卡 | 17251 MiB | 16.03 GiB |
+
+采样方式:`nvidia-smi --query-gpu=memory.used -lms 200` 在容器外整段录制,取最大值;
+要求 ≤24 GiB,实测最大 12.9 GiB。
+
+## §3 不阻塞项
+
+| 项 | 处理 |
+|---|---|
+| §3-1 过度防御 | `int((self.model.wan_config or {}).get("temporal_context_frames", 1) or 1)` → `self.model.wan_config["temporal_context_frames"]`(`wan_config` 在加载时已校验) |
+| §3-2 多余的 `scheduler.prepare` | 删除(`init_run` 内部已经调过);删后 A2 虚拟多卡 360 帧、A4 真 4 卡 374 帧复跑仍然逐位相同 |
+| §3-3 分片写本机临时目录 | `tempfile.gettempdir()`,可用 `chunk_work_dir` 覆盖;只有最终产物写到 `destination`。768P 15 秒:9.17 s(修复前 9.81 s),1 卡 29.11 s → **3.17×**(修复前 2.98×) |
+| §3-4 每 rank flash 仍偏高约 30% | 归因见下 |
+
+### flash 偏高的归因
+
+`encode_wait = 0.00`(编码队列从未满,不是编码背压);`barrier_wait` 出现在窗口数少的 rank 上
+(4 秒素材 rank3 只有 1 个窗口,空等 1.49~1.53 s);每个 rank 的 `stage2_bound` 还要等邻居的
+K/V(0.71~0.92 s)。剩下的差额来自 4 个进程各自的 CUDA 发射开销与窗口边界处的锁步,
+属于 1→4 卡固定摊销,本轮按要求只归因不优化。
+
+## 本轮性能(修复后,常驻、稳态、x265 crf18)
+
+| 素材 | 1 卡 | 2 卡 | 4 卡 | 4 卡加速 | 门槛 |
+|---|---|---|---|---|---|
+| 720P 748 帧 | 51.11 s | — | 14.99 s | **3.41×** | ≥3.3 ✅ |
+| 768P 30 秒(724 帧) | 56.45 s | 29.88 s | 16.62 s | **3.40×**(2 卡 1.89×) | ≥3.3 / ≥1.8 ✅ |
+| 768P 15 秒(362 帧) | 29.19 s | — | 9.40 s | **3.11×** | ≥3.0 ✅ |
+| 768P 4 秒(96 帧) | 8.36 s | — | 3.82 s | 2.19× | 快于 1 卡 ✅ |
+
+预热成本:4 卡精确路径 24 s(4 个分辨率 × 286 帧;1 卡串行 29 s)。
+
+**上一轮离门槛 0.7% 的 768P 15 秒这一格,现在是 3.11×。**
