@@ -13,6 +13,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -27,7 +28,9 @@ from lightx2v_platform.registry_factory import PLATFORM_DEVICE_REGISTER
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--videos", default=None, help="comma separated video paths; each round runs the whole list once, so --repeat 2 gives first vs second request per video")
     parser.add_argument("--stop-after", type=float, default=None, help="raise stop_signal on rank 0 only, N seconds into the first request (production holds the stop flag on rank 0)")
+    parser.add_argument("--recompile-limit", type=int, default=None, help="override torch._dynamo.config.recompile_limit before warm-up, to count the cache entries a full warm-up needs")
     parser.add_argument("--fail-assemble", action="store_true", help="make rank 0 fail while assembling the chunks, to check the four ranks still converge")
     parser.add_argument("--fail-at-layer", type=int, default=None, help="inject an exception on rank 2 at this transformer layer, then hold the process so the other ranks hit the NCCL timeout")
     parser.add_argument("--hold", type=float, default=900.0, help="how long the injected-failure rank stays alive so the peers' NCCL timeout can fire")
@@ -41,6 +44,10 @@ def main():
     validate_config_paths(startup_config)
 
     rank = dist.get_rank() if dist.is_initialized() else 0
+    if mine.recompile_limit is not None:
+        torch._dynamo.config.recompile_limit = mine.recompile_limit
+        torch._dynamo.config.accumulated_recompile_limit = max(torch._dynamo.config.accumulated_recompile_limit, mine.recompile_limit * 64)
+        print(f"[bench] recompile_limit={torch._dynamo.config.recompile_limit} accumulated={torch._dynamo.config.accumulated_recompile_limit}", flush=True)
     runner = build_runner(startup_config)
     if mine.fail_at_layer is not None:
         stage_reference = runner.model.wan_transformer.stage_reference
@@ -69,28 +76,35 @@ def main():
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
 
+    queue = [path for path in (mine.videos or "").split(",") if path]
     timings = []
     for attempt in range(mine.repeat):
         # 生产上只有 rank0 的进程持有 stop_event(server/services/inference/worker.py),
         # 所以这里也只在 rank0 置位,否则测出来的取消延迟不代表线上。
         if mine.stop_after is not None and attempt == 0 and rank == 0:
             threading.Timer(mine.stop_after, setattr, (runner, "stop_signal", True)).start()
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        try:
-            runner.run_request(input_info)
-        except Exception as error:  # noqa: BLE001 - the cancellation test wants the type name
-            # 每个 rank 都打印:取消时四个 rank 都必须抛 TaskStopped(worker 会把 RuntimeError 记成推理失败)。
-            print(f"[bench] rank {rank} run {attempt + 1}: raised after {time.perf_counter() - started:.2f}s: {type(error).__name__}: {error}", flush=True)
-            if mine.stop_after is None and not mine.fail_assemble:
-                raise
-            runner.stop_signal = False
-            timings.append(float("nan"))
-            continue
-        torch.cuda.synchronize()
-        timings.append(time.perf_counter() - started)
-        if rank == 0:
-            print(f"[bench] run {attempt + 1}: {timings[-1]:.2f}s", flush=True)
+        for video in queue or [None]:
+            if video is not None:
+                input_info.video_path = video
+                input_info.save_result_path = f"{request_data['save_result_path']}.{Path(video).stem}.r{attempt + 1}.mp4"
+                input_info.output_fps = None
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            try:
+                runner.run_request(input_info)
+            except Exception as error:  # noqa: BLE001 - the cancellation test wants the type name
+                # 每个 rank 都打印:取消时四个 rank 都必须抛 TaskStopped(worker 会把 RuntimeError 记成推理失败)。
+                print(f"[bench] rank {rank} run {attempt + 1}: raised after {time.perf_counter() - started:.2f}s: {type(error).__name__}: {error}", flush=True)
+                if mine.stop_after is None and not mine.fail_assemble:
+                    raise
+                runner.stop_signal = False
+                timings.append(float("nan"))
+                continue
+            torch.cuda.synchronize()
+            timings.append(time.perf_counter() - started)
+            if rank == 0:
+                label = Path(video).stem if video is not None else f"run {attempt + 1}"
+                print(f"[bench] {label} round {attempt + 1}: {timings[-1]:.2f}s", flush=True)
 
     peak = torch.cuda.max_memory_allocated() / 2**30
     if rank == 0:
