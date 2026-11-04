@@ -115,3 +115,48 @@ swiftvr:
       task: sr
       config_json: /opt/LightX2V/configs/swiftvr/a100/swiftvr_antiphase_segp4.json
       chunk_p_size: 4
+
+# RelayVSR X2:两阶段视频超分(Pika H3 生成段的 SR 引擎,2× 放大)。
+# 模型 RelayVSR_X2 = flash_x2(Wan 骨架的条件分支)+ wan_x2,输入 = Pika H3 768P 的 11 个
+# 官方尺寸(两轴都是 32 的倍数,relayvsr 对齐到 16 不需要补边),输出 = 输入 × 2:
+#   21:9 1536x672→3072x1344 / 16:9 1344x768→2688x1536 / 3:2 1152x768→2304x1536 /
+#   4:3 1024x768→2048x1536 / 5:4 960x768→1920x1536 / 1:1 768x768→1536x1536 /
+#   4:5 768x960→1536x1920 / 3:4 768x1024→1536x2048 / 2:3 768x1152→1536x2304 /
+#   9:16 768x1344→1536x2688 / 9:21 672x1536→1344x3072
+# 不受这 11 个限制(分辨率来自源),但这 11 个以外的尺寸没有预热,首个请求会现场编译。
+#
+# 多卡用 chunk_p_size(和 SwiftVR 同一条上游块并行路径):块按 rank 轮转,每层只把
+# **前缀 c-1 个 reference 的 K/V** 点对点发给后一个 rank,层内先跑不依赖邻居的那一半,
+# 通信完全藏在计算里。与 SwiftVR/SeedVR2 **不同**,RelayVSR 4 卡与单卡成片
+# **逐位相同**(min PSNR = inf),所以多卡只花算力、不动数值:
+#   21:9 / 9:21 / 5:4 / 4:5 各 124 帧,4 卡 vs 单卡逐位相同(已实测)
+#
+# 预热:warmup + use_compile 都开着,11 个 Pika 尺寸 × 4 种窗口布局(44 遍)。
+# 代价是 /ready 之前要等预热:4 卡约 150s,1 卡约 236s(还要叠加模型加载)。
+# 好处是正式请求**零重编译**、每个尺寸首条/稳态 ≤ 1.08,稳态也才有下面的加速比。
+# 不预热的话每个新尺寸的第一条请求会现场编译(实测 1.5× 以上),线上体验更差。
+#
+# 实测(4×A100-PCIE-40G,常驻 x265 crf18,稳态):
+#   16:9 1344x768 30s(724 帧):1 卡 56.37s / 4 卡 16.40s = 3.44×;2 卡 30s = 1.89×
+#   16:9 1344x768 15s(362 帧):1 卡 29.19s / 4 卡 9.40s  = 3.11×
+#   各尺寸 5s(124 帧)4 卡:1:1 2.6s / 4:5 3.0s / 4:3 3.5s / 3:2 3.8s / 21:9 4.5s
+# 显存(nvidia-smi 峰值):4 卡每卡 12.9 GiB(单卡 17.3 GiB),远低于 40G。
+# 4 个 rank 必须落在**同一节点**(边界 K/V 走 NCCL 点对点,`distributed_inference_across_workers`
+# 保持 false);一个实例串行处理请求(引擎侧 single _processing_lock),同 box 不要再放第二个副本。
+relayvsr_x2:
+  variants:
+    - name: relayvsr/1card
+      gpus: 1
+      task: sr
+      config_json: /opt/LightX2V/configs/relayvsr/relayvsr_x2.json
+    - name: relayvsr/chunkp2
+      gpus: 2
+      task: sr
+      config_json: /opt/LightX2V/configs/relayvsr/relayvsr_x2_chunkp2.json
+      # advisory (validated against gpus; real mesh lives in config_json.parallel)
+      chunk_p_size: 2
+    - name: relayvsr/chunkp4
+      gpus: 4
+      task: sr
+      config_json: /opt/LightX2V/configs/relayvsr/relayvsr_x2_chunkp4.json
+      chunk_p_size: 4
