@@ -10,5 +10,6 @@
   "encoder_threads": 16,
   "queue_size": 16,
   "use_compile": true,
-  "warmup": true
+  "warmup": true,
+  "warmup_resolutions": [[672, 1536], [768, 1344], [768, 1152], [768, 1024], [768, 960], [768, 768], [960, 768], [1024, 768], [1152, 768], [1344, 768], [1536, 672]]
 }
