@@ -208,7 +208,6 @@ class SwiftVRRunner(DefaultRunner):
     def _prepare_warmup_inputs(self, height, width, frame_count):
         return torch.zeros(1, frame_count, 3, height, width, dtype=GET_DTYPE(), device=self.init_device)
 
-    @staticmethod
     def resolve_output_size(
         self,
         input_info,
