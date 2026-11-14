@@ -41,9 +41,11 @@ pre-commit run --all-files
 
 感谢以下社区开发者为 LightX2V 作出的贡献：
 
-[zhtshr](https://github.com/zhtshr) · [triple-Mu](https://github.com/triple-Mu) · [vivienfanghuagood](https://github.com/vivienfanghuagood) · [yeahdongcn](https://github.com/yeahdongcn) · [kikidouloveme79](https://github.com/kikidouloveme79) · [ziyanxzy](https://github.com/ziyanxzy) · [Tyr0727](https://github.com/Tyr0727) · [hufangjian2017](https://github.com/hufangjian2017) · [Fatemanx](https://github.com/Fatemanx) · [qiuxin2012](https://github.com/qiuxin2012)
+[zhtshr](https://github.com/zhtshr) · [triple-Mu](https://github.com/triple-Mu) · [vivienfanghuagood](https://github.com/vivienfanghuagood) · [yeahdongcn](https://github.com/yeahdongcn) · [kikidouloveme79](https://github.com/kikidouloveme79) · [ziyanxzy](https://github.com/ziyanxzy) · [Tyr0727](https://github.com/Tyr0727) · [hufangjian2017](https://github.com/hufangjian2017) · [Fatemanx](https://github.com/Fatemanx) · [qiuxin2012](https://github.com/qiuxin2012) · [ZhengXinwei-F](https://github.com/ZhengXinwei-F)
 
 ## :fire: 最新动态
+
+- **2026年11月11日：** 🚀 我们现已支持 [MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)，支持文生图和单张／多张参考图生成与编辑，支持 TP／SP 并行和 CPU offload。离线推理和服务化示例详见 [使用说明](scripts/minimax_h3_image/README_zh.md)。
 
 - **2026年10月26日：** 🚀 新增 [TaoMate-H3](scripts/taomate_h3/run_t2av_3step.sh)、[StreamRender-H3](scripts/streamrender_h3/run_refv2v_2step.sh)、[Matrix-Game-4](scripts/matrix_game4/run_matrix_game4.sh)、[LingBot-Fast](scripts/lingbot_fast/run_5090.sh) 和 [Realtime-Video](scripts/realtime_video/run_5090.sh) 的自回归推理支持。对应目录提供运行脚本及 BF16/FP8 配置。
 
@@ -191,6 +193,10 @@ python scripts/minimax_h3/server/post_t2av.py
 
 修改 [请求脚本](scripts/minimax_h3/server/post_t2av.py) 中的提示词即可生成自己的内容。请求异步执行，结果默认保存到仓库下的 `save_results/server_cache/outputs/` 目录。
 
+### ComfyUI 集成
+
+通过 ComfyUI 节点调用 LightX2V Server，支持图片/视频生成、视频超分、模型常驻复用和多卡选择。部署与示例工作流见 [ComfyUI 集成文档](lightx2v_comfyui/README_zh.md)。
+
 ## 🤖 支持的模型生态
 
 LightX2V 支持多种图像、视频与世界模型，并提供量化权重、蒸馏模型和轻量自编码器。
@@ -221,11 +227,12 @@ LightX2V 支持多种图像、视频与世界模型，并提供量化权重、�
 
 <details>
 <summary><strong>🎨 图像生成与编辑</strong><br><br>
-<a href="scripts/qwen_image/README_zh.md">Qwen-Image</a> · <a href="scripts/flux2">FLUX.2</a> · <a href="scripts/hunyuan_image3">HunyuanImage</a> · <a href="scripts/z_image/README_zh.md">Z-Image</a> · <a href="scripts/longcat/README_zh.md">LongCat-Image</a> · <a href="scripts/bagel/README.md">BAGEL</a> · <a href="scripts/hidream_o1_image">HiDream</a> · <a href="scripts/ernie_image">ERNIE-Image</a> · <a href="scripts/neopp/README.md">SenseNova-U1</a>
+<a href="scripts/minimax_h3_image/README_zh.md">MiniMax-H3-Image</a> · <a href="scripts/qwen_image/README_zh.md">Qwen-Image</a> · <a href="scripts/flux2">FLUX.2</a> · <a href="scripts/hunyuan_image3">HunyuanImage</a> · <a href="scripts/z_image/README_zh.md">Z-Image</a> · <a href="scripts/longcat/README_zh.md">LongCat-Image</a> · <a href="scripts/bagel/README.md">BAGEL</a> · <a href="scripts/hidream_o1_image">HiDream</a> · <a href="scripts/ernie_image">ERNIE-Image</a> · <a href="scripts/neopp/README.md">SenseNova-U1</a>
 </summary>
 
 | 模型 / 变体与权重 | 使用指南 / 脚本 |
 | --- | --- |
+| [MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)（文生图、参考图生成与编辑） | [使用指南](scripts/minimax_h3_image/README_zh.md) |
 | [Qwen-Image](https://huggingface.co/Qwen/Qwen-Image) / [Qwen-Image-2512](https://huggingface.co/Qwen/Qwen-Image-2512) | [使用指南](scripts/qwen_image/README_zh.md) |
 | [Qwen-Image-Edit](https://huggingface.co/Qwen/Qwen-Image-Edit) / [2509](https://huggingface.co/Qwen/Qwen-Image-Edit-2509) / [2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) | [使用指南](scripts/qwen_image/README_zh.md) |
 | [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) / [Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) | [使用指南](scripts/qwen_image_21/README_zh.md) |
@@ -256,7 +263,7 @@ LightX2V 支持多种图像、视频与世界模型，并提供量化权重、�
 
 <details>
 <summary><strong>🌍 世界模型、机器人与三维</strong><br><br>
-<a href="scripts/cosmos3">Cosmos3</a> · <a href="scripts/lingbot">LingBot-World</a> · <a href="scripts/matrix_game4">Matrix-Game-4</a> · <a href="scripts/worldplay/README.md">WorldPlay</a> · <a href="scripts/edenlive/README_zh.md">EdenLive</a> · <a href="scripts/worldmirror/README_zh.md">WorldMirror</a> · <a href="scripts/dreamzero">DreamZero</a> · <a href="scripts/lingbot_va">LingBot-VA</a> · <a href="scripts/motus">Motus</a> · <a href="scripts/fastwam">Fast-WAM</a> · <a href="scripts/realtimewam/README.md">RealtimeWAM</a> · <a href="scripts/hunyuan3d">Hunyuan3D</a>
+<a href="scripts/cosmos3">Cosmos3</a> · <a href="scripts/lingbot">LingBot-World</a> · <a href="scripts/matrix_game4">Matrix-Game-4</a> · <a href="scripts/worldplay/README.md">WorldPlay</a> · <a href="scripts/edenlive/README_zh.md">EdenLive</a> · <a href="scripts/worldmirror/README_zh.md">WorldMirror</a> · <a href="scripts/depth_anything3/README.md">Depth Anything 3</a> · <a href="scripts/dreamzero">DreamZero</a> · <a href="scripts/lingbot_va">LingBot-VA</a> · <a href="scripts/motus">Motus</a> · <a href="scripts/fastwam">Fast-WAM</a> · <a href="scripts/realtimewam/README.md">RealtimeWAM</a> · <a href="scripts/hunyuan3d">Hunyuan3D</a>
 </summary>
 
 | 模型 / 变体与权重 | 使用指南 / 脚本 |
@@ -269,6 +276,7 @@ LightX2V 支持多种图像、视频与世界模型，并提供量化权重、�
 | [WorldPlay](https://huggingface.co/tencent/HY-WorldPlay)（双向、自回归与蒸馏版） | [使用指南](scripts/worldplay/README.md) |
 | [EdenLive](https://huggingface.co/VAST-AI/EdenLive)（Wan2.1 14B / Wan2.2 5B，支持双向与四步自回归推理） | [使用指南](scripts/edenlive/README_zh.md) |
 | [WorldMirror 2.0](https://github.com/Tencent-Hunyuan/HY-World-2.0)（三维重建） | [使用指南](scripts/worldmirror/README_zh.md) |
+| [Depth Anything 3 MONO-LARGE](https://github.com/ByteDance-Seed/Depth-Anything-3)（图片/视频相对深度） | [使用指南与脚本](scripts/depth_anything3/README.md) |
 | [DreamZero](https://huggingface.co/GEAR-Dreams/DreamZero-DROID) | [推理脚本](scripts/dreamzero) |
 | [LingBot-VA](https://huggingface.co/robbyant/lingbot-va-base) | [推理脚本](scripts/lingbot_va) |
 | [Motus](https://huggingface.co/motus-robotics/Motus) | [推理脚本](scripts/motus) |
@@ -319,7 +327,7 @@ LightX2V 支持多种图像、视频与世界模型，并提供量化权重、�
 | 环境安装与配置 | [快速入门指南](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/getting_started/quickstart.html) |
 | 模型准备与加载 | [MiniMax-H3](scripts/minimax_h3/README_zh.md) · [Wan2.1 / VACE](scripts/wan/README_zh.md) · [模型格式与加载](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/getting_started/model_structure.html) |
 | 服务部署与 API 调用 | [服务部署](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/deploy_service.html) · [API 参考](lightx2v/server/README.md) |
-| 交互界面与工作流集成 | [Gradio-Lightx2v](https://github.com/ModelTC/Gradio-Lightx2v) · [ComfyUI](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/deploy_comfyui.html) |
+| 交互界面与工作流集成 | [Gradio-Lightx2v](https://github.com/ModelTC/Gradio-Lightx2v) · [ComfyUI](lightx2v_comfyui/README_zh.md) |
 | Windows 本地部署 | [Windows 部署指南](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/deploy_local_windows.html) |
 | 低资源与低延迟部署 | [低资源部署](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/for_low_resource.html) · [低延迟部署](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/for_low_latency.html) |
 | 模型量化与 LoRA 部署 | [模型量化](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/method_tutorials/quantization.html) · [LoRA 部署](https://lightx2v-zhcn.readthedocs.io/zh-cn/latest/deploy_guides/lora_deploy.html) |

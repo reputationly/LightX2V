@@ -1,6 +1,7 @@
 import gc
-from pathlib import Path
 
+import cv2
+import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
@@ -15,6 +16,7 @@ from lightx2v.models.schedulers.z_image.scheduler import ZImageScheduler
 from lightx2v.models.video_encoders.hf.z_image.vae import AutoencoderKLZImageVAE
 from lightx2v.server.metrics import monitor_cli
 from lightx2v.utils.envs import *
+from lightx2v.utils.image_io import save_image
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
 from lightx2v.utils.utils import is_main_process
@@ -24,9 +26,9 @@ torch_device_module = getattr(torch, AI_DEVICE)
 
 
 def build_z_image_model_with_lora(z_image_module, config, model_kwargs, lora_configs):
-    lora_dynamic_apply = config.get("lora_dynamic_apply", False)
+    use_lora_branch = config.get("lora_mode", "merge") == "separate"
 
-    if lora_dynamic_apply:
+    if use_lora_branch:
         lora_path = lora_configs[0]["path"]
         lora_strength = lora_configs[0]["strength"]
         model_kwargs["lora_path"] = lora_path
@@ -43,6 +45,8 @@ def build_z_image_model_with_lora(z_image_module, config, model_kwargs, lora_con
 
 @RUNNER_REGISTER("z_image")
 class ZImageRunner(DefaultRunner):
+    supported_lora_modes = ("merge", "separate")
+
     model_cpu_offload_seq = "text_encoder->transformer->vae"
     _callback_tensor_inputs = ["latents", "prompt_embeds"]
     supported_request_fields_by_task = {
@@ -373,10 +377,12 @@ class ZImageRunner(DefaultRunner):
         self.end_run()
 
         if not input_info.return_result_tensor and input_info.save_result_path is not None and is_main_process():
-            image = images[0]
-            path = Path(input_info.save_result_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            image.save(path)
+            method = self.config.get("save_image_method", "opencv")
+            with no_sync_profiling(), ProfilingContext4DebugL1(f"Save Image ({method}): {input_info.save_result_path}", time_unit="ms"):
+                pixels = images[0].detach().cpu().float().permute(1, 2, 0).numpy()
+                pixels = (pixels * 255).round().astype(np.uint8)
+                image = Image.fromarray(pixels) if method == "pil" else cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+                save_image(image, input_info.save_result_path, method)
             logger.info(f"Image saved: {input_info.save_result_path}")
 
         del latents, generator

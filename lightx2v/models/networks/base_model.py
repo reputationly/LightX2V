@@ -169,6 +169,7 @@ class BaseTransformerModel(ABC):
             "gguf-Q3_K_S",
             "gguf-Q3_K_M",
             "int8-npu",
+            "int8-metax",
             "fp8-intel-xpu",
             "int8-intel-xpu",
             "int8-iluvatar",
@@ -385,7 +386,7 @@ class BaseTransformerModel(ABC):
         Returns:
             bool: True if model should be initialized empty
         """
-        if self.config.get("lora_configs") and self.config["lora_configs"] and not self.config.get("lora_dynamic_apply", False):
+        if self.config.get("lora_configs") and self.config["lora_configs"] and self.config.get("lora_mode", "merge") not in ("separate", "consumer"):
             return True
         return False
 
@@ -453,7 +454,7 @@ class BaseTransformerModel(ABC):
             validate_numa_operator_views(numa_map, roots)
 
         # Handle LoRA if needed
-        if self.config.get("lora_dynamic_apply", False) and self.lora_path is not None:
+        if self.config.get("lora_mode", "merge") in ("separate", "consumer") and self.lora_path is not None:
             assert self.config.get("lora_configs", False)
             if hasattr(self, "_register_lora"):
                 self._register_lora(self.lora_path, self.lora_strength)
@@ -467,7 +468,7 @@ class BaseTransformerModel(ABC):
         gc.collect()
 
     def _load_lora_file(self, file_path, dtype=None):
-        dtype = GET_DTYPE() if dtype is None else dtype
+        dtype = GET_LORA_DTYPE() if dtype is None else dtype
         if self.device.type != "cpu" and dist.is_initialized():
             device = f"{AI_DEVICE}:{dist.get_rank()}"
         else:
@@ -680,13 +681,16 @@ class BaseTransformerModel(ABC):
 
         weight_dict = {}
         for safetensor_path in safetensors_files:
+            adapter_model_path = self.config.get("adapter_model_path")
+            if adapter_model_path and os.path.realpath(safetensor_path) == os.path.realpath(adapter_model_path):
+                continue
             with safe_open(safetensor_path, framework="pt") as f:
                 self._record_checkpoint_metadata(f)
                 logger.info(f"Loading weights from {safetensor_path}")
                 for k in f.keys():
                     if any(remove_key in k for remove_key in remove_keys):
                         continue
-                    if self.config.get("dit_quant_scheme") == "int8-metal" and k.endswith(".weight_scale"):
+                    if self.config.get("dit_quant_scheme") in ("int8-metal", "fp8-musa") and k.endswith("weight_scale"):
                         weight_dict[k] = f.get_tensor(k).to(device=self.device, dtype=torch.float32)
                     elif f.get_tensor(k).dtype in [torch.float16, torch.bfloat16, torch.float]:
                         if unified_dtype or all(s not in k for s in sensitive_layer):

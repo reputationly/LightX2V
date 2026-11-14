@@ -1,6 +1,7 @@
 import base64
 import io
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -12,6 +13,7 @@ from lightx2v.models.runners.default_runner import DefaultRunner
 from lightx2v.models.runners.request_fields import COMMON_REQUEST_FIELDS
 from lightx2v.models.schedulers.neopp.scheduler import NeoppMoeScheduler
 from lightx2v.utils.envs import *
+from lightx2v.utils.image_io import save_image
 from lightx2v.utils.input_info import NeoppInputInfo
 from lightx2v.utils.profiler import *
 from lightx2v.utils.registry_factory import RUNNER_REGISTER
@@ -20,9 +22,9 @@ from lightx2v_platform.base.global_var import AI_DEVICE
 
 
 def build_neopp_model_with_lora(neopp_module, config, model_kwargs, lora_configs):
-    lora_dynamic_apply = config.get("lora_dynamic_apply", False)
+    use_lora_branch = config.get("lora_mode", "merge") == "separate"
 
-    if lora_dynamic_apply:
+    if use_lora_branch:
         lora_path = lora_configs[0]["path"]
         lora_strength = lora_configs[0]["strength"]
         model_kwargs["lora_path"] = lora_path
@@ -39,6 +41,8 @@ def build_neopp_model_with_lora(neopp_module, config, model_kwargs, lora_configs
 
 @RUNNER_REGISTER("neopp")
 class NeoppRunner(DefaultRunner):
+    supported_lora_modes = ("merge", "separate")
+
     input_info_cls_by_task = {"t2i": NeoppInputInfo, "i2i": NeoppInputInfo}
     supported_request_fields_by_task = {
         "t2i": (COMMON_REQUEST_FIELDS - {"return_result_tensor"}) | {"size"},
@@ -295,12 +299,20 @@ class NeoppRunner(DefaultRunner):
         return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
     def process_images_after_vae_decoder_for_debug(self):
+        if is_main_process() and self.input_info.save_result_path:
+            method = self.config.get("save_image_method", "opencv")
+            path = self.input_info.save_result_path
+            with no_sync_profiling(), ProfilingContext4DebugL1(f"Save Image ({method}): {path}", time_unit="ms"):
+                image = self._denorm(self.scheduler.image_prediction.float())
+                pixels = (image[0].permute(1, 2, 0).cpu().numpy() * 255).round().astype(np.uint8)
+                grid_image = Image.fromarray(pixels)
+                image = grid_image if method == "pil" else cv2.cvtColor(pixels, cv2.COLOR_RGB2BGR)
+                save_image(image, path, method)
+            logger.info(f"✅ Image saved successfully to: {self.input_info.save_result_path} ✅")
+            return grid_image
         image = self._denorm(self.scheduler.image_prediction.float())
         image = (image.clamp(0, 1).permute(0, 2, 3, 1).cpu().numpy() * 255.0).round().astype(np.uint8)
         grid_image = Image.fromarray(image[0])
-        if is_main_process():
-            grid_image.save(self.input_info.save_result_path)
-            logger.info(f"✅ Image saved successfully to: {self.input_info.save_result_path} ✅")
         return grid_image
 
     def _denorm(self, x: torch.Tensor, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]):
